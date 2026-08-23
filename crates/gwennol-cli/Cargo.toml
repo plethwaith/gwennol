@@ -1,0 +1,19 @@
+[package]
+name = "gwennol-cli"
+description = "Gwennol command-line frontend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "gwennol"
+path = "src/main.rs"
+
+[dependencies]
+gwennol-core = { path = "../gwennol-core" }
+tokio.workspace = true
