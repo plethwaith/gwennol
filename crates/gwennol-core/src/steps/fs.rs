@@ -1,6 +1,6 @@
 //! `host_fs.read`, `host_fs.write`, `host_fs.list`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 
 use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
@@ -35,9 +35,28 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         let cancel = ex.cancel_token();
         // Opened before the approval so the approval can describe the very
         // file this handle holds; opening for read has no side effects.
+        // This is the one documented exception to the module's
+        // validate → approve → work ordering. O_NONBLOCK so that a FIFO at
+        // an unapproved path cannot park the open waiting for a writer;
+        // fifos and sockets are then refused outright — they are conduits,
+        // not files, and "read this file" cannot honestly describe them.
         let open = async {
-            let file = tokio::fs::File::open(&path).await?;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.read(true);
+            #[cfg(unix)]
+            opts.custom_flags(nix::libc::O_NONBLOCK);
+            let file = opts.open(&path).await?;
             let meta = file.metadata().await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt as _;
+                let t = meta.file_type();
+                if t.is_fifo() || t.is_socket() {
+                    return Err(std::io::Error::other(
+                        "not a readable file (fifo or socket)",
+                    ));
+                }
+            }
             let canonical = tokio::fs::canonicalize(&path).await?;
             std::io::Result::Ok((file, meta, canonical))
         };
@@ -66,8 +85,11 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         let read = async {
             let mut bytes = Vec::new();
             // One byte past the cap distinguishes "exactly the cap" from
-            // "truncated" without reading the rest.
-            file.take(max as u64 + 1).read_to_end(&mut bytes).await?;
+            // "truncated" without reading the rest. Saturating: a cap of
+            // u64::MAX must mean "unbounded", not wrap to zero.
+            file.take((max as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+                .await?;
             std::io::Result::Ok(bytes)
         };
         let bytes = or_cancelled(&cancel, read)
@@ -108,43 +130,62 @@ async fn canonicalize_for_write(path: &std::path::Path) -> std::io::Result<std::
     }
 }
 
-/// Distinguishes concurrent temporary files within this process; the
-/// process id distinguishes across processes.
-static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Write `content` to a temporary sibling of `path`, then rename it over
-/// `path` — so a crash or a full disk mid-write cannot leave `path`
-/// truncated. An existing file's permissions survive the replacement.
-async fn write_via_rename(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let parent = path
+/// Create an exclusive (`create_new`) temporary sibling of `dest`, named
+/// with a random nonce — so a file or symlink planted at a guessed name
+/// makes creation *fail* rather than redirect the write.
+async fn create_temp_sibling(
+    dest: &std::path::Path,
+) -> std::io::Result<(tokio::fs::File, std::path::PathBuf)> {
+    let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
-    let name = path
+    let name = dest
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no file name"))?;
-    let tmp = parent.join(format!(
-        ".{}.{}.{}.gwennol-tmp",
-        name.to_string_lossy(),
-        std::process::id(),
-        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    let write = async {
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(content.as_bytes()).await?;
-        // Flushed to disk before the rename makes it the file's content.
-        file.sync_all().await?;
-        drop(file);
-        if let Ok(meta) = tokio::fs::metadata(path).await {
-            tokio::fs::set_permissions(&tmp, meta.permissions()).await?;
+    for _ in 0..16 {
+        let nonce = RandomState::new().build_hasher().finish();
+        let tmp = parent.join(format!(
+            ".{}.{nonce:016x}.gwennol-tmp",
+            name.to_string_lossy()
+        ));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+        {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-        tokio::fs::rename(&tmp, path).await
-    };
-    let result = write.await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
     }
-    result
+    Err(std::io::Error::other(
+        "could not create a unique temporary file",
+    ))
+}
+
+/// Finish an atomic write: the destination's permissions are matched
+/// *before* any content lands in the temporary (the caller may be
+/// replacing a private file), then write, flush to disk, and rename over
+/// `dest` — so a crash or a full disk mid-write cannot leave `dest`
+/// truncated.
+async fn write_and_rename(
+    mut file: tokio::fs::File,
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    content: &str,
+) -> std::io::Result<()> {
+    match tokio::fs::metadata(dest).await {
+        Ok(meta) => tokio::fs::set_permissions(tmp, meta.permissions()).await?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    file.write_all(content.as_bytes()).await?;
+    // Flushed to disk before the rename makes it the file's content.
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp, dest).await
 }
 
 /// `host_fs.write`: `{path, content, create_dirs?}` → `{bytes_written}`.
@@ -191,9 +232,18 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 .await
                 .map_err(|e| StepError::Failed(format!("mkdir {}: {e}", parent.display())))?;
         }
-        or_cancelled(&cancel, write_via_rename(&canonical, &content))
+        let (file, tmp) = or_cancelled(&cancel, create_temp_sibling(&canonical))
             .await?
             .map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
+        let result =
+            or_cancelled(&cancel, write_and_rename(file, &tmp, &canonical, &content)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            // Failure or cancellation: either way the write future is gone
+            // and cannot clean up after itself — the temporary must not
+            // linger.
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        result?.map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
         Ok(json!({"bytes_written": content.len()}).into())
     })
 }
@@ -202,9 +252,13 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// `{entries: [{name, kind, size}], truncated}`.
 ///
 /// The operator is shown, and the step lists, the canonical directory —
-/// symlinks resolved. One level only — recursion is a tool's decision to make, one approved
-/// listing at a time — and at most `max_entries` entries come back, with
-/// `truncated` saying whether the directory held more.
+/// symlinks resolved. One level only — recursion is a tool's decision to
+/// make, one approved listing at a time — and at most `max_entries`
+/// entries come back, with `truncated` saying whether the directory held
+/// more. A truncated listing is whatever the directory yielded first,
+/// sorted for presentation — not the lexicographically first entries,
+/// which would require reading the whole directory the cap exists to
+/// avoid.
 pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);

@@ -152,9 +152,26 @@ pub fn approval(ex: &(dyn PluginExecution + Send), access: Access) -> ApprovalRe
     }
 }
 
+/// A payload-free description of an [`Access`] for error messages. The
+/// denial travels back into plugin-visible errors and logs, so it must
+/// not carry stdin, header values, or argv beyond the program — any of
+/// which can hold interpolated secrets.
+fn describe(access: &Access) -> String {
+    match access {
+        Access::ReadFile(p) => format!("read of {}", p.display()),
+        Access::WriteFile(p) => format!("write to {}", p.display()),
+        Access::ListDir(p) => format!("listing of {}", p.display()),
+        Access::Spawn { argv, .. } => format!(
+            "spawn of {:?}",
+            argv.first().map(String::as_str).unwrap_or("?")
+        ),
+        Access::Http { method, url } => format!("{method} {url}"),
+    }
+}
+
 /// Ask the operator. `Err` carries a message suitable for a `StepError`.
 pub async fn approve(request: ApprovalRequest) -> Result<(), String> {
-    let describe = format!("{:?}", request.access);
+    let describe = describe(&request.access);
     let plugin = request.plugin.clone();
     match host().operator.approve(request).await {
         Decision::Allow => Ok(()),

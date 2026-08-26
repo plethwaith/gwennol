@@ -255,7 +255,10 @@ fn request<'a>(
             Duration::from_millis(u64_param(&p, "idle_timeout_ms", DEFAULT_IDLE_TIMEOUT_MS)?);
         let max_redirects = u64_param(&p, "max_redirects", DEFAULT_MAX_REDIRECTS)?;
 
-        let deadline = Instant::now() + timeout;
+        // Set after the first approval, so however long the operator
+        // deliberates is not billed to the network budget. Mid-chain
+        // approvals do run on the clock: by then the network is in play.
+        let mut deadline = None;
         let cancel = ex.cancel_token();
         let mut hops = 0u64;
 
@@ -273,6 +276,7 @@ fn request<'a>(
                 },
             );
             approve(ask).await.map_err(StepError::Failed)?;
+            let hop_deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
 
             let mut req = client().request(method.clone(), url.clone());
             let mut has_content_type = false;
@@ -292,7 +296,7 @@ fn request<'a>(
             }
 
             let resp = tokio::select! {
-                r = tokio::time::timeout_at(deadline, req.send()) => match r {
+                r = tokio::time::timeout_at(hop_deadline, req.send()) => match r {
                     Ok(r) => r.map_err(|e| StepError::Failed(format!("request to {host}: {e}")))?,
                     Err(_) => return Err(StepError::Failed(format!(
                         "request to {host} exceeded timeout of {timeout:?}"
@@ -359,6 +363,7 @@ fn request<'a>(
         }
 
         let host = host_of(&url)?;
+        let deadline = deadline.expect("set when the first hop was approved");
         let mut chunks = resp.bytes_stream();
         let mut bytes: Vec<u8> = Vec::new();
         loop {

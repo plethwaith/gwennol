@@ -21,6 +21,8 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// to the end so the child never blocks on it, while the host's memory
 /// stays bounded by the cap rather than by how fast the child can write.
 async fn drain_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Vec<u8>> {
+    // Saturating: a cap of usize::MAX must mean "unbounded", not wrap.
+    let keep = cap.saturating_add(1);
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -28,10 +30,14 @@ async fn drain_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> std::io::Res
         if n == 0 {
             return Ok(kept);
         }
-        let room = (cap + 1).saturating_sub(kept.len());
+        let room = keep.saturating_sub(kept.len());
         kept.extend_from_slice(&buf[..n.min(room)]);
     }
 }
+
+/// How long a timed-out or cancelled step waits for the killed child's
+/// pipes to close before abandoning them.
+const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// SIGKILL the whole process group the child leads, so a timed-out
 /// `sh -c` leaves no orphans behind.
@@ -161,13 +167,17 @@ pub fn process_run<'a>(
             r = &mut work => r.map_err(|e| StepError::Failed(format!("wait {:?}: {e}", argv[0])))?,
             () = tokio::time::sleep(timeout) => {
                 if let Some(pid) = pid { kill_group(pid); }
-                // Reap; SIGKILL makes this return promptly.
-                let _ = work.await;
+                // Reap, but bounded: a descendant that left the group
+                // (setsid) can hold the pipes open — and off unix nothing
+                // was group-killed at all. Past the grace, dropping `work`
+                // kills the direct child via kill_on_drop and abandons the
+                // pipes rather than hang the step.
+                let _ = tokio::time::timeout(REAP_GRACE, &mut work).await;
                 return Err(StepError::Failed(format!("{:?} exceeded timeout of {timeout:?}", argv[0])));
             }
             () = cancel.cancelled() => {
                 if let Some(pid) = pid { kill_group(pid); }
-                let _ = work.await;
+                let _ = tokio::time::timeout(REAP_GRACE, &mut work).await;
                 return Err(StepError::Failed("cancelled".into()));
             }
         };
@@ -182,4 +192,24 @@ pub fn process_run<'a>(
         })
         .into())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_capped_bounds_memory_but_reads_to_the_end() {
+        let data = vec![7u8; 100_000];
+        let kept = drain_capped(data.as_slice(), 10).await.unwrap();
+        assert_eq!(kept.len(), 11, "one byte past the cap marks truncation");
+        assert!(kept.iter().all(|b| *b == 7));
+    }
+
+    #[tokio::test]
+    async fn drain_capped_survives_the_maximum_cap() {
+        let data = vec![1u8; 10];
+        let kept = drain_capped(data.as_slice(), usize::MAX).await.unwrap();
+        assert_eq!(kept.len(), 10, "cap+1 must saturate, not wrap to zero");
+    }
 }
