@@ -82,11 +82,17 @@ opens sockets.
   each pinned by an integration test against a real kernel.
 - **Not in scope:** any plugin that *uses* these steps; the agent loop; a
   sandbox around an approved child process.
-- **Open question to settle here:** symlinks. The operator is shown a
-  lexically normalised path, which may still be a symlink out of the
-  workspace, and nothing re-checks between approval and open. Interactive
-  review tolerates that; a policy file matching on paths (milestone 6) does
-  not.
+- **Settled: an approval binds to the real file, not the name.**
+  `host_fs.read` opens the file, canonicalises the path, verifies by device
+  and inode that the canonical path names the opened handle, shows the
+  operator that canonical path, and reads from that same handle — a symlink
+  into `~/.ssh` is judged as `~/.ssh`, and the bytes provably come from the
+  approved file. `host_fs.write` refuses a symlink destination outright and
+  canonicalises the deepest existing ancestor, so the approved path is
+  where the bytes will land; `host_fs.list` lists the canonical directory.
+  The residual race — a parent directory swapped between approval and
+  rename — is tolerable under interactive review; the milestone-6 policy
+  file should close it with directory-handle (`openat`-family) I/O.
 
 ### 2. SPI contracts
 

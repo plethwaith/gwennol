@@ -12,11 +12,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Access {
-    /// Read the contents of a file.
+    /// Read the contents of a file. The path is canonical — symlinks
+    /// resolved — and the host has verified it names the file it will
+    /// actually read.
     ReadFile(PathBuf),
-    /// Create or overwrite a file.
+    /// Create or overwrite a file. The path is canonical up to its deepest
+    /// existing ancestor; a symlink destination is refused before asking.
     WriteFile(PathBuf),
-    /// List a directory.
+    /// List a directory, named by its canonical path.
     ListDir(PathBuf),
     /// Spawn a process.
     Spawn {

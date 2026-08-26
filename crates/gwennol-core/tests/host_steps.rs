@@ -92,7 +92,9 @@ impl Fixture {
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        let workspace = tempfile::tempdir().unwrap().keep();
+        // Canonicalised so the canonical paths in approvals compare equal
+        // to workspace joins (macOS tempdirs sit behind the /var symlink).
+        let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         let operator = Arc::new(Recorder::default());
         let mut kernel = gwennol_core::boot(operator.clone(), workspace.clone()).unwrap();
         for m in fixture_plugins() {
@@ -390,6 +392,54 @@ async fn fs_read_bounds_what_it_reads_even_on_endless_files() {
         .unwrap();
     assert_eq!(out["r"]["truncated"], true);
     assert_eq!(out["r"]["content"].as_str().unwrap().len(), 1024);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_read_shows_the_operator_where_a_symlink_really_leads() {
+    let f = fixture();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    std::fs::write(outside.join("real.txt"), "elsewhere").unwrap();
+    std::os::unix::fs::symlink(outside.join("real.txt"), f.workspace.join("innocent.txt")).unwrap();
+    let out = run("reader", json!({"path": "innocent.txt", "max_bytes": 1024}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "elsewhere");
+    let asked = f.requests_for("reader");
+    assert!(
+        asked.contains(&Access::ReadFile(outside.join("real.txt"))),
+        "the operator judged the alias, not the target: {asked:?}"
+    );
+    assert!(
+        !asked.contains(&Access::ReadFile(f.workspace.join("innocent.txt"))),
+        "the alias reached the operator: {asked:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_refuses_a_symlink_destination() {
+    let f = fixture();
+    let outside = tempfile::tempdir().unwrap().keep();
+    std::fs::write(outside.join("target.txt"), "untouched").unwrap();
+    std::os::unix::fs::symlink(outside.join("target.txt"), f.workspace.join("sly.txt")).unwrap();
+    let err = run(
+        "writer",
+        json!({"path": "sly.txt", "content": "overwritten", "dir": "."}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("symlink"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("target.txt")).unwrap(),
+        "untouched",
+        "the write escaped through the link"
+    );
+    assert!(
+        !f.requests_for("writer")
+            .contains(&Access::WriteFile(f.workspace.join("sly.txt"))),
+        "the operator was asked about a write the host must refuse itself"
+    );
 }
 
 #[tokio::test]
