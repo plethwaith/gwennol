@@ -111,6 +111,11 @@ fn fixture_plugins() -> Vec<Value> {
             ]),
         ),
         plugin(
+            "runner",
+            &["step_type:host_process.run"],
+            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": "{{$input.timeout_ms}}"}}]),
+        ),
+        plugin(
             "delegator",
             &["invoke:plugin:reader"],
             json!([{"id": "i", "type": "invoke", "params": {"plugin": "reader", "action": "go", "input": {"path": "{{$input.path}}", "max_bytes": 1024}}}]),
@@ -211,6 +216,53 @@ async fn fs_write_then_list() {
     let asked = f.requests_for("writer");
     assert!(asked.contains(&Access::WriteFile(f.workspace.join("out/nested/a.txt"))));
     assert!(asked.contains(&Access::ListDir(f.workspace.join("out/nested"))));
+}
+
+// ---------------------------------------------------------------- process
+
+#[tokio::test]
+async fn process_run_captures_output_and_status_without_a_shell() {
+    let f = fixture();
+    let out = run("runner", json!({"argv": ["sh", "-c", "cat; echo err >&2; exit 3"], "stdin": "from stdin", "timeout_ms": 10000})).await.unwrap();
+    assert_eq!(out["p"]["status"], 3);
+    assert_eq!(out["p"]["stdout"], "from stdin");
+    assert_eq!(out["p"]["stderr"], "err\n");
+    let asked = f.requests_for("runner");
+    assert!(
+        asked.iter().any(
+            |a| matches!(a, Access::Spawn { argv, cwd } if argv[0] == "sh" && *cwd == f.workspace)
+        ),
+        "{asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn process_run_child_sees_only_the_allow_listed_environment() {
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "this test needs a variable the harness sets and the allow-list omits"
+    );
+    let out = run(
+        "runner",
+        json!({"argv": ["sh", "-c", r#"printf '%s|%s' "${PATH:+set}" "${CARGO_MANIFEST_DIR:+leaked}""#], "stdin": "", "timeout_ms": 10000}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["p"]["stdout"], "set|",
+        "the child should keep PATH and lose everything not allow-listed"
+    );
+}
+
+#[tokio::test]
+async fn process_run_times_out() {
+    let err = run(
+        "runner",
+        json!({"argv": ["sleep", "5"], "stdin": "", "timeout_ms": 100}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("exceeded timeout"), "{err}");
 }
 
 // ---------------------------------------------------------------- cause
@@ -336,5 +388,13 @@ fn host_manifests_are_valid_and_nothing_is_freely_usable() {
             names.push(name.to_string());
         }
     }
-    assert_eq!(names, ["host_fs.read", "host_fs.write", "host_fs.list"]);
+    assert_eq!(
+        names,
+        [
+            "host_fs.read",
+            "host_fs.write",
+            "host_fs.list",
+            "host_process.run",
+        ]
+    );
 }

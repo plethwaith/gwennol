@@ -13,13 +13,16 @@ use crate::steps;
 
 /// The `host_fs` plugin manifest, as shipped.
 pub const HOST_FS_MANIFEST: &str = include_str!("../resources/host_fs.json");
+/// The `host_process` plugin manifest, as shipped.
+pub const HOST_PROCESS_MANIFEST: &str = include_str!("../resources/host_process.json");
 
 /// Every host plugin manifest, in registration order.
-pub const HOST_MANIFESTS: [&str; 1] = [HOST_FS_MANIFEST];
+pub const HOST_MANIFESTS: [&str; 2] = [HOST_FS_MANIFEST, HOST_PROCESS_MANIFEST];
 
 gwead::native_step_impl!("gwennol.host_fs.read", steps::fs::fs_read);
 gwead::native_step_impl!("gwennol.host_fs.write", steps::fs::fs_write);
 gwead::native_step_impl!("gwennol.host_fs.list", steps::fs::fs_list);
+gwead::native_step_impl!("gwennol.host_process.run", steps::process::process_run);
 
 /// Why [`boot`] failed.
 #[derive(Debug, thiserror::Error)]

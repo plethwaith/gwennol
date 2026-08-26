@@ -10,12 +10,14 @@
 //!    grant is refused before the operator is bothered;
 //! 4. does the work, racing it against the invocation's cancel token.
 //!
-//! They are published to plugins by the `host_fs` manifest in `resources/`
-//! as `host_fs.read`, `host_fs.write` and `host_fs.list`. None is
-//! `freelyUsable`: a plugin must hold the matching `step_type:host_` grant,
-//! which the kernel enforces at dispatch.
+//! They are published to plugins by the `host_fs` and `host_process`
+//! manifests in `resources/` as `host_fs.read`, `host_fs.write`,
+//! `host_fs.list` and `host_process.run`. None is `freelyUsable`: a plugin
+//! must hold the matching `step_type:host_` grant, which the kernel
+//! enforces at dispatch.
 
 pub mod fs;
+pub mod process;
 
 use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::Value;

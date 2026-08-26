@@ -59,5 +59,7 @@ pub mod steps;
 
 pub use gwead;
 pub use host::{HostConfig, ProcessEnv};
-pub use kernel::{BootError, HOST_FS_MANIFEST, HOST_MANIFESTS, boot, boot_with};
+pub use kernel::{
+    BootError, HOST_FS_MANIFEST, HOST_MANIFESTS, HOST_PROCESS_MANIFEST, boot, boot_with,
+};
 pub use operator::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
