@@ -132,6 +132,11 @@ fn fixture_plugins() -> Vec<Value> {
             ]),
         ),
         plugin(
+            "lister",
+            &["step_type:host_fs.list"],
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": "{{$input.max}}"}}]),
+        ),
+        plugin(
             "runner",
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": "{{$input.timeout_ms}}"}}]),
@@ -370,9 +375,70 @@ async fn fs_write_then_list() {
         out["l"]["entries"],
         json!([{"name": "a.txt", "kind": "file", "size": 3}])
     );
+    assert_eq!(out["l"]["truncated"], false);
     let asked = f.requests_for("writer");
     assert!(asked.contains(&Access::WriteFile(f.workspace.join("out/nested/a.txt"))));
     assert!(asked.contains(&Access::ListDir(f.workspace.join("out/nested"))));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_read_bounds_what_it_reads_even_on_endless_files() {
+    // /dev/zero never ends; an unbounded read would never return.
+    let out = run("reader", json!({"path": "/dev/zero", "max_bytes": 1024}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["truncated"], true);
+    assert_eq!(out["r"]["content"].as_str().unwrap().len(), 1024);
+}
+
+#[tokio::test]
+async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
+    let f = fixture();
+    for content in ["first", "second"] {
+        run(
+            "writer",
+            json!({"path": "atomic/x.txt", "content": content, "dir": "atomic"}),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("atomic/x.txt")).unwrap(),
+        "second"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("atomic"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn fs_list_caps_entries_and_reports_the_cut() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("capped")).unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+        std::fs::write(f.workspace.join("capped").join(name), "x").unwrap();
+    }
+    let out = run("lister", json!({"dir": "capped", "max": 2}))
+        .await
+        .unwrap();
+    assert_eq!(out["l"]["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(out["l"]["truncated"], true);
+
+    let out = run("lister", json!({"dir": "capped", "max": 100}))
+        .await
+        .unwrap();
+    let names: Vec<_> = out["l"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b", "c", "d", "e"]);
+    assert_eq!(out["l"]["truncated"], false);
 }
 
 // ---------------------------------------------------------------- process
