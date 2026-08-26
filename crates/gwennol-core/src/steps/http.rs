@@ -24,6 +24,9 @@ use crate::operator::Access;
 
 /// Default cap on a buffered (non-streaming) response body.
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 8 << 20;
+/// Hard ceiling on `max_bytes`: larger requests are clamped, so a plugin
+/// cannot ask the host to buffer without bound.
+pub const BODY_BYTES_CEILING: u64 = 64 << 20;
 /// Default budget for reaching a response — the whole redirect chain, and
 /// the body too when it is buffered.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -249,7 +252,8 @@ fn request<'a>(
             other => other.cloned(),
         };
         let stream = bool_param(&p, "stream", false)?;
-        let max = u64_param(&p, "max_bytes", DEFAULT_MAX_BODY_BYTES)? as usize;
+        let max =
+            u64_param(&p, "max_bytes", DEFAULT_MAX_BODY_BYTES)?.min(BODY_BYTES_CEILING) as usize;
         let timeout = Duration::from_millis(u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?);
         let idle =
             Duration::from_millis(u64_param(&p, "idle_timeout_ms", DEFAULT_IDLE_TIMEOUT_MS)?);

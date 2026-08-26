@@ -15,7 +15,7 @@ use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwennol_core::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
 
-/// Records every approval request; denies anything the `denied` plugin
+/// Records every approval request; denies anything a `denied*` plugin
 /// asks for; answers `token` for the `secretive` plugin.
 #[derive(Default)]
 struct Recorder {
@@ -25,7 +25,7 @@ struct Recorder {
 #[async_trait::async_trait]
 impl Operator for Recorder {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        let deny = request.plugin == "denied";
+        let deny = request.plugin.starts_with("denied");
         self.requests.lock().unwrap().push(request);
         if deny {
             Decision::Deny
@@ -185,6 +185,11 @@ fn fixture_plugins() -> Vec<Value> {
             "denied",
             &["step_type:host_fs.read"],
             json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}"}}]),
+        ),
+        plugin(
+            "denied_runner",
+            &["step_type:host_process.run"],
+            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": 1000, "max_output_bytes": 1024}}]),
         ),
         {
             let mut p = plugin(
@@ -401,6 +406,49 @@ async fn fs_read_bounds_what_it_reads_even_on_endless_files() {
         .unwrap();
     assert_eq!(out["r"]["truncated"], true);
     assert_eq!(out["r"]["content"].as_str().unwrap().len(), 1024);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_read_refuses_a_fifo_instead_of_blocking_on_it() {
+    let f = fixture();
+    let path = f.workspace.join("pipe.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Pre-refusal, opening a writerless FIFO parks forever and this test
+    // hangs; the refusal must also come before the operator is asked.
+    let err = run("reader", json!({"path": "pipe.fifo", "max_bytes": 10}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("fifo"), "{err}");
+    assert!(
+        !f.requests_for("reader").contains(&Access::ReadFile(path)),
+        "the operator was asked to approve reading a conduit"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_preserves_restrictive_permissions_on_overwrite() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let path = f.workspace.join("private.txt");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    run(
+        "writer",
+        json!({"path": "private.txt", "content": "new", "dir": "."}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the replacement widened a private file");
 }
 
 #[cfg(unix)]
@@ -984,6 +1032,30 @@ async fn missing_egress_grant_is_refused_before_operator_is_asked() {
     assert!(
         f.requests_for("nofetch").is_empty(),
         "operator was asked despite missing egress grant"
+    );
+}
+
+#[tokio::test]
+async fn a_denial_names_the_shape_but_not_the_payload() {
+    let f = fixture();
+    let err = run(
+        "denied_runner",
+        json!({"argv": ["cat"], "stdin": "hunter2-super-secret"}),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("operator denied"), "{msg}");
+    assert!(msg.contains("spawn"), "{msg}");
+    assert!(
+        !msg.contains("hunter2"),
+        "the denial leaked stdin into a plugin-visible error: {msg}"
+    );
+    // The *operator* still saw the payload — that is the point of the gate.
+    assert!(
+        f.requests_for("denied_runner")
+            .iter()
+            .any(|a| matches!(a, Access::Spawn { stdin: Some(s), .. } if s.contains("hunter2")))
     );
 }
 

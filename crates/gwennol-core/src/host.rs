@@ -165,7 +165,11 @@ fn describe(access: &Access) -> String {
             "spawn of {:?}",
             argv.first().map(String::as_str).unwrap_or("?")
         ),
-        Access::Http { method, url } => format!("{method} {url}"),
+        // Query strings and fragments carry parameters, which can carry
+        // secrets; the origin and path say what was denied.
+        Access::Http { method, url } => {
+            format!("{method} {}", url.split(['?', '#']).next().unwrap_or(url))
+        }
     }
 }
 

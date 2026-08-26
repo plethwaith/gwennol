@@ -12,8 +12,13 @@ use crate::operator::Access;
 
 /// Default cap on bytes returned by `fs_read`.
 pub const DEFAULT_READ_MAX_BYTES: u64 = 1 << 20;
+/// Hard ceiling on `max_bytes`: larger requests are clamped, so a plugin
+/// cannot ask the host to buffer without bound.
+pub const READ_BYTES_CEILING: u64 = 64 << 20;
 /// Default cap on entries returned by `fs_list`.
 pub const DEFAULT_LIST_MAX_ENTRIES: u64 = 1000;
+/// Hard ceiling on `max_entries`: larger requests are clamped.
+pub const LIST_ENTRIES_CEILING: u64 = 100_000;
 
 /// `host_fs.read`: `{path, max_bytes?}` → `{content, truncated, size}`.
 ///
@@ -31,7 +36,8 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
     Box::pin(async move {
         let p = resolve(ex, params);
         let path = resolve_path(str_param(&p, "path")?);
-        let max = u64_param(&p, "max_bytes", DEFAULT_READ_MAX_BYTES)? as usize;
+        let max =
+            u64_param(&p, "max_bytes", DEFAULT_READ_MAX_BYTES)?.min(READ_BYTES_CEILING) as usize;
         let cancel = ex.cancel_token();
         // Opened before the approval so the approval can describe the very
         // file this handle holds; opening for read has no side effects.
@@ -48,7 +54,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             let file = opts.open(&path).await?;
             let meta = file.metadata().await?;
             #[cfg(unix)]
-            {
+            let file = {
                 use std::os::unix::fs::FileTypeExt as _;
                 let t = meta.file_type();
                 if t.is_fifo() || t.is_socket() {
@@ -56,7 +62,18 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                         "not a readable file (fifo or socket)",
                     ));
                 }
-            }
+                // O_NONBLOCK has served its purpose; cleared so a slow
+                // device read waits instead of failing with EAGAIN and
+                // discarding the bytes already delivered.
+                let std_file = file.into_std().await;
+                let flags = nix::fcntl::fcntl(&std_file, nix::fcntl::FcntlArg::F_GETFL)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                let flags = nix::fcntl::OFlag::from_bits_truncate(flags)
+                    .difference(nix::fcntl::OFlag::O_NONBLOCK);
+                nix::fcntl::fcntl(&std_file, nix::fcntl::FcntlArg::F_SETFL(flags))
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                tokio::fs::File::from_std(std_file)
+            };
             let canonical = tokio::fs::canonicalize(&path).await?;
             std::io::Result::Ok((file, meta, canonical))
         };
@@ -132,9 +149,14 @@ async fn canonicalize_for_write(path: &std::path::Path) -> std::io::Result<std::
 
 /// Create an exclusive (`create_new`) temporary sibling of `dest`, named
 /// with a random nonce — so a file or symlink planted at a guessed name
-/// makes creation *fail* rather than redirect the write.
+/// makes creation *fail* rather than redirect the write. With `restrict`
+/// (used when replacing an existing file) the temporary is born 0600, so
+/// its content is never readable beyond what the destination allowed —
+/// there is no create-then-chmod gap in which another opener can grab a
+/// readable fd.
 async fn create_temp_sibling(
     dest: &std::path::Path,
+    restrict: bool,
 ) -> std::io::Result<(tokio::fs::File, std::path::PathBuf)> {
     let parent = dest
         .parent()
@@ -143,18 +165,21 @@ async fn create_temp_sibling(
     let name = dest
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if restrict {
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = restrict;
     for _ in 0..16 {
         let nonce = RandomState::new().build_hasher().finish();
         let tmp = parent.join(format!(
             ".{}.{nonce:016x}.gwennol-tmp",
             name.to_string_lossy()
         ));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .await
-        {
+        match opts.open(&tmp).await {
             Ok(file) => return Ok((file, tmp)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -165,27 +190,22 @@ async fn create_temp_sibling(
     ))
 }
 
-/// Finish an atomic write: the destination's permissions are matched
-/// *before* any content lands in the temporary (the caller may be
-/// replacing a private file), then write, flush to disk, and rename over
-/// `dest` — so a crash or a full disk mid-write cannot leave `dest`
-/// truncated.
-async fn write_and_rename(
+/// Fill the temporary: write, flush to disk, and — when replacing an
+/// existing file — set its permissions on the *open handle* (fchmod, so a
+/// swapped path cannot redirect the chmod), widening the 0600 it was born
+/// with only after the content is fully written.
+async fn fill_temp(
     mut file: tokio::fs::File,
-    tmp: &std::path::Path,
-    dest: &std::path::Path,
     content: &str,
+    dest_perms: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
-    match tokio::fs::metadata(dest).await {
-        Ok(meta) => tokio::fs::set_permissions(tmp, meta.permissions()).await?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     file.write_all(content.as_bytes()).await?;
     // Flushed to disk before the rename makes it the file's content.
     file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(tmp, dest).await
+    if let Some(perms) = dest_perms {
+        file.set_permissions(perms).await?;
+    }
+    Ok(())
 }
 
 /// `host_fs.write`: `{path, content, create_dirs?}` → `{bytes_written}`.
@@ -232,18 +252,42 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 .await
                 .map_err(|e| StepError::Failed(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let (file, tmp) = or_cancelled(&cancel, create_temp_sibling(&canonical))
-            .await?
+        // Whether this replaces an existing file decides both the
+        // temporary's birth mode and the permissions it ends with.
+        let dest_perms = match tokio::fs::metadata(&canonical).await {
+            Ok(meta) => Some(meta.permissions()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(StepError::Failed(format!(
+                    "write {}: {e}",
+                    canonical.display()
+                )));
+            }
+        };
+        // Creation and rename are quick local operations and are not raced
+        // against cancellation: a dropped future cannot clean up after
+        // itself, so cancellation is consulted *between* phases instead. A
+        // cancelled write either leaves the destination untouched with the
+        // temporary removed, or — once the rename begins — completes.
+        let (file, tmp) = create_temp_sibling(&canonical, dest_perms.is_some())
+            .await
             .map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
-        let result =
-            or_cancelled(&cancel, write_and_rename(file, &tmp, &canonical, &content)).await;
-        if !matches!(result, Ok(Ok(()))) {
-            // Failure or cancellation: either way the write future is gone
-            // and cannot clean up after itself — the temporary must not
-            // linger.
+        let filled = or_cancelled(&cancel, fill_temp(file, &content, dest_perms)).await;
+        let cancelled_after_fill = cancel.is_cancelled();
+        if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
-        result?.map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
+        filled?.map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
+        if cancelled_after_fill {
+            return Err(StepError::Failed("cancelled".into()));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &canonical).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(StepError::Failed(format!(
+                "write {}: {e}",
+                canonical.display()
+            )));
+        }
         Ok(json!({"bytes_written": content.len()}).into())
     })
 }

@@ -12,7 +12,7 @@
         "additionalProperties": false,
         "properties": {
           "path": { "type": "string", "description": "File path; relative paths resolve against the workspace root." },
-          "max_bytes": { "type": "integer", "minimum": 0, "description": "Cap on returned bytes (default 1 MiB). Bounds what is read, not just what is returned; the result reports truncation." }
+          "max_bytes": { "type": "integer", "minimum": 0, "description": "Cap on returned bytes (default 1 MiB, clamped to 64 MiB). Bounds what is read, not just what is returned; the result reports truncation." }
         }
       },
       "outputSchema": {
@@ -51,7 +51,7 @@
         "additionalProperties": false,
         "properties": {
           "path": { "type": "string" },
-          "max_entries": { "type": "integer", "minimum": 0, "description": "Cap on returned entries (default 1000). The result reports truncation; a truncated listing is the first entries the directory yielded (sorted), not the lexicographically first." }
+          "max_entries": { "type": "integer", "minimum": 0, "description": "Cap on returned entries (default 1000, clamped to 100000). The result reports truncation; a truncated listing is the first entries the directory yielded (sorted), not the lexicographically first." }
         }
       },
       "outputSchema": {

@@ -13,6 +13,9 @@ use crate::operator::Access;
 
 /// Default cap on captured stdout and stderr, each.
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1 << 20;
+/// Hard ceiling on `max_output_bytes`: larger requests are clamped, so a
+/// plugin cannot ask the host to buffer without bound.
+pub const OUTPUT_BYTES_CEILING: u64 = 64 << 20;
 /// Default wall-clock limit.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
@@ -40,7 +43,9 @@ async fn drain_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> std::io::Res
 const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// SIGKILL the whole process group the child leads, so a timed-out
-/// `sh -c` leaves no orphans behind.
+/// `sh -c` leaves no orphans behind. Best-effort: a descendant that
+/// detached into its own session (`setsid`) has left the group and is out
+/// of reach.
 #[cfg(unix)]
 fn kill_group(pid: u32) {
     // The child was spawned as its group's leader, so its pid is the pgid.
@@ -61,6 +66,9 @@ fn kill_group(_pid: u32) {}
 /// Exceeding `timeout_ms` fails the step and kills the child's whole
 /// process group (the child is spawned as its leader), not just the child —
 /// so a timed-out `sh -c` leaves no orphans. Cancellation does the same.
+/// Best-effort, not a guarantee: a descendant that detached into its own
+/// session is out of the group's reach, and the wait for the killed
+/// child's pipes is bounded rather than indefinite.
 ///
 /// No shell is involved: `argv[0]` is the program. A tool that wants a
 /// shell asks for one explicitly (`["sh", "-c", …]`) and the operator sees
@@ -109,7 +117,8 @@ pub fn process_run<'a>(
             Some(_) => return Err(StepError::Failed("param 'stdin' must be a string".into())),
         };
         let timeout = Duration::from_millis(u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?);
-        let max = u64_param(&p, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)? as usize;
+        let max = u64_param(&p, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)?
+            .min(OUTPUT_BYTES_CEILING) as usize;
 
         let ask = approval(
             &*ex,
