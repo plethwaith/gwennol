@@ -11,27 +11,40 @@ it may use, and the kernel refuses anything else at dispatch time — so the
 manifest is an accurate statement of what a tool can reach, and "where can my
 API key go?" is answered by reading ten lines of JSON.
 
+## The two gates
+
+Everything that reaches outside the sandbox — a file, a process, a socket —
+goes through a host step type, and every one of those passes two gates in
+order:
+
+1. **The manifest**, enforced by the kernel. A plugin must hold
+   `step_type:host_fs.read` (or `host_process.run`, or `host_http.post`, …)
+   and, for HTTP, `network:egress:<host>`. Without the grant, dispatch is
+   refused before any host code runs.
+2. **The operator** — whichever frontend is in charge — shown the concrete
+   path, argv or URL, the plugin asking, and the model's tool call behind it.
+
+So the manifest says what a tool *can* reach; the operator decides what it
+*may* reach right now. Because every host step type shares a `host_` prefix,
+"what in this deployment can touch the outside world?" is one grep across the
+manifests.
+
 ## Status
 
-**Pre-alpha.** The workspace scaffold exists; nothing runs yet. The 0.0.0
-release on crates.io is a name reservation.
+**Pre-alpha.** The workspace scaffold and the plan exist; nothing runs yet.
+The 0.0.0 release on crates.io is a name reservation.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
+naming rules, and the seven milestones to a usable harness.
 
 ## Layout
 
 ```
-crates/gwennol-core/   host library: kernel config, native steps, loop, Operator trait
+crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
 crates/gwennol-cli/    first frontend (non-interactive CLI)
 plugins/               bundled SPI + plugin manifests
+docs/                  roadmap and design notes
 ```
-
-## First milestone
-
-1. Native host steps: `fs.read`, `fs.write`, `fs.list`, `process.run`,
-   `http.post` (streaming), each routed through `Operator::approve`.
-2. SPIs: `llm.chat` (streaming) and `tool`.
-3. Plugins: one provider (Anthropic) and four tools (read, write, grep, bash).
-4. The agent loop in core, the CLI frontend, and one end-to-end test that runs
-   a tool call through a real sandboxed plugin against a stubbed provider.
 
 ## License
 
