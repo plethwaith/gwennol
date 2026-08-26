@@ -55,8 +55,9 @@ pub mod host;
 pub mod kernel;
 pub mod operator;
 pub mod secrets;
+pub mod steps;
 
 pub use gwead;
 pub use host::{HostConfig, ProcessEnv};
-pub use kernel::{BootError, boot, boot_with};
+pub use kernel::{BootError, HOST_FS_MANIFEST, HOST_MANIFESTS, boot, boot_with};
 pub use operator::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};

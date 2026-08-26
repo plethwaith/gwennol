@@ -9,6 +9,17 @@ use gwead::kernel::{Kernel, KernelConfig, KernelError};
 use crate::host::{HostConfig, ProcessEnv, install};
 use crate::operator::Operator;
 use crate::secrets::OperatorSecrets;
+use crate::steps;
+
+/// The `host_fs` plugin manifest, as shipped.
+pub const HOST_FS_MANIFEST: &str = include_str!("../resources/host_fs.json");
+
+/// Every host plugin manifest, in registration order.
+pub const HOST_MANIFESTS: [&str; 1] = [HOST_FS_MANIFEST];
+
+gwead::native_step_impl!("gwennol.host_fs.read", steps::fs::fs_read);
+gwead::native_step_impl!("gwennol.host_fs.write", steps::fs::fs_write);
+gwead::native_step_impl!("gwennol.host_fs.list", steps::fs::fs_list);
 
 /// Why [`boot`] failed.
 #[derive(Debug, thiserror::Error)]
@@ -24,8 +35,8 @@ pub enum BootError {
     Kernel(#[from] KernelError),
 }
 
-/// Install the operator as this process's host and boot a kernel, with the
-/// default [`ProcessEnv`].
+/// Install the operator as this process's host and boot a kernel with the
+/// host plugins registered, with the default [`ProcessEnv`].
 ///
 /// Returns the kernel un-wrapped so the caller can register the bundled
 /// SPIs and plugins before calling [`Kernel::into_arc`] — every step body
@@ -47,5 +58,9 @@ pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     let config = KernelConfig::default()
         .with_native_step_impls(NativeStepImplTable::discover()?)
         .with_secret_resolver(Arc::new(OperatorSecrets(operator)));
-    Ok(Kernel::boot(config)?)
+    let mut kernel = Kernel::boot(config)?;
+    for manifest in HOST_MANIFESTS {
+        kernel.register_plugin_from_json(manifest)?;
+    }
+    Ok(kernel)
 }
