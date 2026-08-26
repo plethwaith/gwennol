@@ -267,6 +267,15 @@ fn spawn_echo_server() -> String {
                         write!(s, "HTTP/1.1 {code}\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
                         return;
                     }
+                    // Answers and then streams a body forever.
+                    "/endless" => {
+                        write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\n").unwrap();
+                        let chunk = [b'z'; 8192];
+                        while s.write_all(&chunk).is_ok() {
+                            let _ = s.flush();
+                        }
+                        return;
+                    }
                     // Reads the request and never answers.
                     "/hang" => {
                         std::thread::sleep(std::time::Duration::from_secs(30));
@@ -445,6 +454,7 @@ async fn fs_write_refuses_a_symlink_destination() {
 #[tokio::test]
 async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
     let f = fixture();
+    let mut inodes = Vec::new();
     for content in ["first", "second"] {
         run(
             "writer",
@@ -452,10 +462,24 @@ async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
         )
         .await
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            inodes.push(
+                std::fs::metadata(f.workspace.join("atomic/x.txt"))
+                    .unwrap()
+                    .ino(),
+            );
+        }
     }
     assert_eq!(
         std::fs::read_to_string(f.workspace.join("atomic/x.txt")).unwrap(),
         "second"
+    );
+    #[cfg(unix)]
+    assert_ne!(
+        inodes[0], inodes[1],
+        "the replacement arrived in place — a rename must bring a new inode"
     );
     let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("atomic"))
         .unwrap()
@@ -516,17 +540,20 @@ async fn process_run_captures_output_and_status_without_a_shell() {
 }
 
 #[tokio::test]
-async fn process_run_survives_a_child_that_never_reads_a_large_stdin() {
-    // Bigger than any pipe buffer; a blocking stdin write before the drains
-    // would deadlock here and ignore the timeout entirely.
+async fn process_run_survives_a_child_that_floods_stdout_and_never_reads_stdin() {
+    // The child fills its stdout pipe while never touching stdin, and the
+    // stdin payload is bigger than any pipe buffer — so a sequential
+    // "write stdin, then drain output" host deadlocks against it with the
+    // timeout out of reach. Concurrent feeding and draining completes it.
     let big = "x".repeat(1 << 20);
     let out = run(
         "runner",
-        json!({"argv": ["sh", "-c", "exit 0"], "stdin": big, "timeout_ms": 10000, "max_output_bytes": 1048576}),
+        json!({"argv": ["sh", "-c", "head -c 200000 /dev/zero"], "stdin": big, "timeout_ms": 10000, "max_output_bytes": 1048576}),
     )
     .await
     .unwrap();
     assert_eq!(out["p"]["status"], 0);
+    assert_eq!(out["p"]["stdout"].as_str().unwrap().len(), 200_000);
 }
 
 #[tokio::test]
@@ -550,16 +577,17 @@ async fn process_run_bounds_captured_output_while_draining_the_rest() {
 async fn a_timed_out_process_group_leaves_no_orphans() {
     let f = fixture();
     // The backgrounded sleep would outlive a kill that reached only the
-    // direct child. The shell records its own pid, which — as group
-    // leader — is also the pgid.
+    // direct child; its recorded pid is what makes this a real pin — a
+    // group-existence check alone reads "dead" vacuously when no group
+    // was ever created.
     let err = run(
         "runner",
-        json!({"argv": ["sh", "-c", "echo $$ > pg.pid; sleep 30 & sleep 30"], "stdin": "", "timeout_ms": 500, "max_output_bytes": 1048576}),
+        json!({"argv": ["sh", "-c", "sleep 30 & echo $! > bg.pid; sleep 30"], "stdin": "", "timeout_ms": 500, "max_output_bytes": 1048576}),
     )
     .await
     .unwrap_err();
     assert!(err.to_string().contains("exceeded timeout"), "{err}");
-    let pgid: u32 = std::fs::read_to_string(f.workspace.join("pg.pid"))
+    let bg: u32 = std::fs::read_to_string(f.workspace.join("bg.pid"))
         .unwrap()
         .trim()
         .parse()
@@ -570,7 +598,7 @@ async fn a_timed_out_process_group_leaves_no_orphans() {
     loop {
         let alive = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .arg(format!("kill -0 {bg} 2>/dev/null"))
             .status()
             .unwrap()
             .success();
@@ -579,7 +607,7 @@ async fn a_timed_out_process_group_leaves_no_orphans() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "process group {pgid} is still alive after the timeout"
+            "backgrounded child {bg} outlived the timeout — only its parent was killed"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -763,6 +791,21 @@ async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one()
         None,
         "a non-standard credential header followed a redirect off its origin: {echoed}"
     );
+}
+
+#[tokio::test]
+async fn http_stops_reading_an_endless_body_at_the_cap() {
+    // A host that buffers the whole body before applying the cap never
+    // returns from this endpoint; one that stops past the cap is instant.
+    let f = fixture();
+    let out = run(
+        "fetcher",
+        json!({"url": format!("{}/endless", f.echo), "body": "", "stream": false, "max_bytes": 1000}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["h"]["truncated"], true);
+    assert!(out["h"]["body"].as_str().unwrap().len() <= 1000);
 }
 
 #[tokio::test]
