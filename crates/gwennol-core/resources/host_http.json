@@ -17,7 +17,7 @@
           "max_bytes": { "type": "integer", "minimum": 0, "default": 8388608, "description": "Cap on a buffered body." },
           "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Budget for reaching a response, redirects included; also covers reading a buffered body." },
           "idle_timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Streaming only: longest gap allowed between chunks of the response body." },
-          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin strips credential headers. 0 refuses to follow any." }
+          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin drops the plugin's headers. 0 refuses to follow any." }
         }
       },
       "outputSchema": {
@@ -52,7 +52,7 @@
           "max_bytes": { "type": "integer", "minimum": 0, "default": 8388608, "description": "Cap on a buffered body." },
           "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Budget for reaching a response, redirects included; also covers reading a buffered body." },
           "idle_timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Streaming only: longest gap allowed between chunks of the response body." },
-          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin strips credential headers. 0 refuses to follow any." }
+          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin drops the plugin's headers. 0 refuses to follow any." }
         }
       },
       "outputSchema": {

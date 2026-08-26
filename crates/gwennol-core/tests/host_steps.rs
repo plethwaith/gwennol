@@ -144,7 +144,7 @@ fn fixture_plugins() -> Vec<Value> {
         plugin(
             "fetcher",
             &["step_type:host_http.post", "network:egress:127.0.0.1"],
-            json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "body": "{{$input.body}}", "stream": "{{$input.stream}}"}}]),
+            json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "body": "{{$input.body}}", "stream": "{{$input.stream}}", "max_bytes": "{{$input.max_bytes}}"}}]),
         ),
         plugin(
             "getter",
@@ -188,7 +188,7 @@ fn fixture_plugins() -> Vec<Value> {
             let mut p = plugin(
                 "secretive",
                 &["step_type:host_http.post", "network:egress:127.0.0.1"],
-                json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "headers": {"authorization": "Bearer {{$secrets.token}}"}}}]),
+                json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "headers": {"authorization": "Bearer {{$secrets.token}}", "x-api-key": "{{$secrets.token}}"}}}]),
             );
             p["usesSecrets"] = json!(["token"]);
             p
@@ -571,7 +571,7 @@ async fn http_post_buffered_with_json_body() {
     let f = fixture();
     let out = run(
         "fetcher",
-        json!({"url": format!("{}/chat", f.echo), "body": {"a": 1}, "stream": false}),
+        json!({"url": format!("{}/chat", f.echo), "body": {"a": 1}, "stream": false, "max_bytes": 1048576}),
     )
     .await
     .unwrap();
@@ -693,6 +693,7 @@ async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one()
     let echoed: Value = gwead::serde_json::from_str(same["h"]["body"].as_str().unwrap()).unwrap();
     assert_eq!(echoed["path"], "/after");
     assert_eq!(echoed["headers"]["authorization"], "Bearer s3cr3t");
+    assert_eq!(echoed["headers"]["x-api-key"], "s3cr3t");
 
     let across = run(
         "secretive",
@@ -707,6 +708,26 @@ async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one()
         None,
         "the key followed a redirect off its origin: {echoed}"
     );
+    assert_eq!(
+        echoed["headers"].get("x-api-key"),
+        None,
+        "a non-standard credential header followed a redirect off its origin: {echoed}"
+    );
+}
+
+#[tokio::test]
+async fn http_buffered_body_is_bounded_by_max_bytes() {
+    let f = fixture();
+    // The echo of a 100 KB request body is well past the 500-byte cap.
+    let big = "y".repeat(100_000);
+    let out = run(
+        "fetcher",
+        json!({"url": format!("{}/big", f.echo), "body": big, "stream": false, "max_bytes": 500}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["h"]["truncated"], true);
+    assert!(out["h"]["body"].as_str().unwrap().len() <= 500);
 }
 
 #[tokio::test]

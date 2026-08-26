@@ -22,7 +22,7 @@ feature-complete rival to existing harnesses.
   path, argv or URL, the plugin asking, and the model's tool call behind it.
   Per *hop*, not per step: the HTTP client follows no redirects of its own,
   so a `Location` faces both gates like any other request, and one that
-  leaves the origin travels without the plugin's credential headers.
+  leaves the origin travels without the plugin's headers.
 - **No ambient authority.** A plugin reaches only what its manifest declares
   and the operator allows. A spawned child therefore gets the environment the
   frontend's policy describes, not the one the agent was launched from.
@@ -70,8 +70,8 @@ opens sockets.
   an approval; `boot` / `boot_with`.
 - **Done when:** the kernel refuses an ungranted step type *before* the
   operator is asked; every step asks the operator with its concrete
-  arguments; an HTTP redirect faces both gates again per hop and loses its
-  credential headers when it leaves the origin; a spawned child receives only
+  arguments; an HTTP redirect faces both gates again per hop and loses the
+  plugin's headers when it leaves the origin; a spawned child receives only
   the allow-listed environment; an approval raised two plugins deep still
   names the tool call that caused it; `host_fs.read` bounds what it reads
   rather than allocating the whole file and truncating afterwards;

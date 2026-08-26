@@ -37,9 +37,6 @@ pub const DEFAULT_MAX_REDIRECTS: u64 = 5;
 /// Time allowed to establish a connection, inside the overall budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Headers that carry authority and must not cross an origin boundary.
-const CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
-
 type StepFuture<'a> = Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
 fn client() -> &'static reqwest::Client {
@@ -66,7 +63,7 @@ struct Redirect {
     method: Method,
     /// Whether the body is dropped (a method rewrite; RFC 9110 §15.4).
     drop_body: bool,
-    /// Whether the hop leaves the current origin, so credential headers
+    /// Whether the hop leaves the current origin, so the plugin's headers
     /// must not go with it.
     cross_origin: bool,
 }
@@ -193,9 +190,11 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// run through both gates again — the kernel's `network:egress:<host>`
 /// grant first, then the operator, shown the concrete next URL — because a
 /// followed redirect is a request to a host the plugin never declared and
-/// the operator never saw. Leaving the origin also strips `authorization`,
-/// `cookie` and `proxy-authorization`: a redirect is the far end choosing
-/// where a plugin's credential goes, which is not its choice to make.
+/// the operator never saw. A hop that leaves the origin carries *none* of
+/// the plugin's headers: which of them holds authority is the plugin's
+/// business (`x-api-key` is authority to Anthropic), so the host assumes
+/// they all do — a redirect is the far end choosing where a plugin's
+/// credential goes, which is not its choice to make.
 ///
 /// # Time
 ///
@@ -322,8 +321,10 @@ fn request<'a>(
             }
             hops += 1;
             if next.cross_origin {
-                headers
-                    .retain(|(k, _)| !CREDENTIAL_HEADERS.iter().any(|c| k.eq_ignore_ascii_case(c)));
+                // All of them, not a known-credential list: which header
+                // carries authority is the plugin's business, so the host
+                // assumes every one does.
+                headers.clear();
             }
             if next.drop_body {
                 body = None;
@@ -362,15 +363,28 @@ fn request<'a>(
         }
 
         let host = host_of(&url)?;
-        let bytes = tokio::select! {
-            r = tokio::time::timeout_at(deadline, resp.bytes()) => match r {
-                Ok(r) => r.map_err(|e| StepError::Failed(format!("reading response from {host}: {e}")))?,
-                Err(_) => return Err(StepError::Failed(format!(
-                    "reading response from {host} exceeded timeout of {timeout:?}"
-                ))),
-            },
-            () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
-        };
+        let mut chunks = resp.bytes_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let chunk = tokio::select! {
+                r = tokio::time::timeout_at(deadline, chunks.next()) => match r {
+                    Ok(c) => c,
+                    Err(_) => return Err(StepError::Failed(format!(
+                        "reading response from {host} exceeded timeout of {timeout:?}"
+                    ))),
+                },
+                () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = chunk
+                .map_err(|e| StepError::Failed(format!("reading response from {host}: {e}")))?;
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > max {
+                // Already past the cap: the rest of the body stays unread,
+                // so max_bytes bounds host memory, not just the result.
+                break;
+            }
+        }
         let (body, truncated) = lossy_capped(&bytes, max);
         Ok(StepOutput::with_metadata(
             json!({"status": status, "body": body, "truncated": truncated}),
