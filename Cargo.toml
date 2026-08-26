@@ -19,3 +19,5 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs", "process", "time"] }
 tracing = "0.1"
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+url = "2"

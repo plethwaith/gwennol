@@ -15,14 +15,18 @@ use crate::steps;
 pub const HOST_FS_MANIFEST: &str = include_str!("../resources/host_fs.json");
 /// The `host_process` plugin manifest, as shipped.
 pub const HOST_PROCESS_MANIFEST: &str = include_str!("../resources/host_process.json");
+/// The `host_http` plugin manifest, as shipped.
+pub const HOST_HTTP_MANIFEST: &str = include_str!("../resources/host_http.json");
 
 /// Every host plugin manifest, in registration order.
-pub const HOST_MANIFESTS: [&str; 2] = [HOST_FS_MANIFEST, HOST_PROCESS_MANIFEST];
+pub const HOST_MANIFESTS: [&str; 3] = [HOST_FS_MANIFEST, HOST_PROCESS_MANIFEST, HOST_HTTP_MANIFEST];
 
 gwead::native_step_impl!("gwennol.host_fs.read", steps::fs::fs_read);
 gwead::native_step_impl!("gwennol.host_fs.write", steps::fs::fs_write);
 gwead::native_step_impl!("gwennol.host_fs.list", steps::fs::fs_list);
 gwead::native_step_impl!("gwennol.host_process.run", steps::process::process_run);
+gwead::native_step_impl!("gwennol.host_http.get", steps::http::http_get);
+gwead::native_step_impl!("gwennol.host_http.post", steps::http::http_post);
 
 /// Why [`boot`] failed.
 #[derive(Debug, thiserror::Error)]
@@ -39,7 +43,8 @@ pub enum BootError {
 }
 
 /// Install the operator as this process's host and boot a kernel with the
-/// host plugins registered, with the default [`ProcessEnv`].
+/// `host_fs`, `host_process` and `host_http` plugins registered, with the
+/// default [`ProcessEnv`].
 ///
 /// Returns the kernel un-wrapped so the caller can register the bundled
 /// SPIs and plugins before calling [`Kernel::into_arc`] — every step body

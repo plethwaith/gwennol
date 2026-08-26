@@ -5,15 +5,18 @@
 //! The host is a process singleton, so this binary boots one kernel with
 //! every fixture plugin registered up front and shares it across tests.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use gwead::kernel::streams::{STREAM_EOF, STREAM_IO_ERROR, StreamRegistry, read_async_shared};
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwennol_core::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
 
 /// Records every approval request; denies anything the `denied` plugin
-/// asks for.
+/// asks for; answers `token` for the `secretive` plugin.
 #[derive(Default)]
 struct Recorder {
     requests: Mutex<Vec<ApprovalRequest>>,
@@ -30,8 +33,8 @@ impl Operator for Recorder {
             Decision::Allow
         }
     }
-    async fn secret(&self, _plugin: &str, _name: &str) -> Option<String> {
-        None
+    async fn secret(&self, plugin: &str, name: &str) -> Option<String> {
+        (plugin == "secretive" && name == "token").then(|| "s3cr3t".to_string())
     }
     fn emit(&self, _: Event) {}
     async fn input(&self) -> Option<Turn> {
@@ -43,6 +46,11 @@ struct Fixture {
     kernel: Arc<Kernel>,
     operator: Arc<Recorder>,
     workspace: PathBuf,
+    /// `http://127.0.0.1:<port>` of the echo server.
+    echo: String,
+    /// A second echo server: same host, different port, so a redirect
+    /// between them crosses an origin without leaving the egress grant.
+    echo2: String,
 }
 
 impl Fixture {
@@ -68,6 +76,17 @@ impl Fixture {
             .map(|r| r.cause.clone())
             .collect()
     }
+
+    /// Every URL the operator was shown for `plugin`.
+    fn urls_for(&self, plugin: &str) -> Vec<String> {
+        self.requests_for(plugin)
+            .into_iter()
+            .filter_map(|a| match a {
+                Access::Http { url, .. } => Some(url),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn fixture() -> &'static Fixture {
@@ -83,6 +102,8 @@ fn fixture() -> &'static Fixture {
             kernel: kernel.into_arc(),
             operator,
             workspace,
+            echo: spawn_echo_server(),
+            echo2: spawn_echo_server(),
         }
     })
 }
@@ -116,6 +137,34 @@ fn fixture_plugins() -> Vec<Value> {
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": "{{$input.timeout_ms}}"}}]),
         ),
         plugin(
+            "fetcher",
+            &["step_type:host_http.post", "network:egress:127.0.0.1"],
+            json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "body": "{{$input.body}}", "stream": "{{$input.stream}}"}}]),
+        ),
+        plugin(
+            "getter",
+            &["step_type:host_http.get", "network:egress:127.0.0.1"],
+            json!([{"id": "h", "type": "host_http.get", "params": {"url": "{{$input.url}}", "stream": "{{$input.stream}}"}}]),
+        ),
+        plugin(
+            "getbody",
+            &["step_type:host_http.get", "network:egress:127.0.0.1"],
+            json!([{"id": "h", "type": "host_http.get", "params": {"url": "{{$input.url}}", "body": "nope"}}]),
+        ),
+        plugin(
+            "tuned",
+            &["step_type:host_http.get", "network:egress:127.0.0.1"],
+            json!([{"id": "h", "type": "host_http.get", "params": {
+                "url": "{{$input.url}}", "stream": "{{$input.stream}}",
+                "timeout_ms": "{{$input.timeout_ms}}", "idle_timeout_ms": "{{$input.idle_timeout_ms}}",
+                "max_redirects": "{{$input.max_redirects}}"}}]),
+        ),
+        plugin(
+            "nofetch",
+            &["step_type:host_http.get"],
+            json!([{"id": "h", "type": "host_http.get", "params": {"url": "{{$input.url}}"}}]),
+        ),
+        plugin(
             "delegator",
             &["invoke:plugin:reader"],
             json!([{"id": "i", "type": "invoke", "params": {"plugin": "reader", "action": "go", "input": {"path": "{{$input.path}}", "max_bytes": 1024}}}]),
@@ -130,7 +179,115 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_fs.read"],
             json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}"}}]),
         ),
+        {
+            let mut p = plugin(
+                "secretive",
+                &["step_type:host_http.post", "network:egress:127.0.0.1"],
+                json!([{"id": "h", "type": "host_http.post", "params": {"url": "{{$input.url}}", "headers": {"authorization": "Bearer {{$secrets.token}}"}}}]),
+            );
+            p["usesSecrets"] = json!(["token"]);
+            p
+        },
     ]
+}
+
+/// Minimal HTTP/1.1 server: answers every request with a JSON echo of the
+/// method, path, headers and body. Streaming-friendly: the body is sent in
+/// two writes with a flush between.
+fn spawn_echo_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (head_end, mut body_len) = loop {
+                    let n = s.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        break (i + 4, len);
+                    }
+                };
+                while buf.len() < head_end + body_len {
+                    let n = s.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        body_len = buf.len() - head_end;
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let mut lines = head.lines();
+                let req_line = lines.next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let headers: gwead::serde_json::Map<String, Value> = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| {
+                        (
+                            k.trim().to_ascii_lowercase(),
+                            Value::String(v.trim().to_string()),
+                        )
+                    })
+                    .collect();
+                let (route, query) = path.split_once('?').unwrap_or((path, ""));
+                let location = query.strip_prefix("to=").unwrap_or("");
+                match route {
+                    // `/redirect?to=<url>` sends the client onward; the
+                    // 307 form is the one that must keep method and body.
+                    "/redirect" | "/redirect307" | "/loop" => {
+                        let (code, to) = match route {
+                            "/redirect307" => ("307 Temporary Redirect", location),
+                            "/loop" => ("302 Found", "/loop"),
+                            _ => ("302 Found", location),
+                        };
+                        write!(s, "HTTP/1.1 {code}\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                        return;
+                    }
+                    // Reads the request and never answers.
+                    "/hang" => {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
+                    // Answers, sends half a body, then goes quiet.
+                    "/dribble" => {
+                        write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 32\r\nconnection: close\r\n\r\n").unwrap();
+                        s.write_all(b"data: half").unwrap();
+                        s.flush().unwrap();
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
+                    _ => {}
+                }
+                let body = String::from_utf8_lossy(&buf[head_end..head_end + body_len]).to_string();
+                let echo =
+                    json!({"method": method, "path": path, "headers": headers, "body": body})
+                        .to_string();
+                let (a, b) = echo.split_at(echo.len() / 2);
+                write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-echo: yes\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", echo.len()).unwrap();
+                s.write_all(a.as_bytes()).unwrap();
+                s.flush().unwrap();
+                s.write_all(b.as_bytes()).unwrap();
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
 }
 
 async fn run(plugin: &str, input: Value) -> Result<Value, KernelError> {
@@ -265,6 +422,211 @@ async fn process_run_times_out() {
     assert!(err.to_string().contains("exceeded timeout"), "{err}");
 }
 
+// ---------------------------------------------------------------- http
+
+#[tokio::test]
+async fn http_post_buffered_with_json_body() {
+    let f = fixture();
+    let out = run(
+        "fetcher",
+        json!({"url": format!("{}/chat", f.echo), "body": {"a": 1}, "stream": false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["h"]["status"], 200);
+    let echoed: Value = gwead::serde_json::from_str(out["h"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["method"], "POST");
+    assert_eq!(echoed["path"], "/chat");
+    assert_eq!(echoed["headers"]["content-type"], "application/json");
+    assert_eq!(echoed["body"], "{\"a\":1}");
+    assert!(f.requests_for("fetcher").iter().any(
+        |a| matches!(a, Access::Http { method, url } if method == "POST" && url.ends_with("/chat"))
+    ));
+}
+
+#[tokio::test]
+async fn http_get_streaming_returns_a_readable_handle() {
+    let f = fixture();
+    let streams = Arc::new(Mutex::new(StreamRegistry::new()));
+    let r = f
+        .kernel
+        .execute(
+            "getter",
+            "go",
+            json!({"url": format!("{}/stream", f.echo), "stream": true}),
+        )
+        .with_config(&json!({}))
+        .with_streams(streams.clone())
+        .run()
+        .await
+        .unwrap();
+    let handle = r.step_results["h"]["body"].as_u64().expect("stream handle") as u32;
+    let id = std::num::NonZeroU32::new(handle).unwrap();
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 7]; // small, so the body takes many reads
+    loop {
+        let n = read_async_shared(&streams, id, &mut buf).await;
+        if n == STREAM_EOF {
+            break;
+        }
+        assert!(n > 0, "stream read returned {n}");
+        collected.extend_from_slice(&buf[..n as usize]);
+    }
+    let echoed: Value = gwead::serde_json::from_slice(&collected).unwrap();
+    assert_eq!(echoed["method"], "GET");
+    assert_eq!(echoed["path"], "/stream");
+}
+
+#[tokio::test]
+async fn a_get_with_a_body_is_refused() {
+    let f = fixture();
+    let err = run("getbody", json!({"url": format!("{}/x", f.echo)}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("body"), "{err}");
+}
+
+#[tokio::test]
+async fn http_post_secret_reaches_header_only_for_declaring_plugin() {
+    let f = fixture();
+    let out = run("secretive", json!({"url": format!("{}/auth", f.echo)}))
+        .await
+        .unwrap();
+    let echoed: Value = gwead::serde_json::from_str(out["h"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["headers"]["authorization"], "Bearer s3cr3t");
+}
+
+// ---------------------------------------------------------------- http redirects
+
+#[tokio::test]
+async fn redirect_is_followed_and_every_hop_faces_the_operator() {
+    let f = fixture();
+    let start = format!("{}/redirect?to=/final", f.echo);
+    let out = run("getter", json!({"url": start, "stream": false}))
+        .await
+        .unwrap();
+    let echoed: Value = gwead::serde_json::from_str(out["h"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["path"], "/final", "the redirect was not followed");
+    let urls = f.urls_for("getter");
+    assert!(urls.contains(&start), "{urls:?}");
+    assert!(
+        urls.iter().any(|u| u.ends_with("/final")),
+        "the operator never saw the hop: {urls:?}"
+    );
+}
+
+#[tokio::test]
+async fn redirect_to_an_ungranted_host_is_refused() {
+    let f = fixture();
+    // Same machine, same port — but `localhost` is not the host the
+    // manifest declared, and the grant is what decides.
+    let onward = f.echo.replace("127.0.0.1", "localhost");
+    let err = run(
+        "getter",
+        json!({"url": format!("{}/redirect?to={onward}/final", f.echo), "stream": false}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("network:egress:localhost"),
+        "{err}"
+    );
+    // Not `contains`: the starting URL names the onward host in its query
+    // string. What must never appear is a request *to* it.
+    assert!(
+        !f.urls_for("getter").iter().any(|u| u.starts_with(&onward)),
+        "operator was asked about a host the manifest never declared"
+    );
+}
+
+#[tokio::test]
+async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one() {
+    let f = fixture();
+    let same = run(
+        "secretive",
+        json!({"url": format!("{}/redirect?to=/after", f.echo)}),
+    )
+    .await
+    .unwrap();
+    let echoed: Value = gwead::serde_json::from_str(same["h"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["path"], "/after");
+    assert_eq!(echoed["headers"]["authorization"], "Bearer s3cr3t");
+
+    let across = run(
+        "secretive",
+        json!({"url": format!("{}/redirect?to={}/after", f.echo, f.echo2)}),
+    )
+    .await
+    .unwrap();
+    let echoed: Value = gwead::serde_json::from_str(across["h"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["path"], "/after");
+    assert_eq!(
+        echoed["headers"].get("authorization"),
+        None,
+        "the key followed a redirect off its origin: {echoed}"
+    );
+}
+
+#[tokio::test]
+async fn redirect_chain_is_bounded() {
+    let f = fixture();
+    let err = run(
+        "tuned",
+        json!({"url": format!("{}/loop", f.echo), "stream": false, "timeout_ms": 10000, "idle_timeout_ms": 10000, "max_redirects": 2}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("more than 2 redirects"), "{err}");
+}
+
+// ---------------------------------------------------------------- http time
+
+#[tokio::test]
+async fn http_times_out_reaching_a_response() {
+    let f = fixture();
+    let err = run(
+        "tuned",
+        json!({"url": format!("{}/hang", f.echo), "stream": false, "timeout_ms": 200, "idle_timeout_ms": 10000, "max_redirects": 5}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("exceeded timeout"), "{err}");
+}
+
+#[tokio::test]
+async fn stalled_stream_ends_in_an_io_error_rather_than_hanging() {
+    let f = fixture();
+    let streams = Arc::new(Mutex::new(StreamRegistry::new()));
+    let r = f
+        .kernel
+        .execute(
+            "tuned",
+            "go",
+            json!({"url": format!("{}/dribble", f.echo), "stream": true, "timeout_ms": 10000, "idle_timeout_ms": 200, "max_redirects": 5}),
+        )
+        .with_config(&json!({}))
+        .with_streams(streams.clone())
+        .run()
+        .await
+        .unwrap();
+    let handle = r.step_results["h"]["body"].as_u64().expect("stream handle") as u32;
+    let id = std::num::NonZeroU32::new(handle).unwrap();
+    let mut buf = [0u8; 64];
+    let mut seen = Vec::new();
+    let code = loop {
+        let n = read_async_shared(&streams, id, &mut buf).await;
+        if n < 0 {
+            break n;
+        }
+        seen.extend_from_slice(&buf[..n as usize]);
+    };
+    assert_eq!(seen, b"data: half", "the delivered prefix was lost");
+    assert_eq!(
+        code, STREAM_IO_ERROR,
+        "a peer that stopped talking should surface as an error, not EOF"
+    );
+}
+
 // ---------------------------------------------------------------- cause
 
 fn a_tool_call() -> ToolCall {
@@ -354,6 +716,22 @@ async fn kernel_refuses_ungranted_step_type_before_operator_is_asked() {
 }
 
 #[tokio::test]
+async fn missing_egress_grant_is_refused_before_operator_is_asked() {
+    let f = fixture();
+    let err = run("nofetch", json!({"url": format!("{}/x", f.echo)}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("network:egress:127.0.0.1"),
+        "{err}"
+    );
+    assert!(
+        f.requests_for("nofetch").is_empty(),
+        "operator was asked despite missing egress grant"
+    );
+}
+
+#[tokio::test]
 async fn operator_denial_fails_the_step() {
     let f = fixture();
     std::fs::write(f.workspace.join("secret.txt"), "no").unwrap();
@@ -395,6 +773,8 @@ fn host_manifests_are_valid_and_nothing_is_freely_usable() {
             "host_fs.write",
             "host_fs.list",
             "host_process.run",
+            "host_http.get",
+            "host_http.post",
         ]
     );
 }

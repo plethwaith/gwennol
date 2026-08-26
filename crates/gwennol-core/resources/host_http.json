@@ -1,0 +1,81 @@
+{
+  "formatVersion": 1,
+  "name": "host_http",
+  "version": "0.1.0",
+  "description": "Gwennol HTTP step types, one per method, so a manifest that only fetches is provably read-only. Native code; every hop asks the operator. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_http.* grant, and network:egress:<host> for every host it reaches.",
+  "stepTypeDefs": [
+    {
+      "name": "host_http.get",
+      "inputSchema": {
+        "type": "object",
+        "required": ["url"],
+        "additionalProperties": false,
+        "properties": {
+          "url": { "type": "string", "description": "http or https URL. The calling plugin must hold network:egress:<host> — for every host in the redirect chain, not just this one." },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "stream": { "type": "boolean", "default": false, "description": "Return the response body as a readable stream handle instead of buffering it." },
+          "max_bytes": { "type": "integer", "minimum": 0, "default": 8388608, "description": "Cap on a buffered body." },
+          "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Budget for reaching a response, redirects included; also covers reading a buffered body." },
+          "idle_timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Streaming only: longest gap allowed between chunks of the response body." },
+          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin strips credential headers. 0 refuses to follow any." }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["status", "body"],
+        "properties": {
+          "status": { "type": "integer" },
+          "body": { "description": "Decoded text when buffered; an integer stream handle when streaming." },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "metadataSchema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "integer" },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "url": { "type": "string", "description": "The URL that finally answered — the last hop of any redirect chain." }
+        }
+      }
+    },
+    {
+      "name": "host_http.post",
+      "inputSchema": {
+        "type": "object",
+        "required": ["url"],
+        "additionalProperties": false,
+        "properties": {
+          "url": { "type": "string", "description": "http or https URL. The calling plugin must hold network:egress:<host> — for every host in the redirect chain, not just this one." },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "body": { "description": "A string is sent verbatim; any other value is serialised as JSON." },
+          "stream": { "type": "boolean", "default": false, "description": "Return the response body as a readable stream handle instead of buffering it." },
+          "max_bytes": { "type": "integer", "minimum": 0, "default": 8388608, "description": "Cap on a buffered body." },
+          "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Budget for reaching a response, redirects included; also covers reading a buffered body." },
+          "idle_timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Streaming only: longest gap allowed between chunks of the response body." },
+          "max_redirects": { "type": "integer", "minimum": 0, "default": 5, "description": "Redirects followed. Each hop is re-checked against network:egress and re-approved by the operator, and leaving the origin strips credential headers. 0 refuses to follow any." }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["status", "body"],
+        "properties": {
+          "status": { "type": "integer" },
+          "body": { "description": "Decoded text when buffered; an integer stream handle when streaming." },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "metadataSchema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "integer" },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "url": { "type": "string", "description": "The URL that finally answered — the last hop of any redirect chain." }
+        }
+      }
+    }
+  ],
+  "stepTypeImpls": [
+    { "stepType": "host_http.get", "kind": "native", "implRef": "gwennol.host_http.get" },
+    { "stepType": "host_http.post", "kind": "native", "implRef": "gwennol.host_http.post" }
+  ]
+}
