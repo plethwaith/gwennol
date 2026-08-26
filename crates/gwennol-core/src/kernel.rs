@@ -62,7 +62,6 @@ pub fn boot(operator: Arc<dyn Operator>, workspace_root: PathBuf) -> Result<Kern
 /// environment spawned processes get.
 pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     let operator = host.operator.clone();
-    install(host).map_err(|_| BootError::AlreadyInstalled)?;
     let config = KernelConfig::default()
         .with_native_step_impls(NativeStepImplTable::discover()?)
         .with_secret_resolver(Arc::new(OperatorSecrets(operator)));
@@ -70,5 +69,10 @@ pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     for manifest in HOST_MANIFESTS {
         kernel.register_plugin_from_json(manifest)?;
     }
+    // The process-global host is installed only once everything fallible
+    // has succeeded, so a failed boot leaves the process able to try
+    // again. No step can run before this: executing actions needs the
+    // kernel this function is about to return.
+    install(host).map_err(|_| BootError::AlreadyInstalled)?;
     Ok(kernel)
 }
