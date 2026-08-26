@@ -6,8 +6,6 @@
 //! rewrite the method mid-chain (a 303, or a legacy 302 on a POST), so the
 //! method is fixed per *step type* but still varies per hop.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -20,7 +18,7 @@ use reqwest::Method;
 use tokio::time::Instant;
 use url::Url;
 
-use super::{bool_param, lossy_capped, resolve, str_param, u64_param};
+use super::{StepFuture, bool_param, lossy_capped, resolve, str_param, u64_param};
 use crate::host::{approval, approve};
 use crate::operator::Access;
 
@@ -36,8 +34,6 @@ pub const DEFAULT_MAX_REDIRECTS: u64 = 5;
 
 /// Time allowed to establish a connection, inside the overall budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-type StepFuture<'a> = Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -341,18 +337,18 @@ fn request<'a>(
                 Value::String(String::from_utf8_lossy(v.as_bytes()).into_owned()),
             );
         }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
         let mut metadata = IndexMap::new();
         metadata.insert("status".to_string(), json!(status));
         metadata.insert("headers".to_string(), Value::Object(hdrs));
         metadata.insert("url".to_string(), json!(url.to_string()));
 
         if stream {
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
             let source = resp.bytes_stream().map_err(std::io::Error::other).boxed();
             let handle = lock_shared(ex.streams())
                 .register_readable(content_type, guarded_body(source, idle, cancel));

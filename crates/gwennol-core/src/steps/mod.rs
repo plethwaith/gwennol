@@ -20,8 +20,27 @@ pub mod fs;
 pub mod http;
 pub mod process;
 
-use gwead::kernel::{PluginExecution, StepError};
+use std::future::Future;
+use std::pin::Pin;
+
+use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::Value;
+use gwead::tokio_util::sync::CancellationToken;
+
+/// The boxed future a native step implementation returns.
+pub(crate) type StepFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
+
+/// Run `work` to completion, unless the invocation is cancelled first.
+pub(crate) async fn or_cancelled<T>(
+    cancel: &CancellationToken,
+    work: impl Future<Output = T>,
+) -> Result<T, StepError> {
+    tokio::select! {
+        r = work => Ok(r),
+        () = cancel.cancelled() => Err(StepError::Failed("cancelled".into())),
+    }
+}
 
 /// Resolve `{{templates}}` in the raw step params.
 pub(crate) fn resolve(ex: &dyn PluginExecution, params: &Value) -> Value {

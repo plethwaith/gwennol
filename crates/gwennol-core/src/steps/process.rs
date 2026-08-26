@@ -1,15 +1,13 @@
 //! `host_process.run`.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use gwead::kernel::{PluginExecution, StepError, StepOutput};
+use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{lossy_capped, resolve, u64_param};
+use super::{StepFuture, lossy_capped, resolve, u64_param};
 use crate::host::{approval, approve, host, resolve_path};
 use crate::operator::Access;
 
@@ -17,8 +15,6 @@ use crate::operator::Access;
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1 << 20;
 /// Default wall-clock limit.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-
-type StepFuture<'a> = Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
 /// Read everything `r` produces, keeping at most `cap + 1` bytes (one past
 /// the cap marks truncation) and discarding the rest — the pipe is drained

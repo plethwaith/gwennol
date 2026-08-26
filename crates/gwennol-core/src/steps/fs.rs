@@ -1,14 +1,12 @@
 //! `host_fs.read`, `host_fs.write`, `host_fs.list`.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gwead::kernel::{PluginExecution, StepError, StepOutput};
+use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{bool_param, lossy_capped, resolve, str_param, u64_param};
+use super::{StepFuture, bool_param, lossy_capped, or_cancelled, resolve, str_param, u64_param};
 use crate::host::{approval, approve, resolve_path};
 use crate::operator::Access;
 
@@ -16,8 +14,6 @@ use crate::operator::Access;
 pub const DEFAULT_READ_MAX_BYTES: u64 = 1 << 20;
 /// Default cap on entries returned by `fs_list`.
 pub const DEFAULT_LIST_MAX_ENTRIES: u64 = 1000;
-
-type StepFuture<'a> = Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
 /// `host_fs.read`: `{path, max_bytes?}` → `{content, truncated, size}`.
 ///
@@ -43,10 +39,9 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             file.take(max as u64 + 1).read_to_end(&mut bytes).await?;
             std::io::Result::Ok((size, bytes))
         };
-        let (size, bytes) = tokio::select! {
-            r = read => r.map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?,
-            () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
-        };
+        let (size, bytes) = or_cancelled(&cancel, read)
+            .await?
+            .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
         let (content, truncated) = lossy_capped(&bytes, max);
         Ok(json!({"content": content, "truncated": truncated, "size": size}).into())
     })
@@ -117,10 +112,9 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 .await
                 .map_err(|e| StepError::Failed(format!("mkdir {}: {e}", parent.display())))?;
         }
-        tokio::select! {
-            r = write_via_rename(&path, &content) => r.map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?,
-            () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
-        }
+        or_cancelled(&cancel, write_via_rename(&path, &content))
+            .await?
+            .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
         Ok(json!({"bytes_written": content.len()}).into())
     })
 }
@@ -145,10 +139,9 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         let mut entries = Vec::new();
         let mut truncated = false;
         loop {
-            let next = tokio::select! {
-                r = rd.next_entry() => r.map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?,
-                () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
-            };
+            let next = or_cancelled(&cancel, rd.next_entry())
+                .await?
+                .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
             let Some(entry) = next else { break };
             if entries.len() >= max {
                 truncated = true;
