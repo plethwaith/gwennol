@@ -139,7 +139,7 @@ fn fixture_plugins() -> Vec<Value> {
         plugin(
             "runner",
             &["step_type:host_process.run"],
-            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": "{{$input.timeout_ms}}"}}]),
+            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": "{{$input.timeout_ms}}", "max_output_bytes": "{{$input.max_output_bytes}}"}}]),
         ),
         plugin(
             "fetcher",
@@ -446,17 +446,93 @@ async fn fs_list_caps_entries_and_reports_the_cut() {
 #[tokio::test]
 async fn process_run_captures_output_and_status_without_a_shell() {
     let f = fixture();
-    let out = run("runner", json!({"argv": ["sh", "-c", "cat; echo err >&2; exit 3"], "stdin": "from stdin", "timeout_ms": 10000})).await.unwrap();
+    let out = run("runner", json!({"argv": ["sh", "-c", "cat; echo err >&2; exit 3"], "stdin": "from stdin", "timeout_ms": 10000, "max_output_bytes": 1048576})).await.unwrap();
     assert_eq!(out["p"]["status"], 3);
     assert_eq!(out["p"]["stdout"], "from stdin");
     assert_eq!(out["p"]["stderr"], "err\n");
     let asked = f.requests_for("runner");
     assert!(
         asked.iter().any(
-            |a| matches!(a, Access::Spawn { argv, cwd } if argv[0] == "sh" && *cwd == f.workspace)
+            |a| matches!(a, Access::Spawn { argv, cwd, .. } if argv[0] == "sh" && *cwd == f.workspace)
         ),
         "{asked:?}"
     );
+    assert!(
+        asked.iter().any(
+            |a| matches!(a, Access::Spawn { stdin, .. } if *stdin == Some("from stdin".into()))
+        ),
+        "the operator was not shown the stdin payload: {asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn process_run_survives_a_child_that_never_reads_a_large_stdin() {
+    // Bigger than any pipe buffer; a blocking stdin write before the drains
+    // would deadlock here and ignore the timeout entirely.
+    let big = "x".repeat(1 << 20);
+    let out = run(
+        "runner",
+        json!({"argv": ["sh", "-c", "exit 0"], "stdin": big, "timeout_ms": 10000, "max_output_bytes": 1048576}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["p"]["status"], 0);
+}
+
+#[tokio::test]
+async fn process_run_bounds_captured_output_while_draining_the_rest() {
+    let out = run(
+        "runner",
+        json!({"argv": ["sh", "-c", "head -c 200000 /dev/zero"], "stdin": "", "timeout_ms": 10000, "max_output_bytes": 100}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["p"]["status"], 0,
+        "the drained child should still exit cleanly"
+    );
+    assert_eq!(out["p"]["stdout_truncated"], true);
+    assert!(out["p"]["stdout"].as_str().unwrap().len() <= 100);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_timed_out_process_group_leaves_no_orphans() {
+    let f = fixture();
+    // The backgrounded sleep would outlive a kill that reached only the
+    // direct child. The shell records its own pid, which — as group
+    // leader — is also the pgid.
+    let err = run(
+        "runner",
+        json!({"argv": ["sh", "-c", "echo $$ > pg.pid; sleep 30 & sleep 30"], "stdin": "", "timeout_ms": 500, "max_output_bytes": 1048576}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("exceeded timeout"), "{err}");
+    let pgid: u32 = std::fs::read_to_string(f.workspace.join("pg.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Poll: a freshly-reparented zombie still answers kill -0 until init
+    // reaps it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let alive = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process group {pgid} is still alive after the timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[tokio::test]
@@ -467,7 +543,7 @@ async fn process_run_child_sees_only_the_allow_listed_environment() {
     );
     let out = run(
         "runner",
-        json!({"argv": ["sh", "-c", r#"printf '%s|%s' "${PATH:+set}" "${CARGO_MANIFEST_DIR:+leaked}""#], "stdin": "", "timeout_ms": 10000}),
+        json!({"argv": ["sh", "-c", r#"printf '%s|%s' "${PATH:+set}" "${CARGO_MANIFEST_DIR:+leaked}""#], "stdin": "", "timeout_ms": 10000, "max_output_bytes": 1048576}),
     )
     .await
     .unwrap();
@@ -481,7 +557,7 @@ async fn process_run_child_sees_only_the_allow_listed_environment() {
 async fn process_run_times_out() {
     let err = run(
         "runner",
-        json!({"argv": ["sleep", "5"], "stdin": "", "timeout_ms": 100}),
+        json!({"argv": ["sleep", "5"], "stdin": "", "timeout_ms": 100, "max_output_bytes": 1048576}),
     )
     .await
     .unwrap_err();

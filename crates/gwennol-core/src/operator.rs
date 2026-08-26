@@ -24,6 +24,11 @@ pub enum Access {
         argv: Vec<String>,
         /// Working directory.
         cwd: PathBuf,
+        /// What will be piped to the child's stdin. Part of the request
+        /// because for an interpreter (`sh`, `python`, …) it is the real
+        /// payload — an approval that omitted it would be judging the
+        /// envelope and not the letter.
+        stdin: Option<String>,
     },
     /// Make an outbound HTTP request.
     Http {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{lossy_capped, resolve, u64_param};
 use crate::host::{approval, approve, host, resolve_path};
@@ -20,14 +20,55 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 type StepFuture<'a> = Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
+/// Read everything `r` produces, keeping at most `cap + 1` bytes (one past
+/// the cap marks truncation) and discarding the rest — the pipe is drained
+/// to the end so the child never blocks on it, while the host's memory
+/// stays bounded by the cap rather than by how fast the child can write.
+async fn drain_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(kept);
+        }
+        let room = (cap + 1).saturating_sub(kept.len());
+        kept.extend_from_slice(&buf[..n.min(room)]);
+    }
+}
+
+/// SIGKILL the whole process group the child leads, so a timed-out
+/// `sh -c` leaves no orphans behind.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // The child was spawned as its group's leader, so its pid is the pgid.
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
+/// Non-unix targets have no process-group notion for this to use; the
+/// direct child still dies via `kill_on_drop`.
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
+
 /// `host_process.run`: `{argv, cwd?, stdin?, timeout_ms?, max_output_bytes?}`
 /// → `{status, stdout, stderr, stdout_truncated, stderr_truncated}`.
 ///
-/// Exceeding `timeout_ms` fails the step; the child is killed on drop.
+/// Exceeding `timeout_ms` fails the step and kills the child's whole
+/// process group (the child is spawned as its leader), not just the child —
+/// so a timed-out `sh -c` leaves no orphans. Cancellation does the same.
 ///
 /// No shell is involved: `argv[0]` is the program. A tool that wants a
 /// shell asks for one explicitly (`["sh", "-c", …]`) and the operator sees
-/// that it did.
+/// that it did — including `stdin`, which for an interpreter is the real
+/// payload.
+///
+/// stdin is fed and stdout/stderr drained concurrently, each capped at
+/// `max_output_bytes` (excess is read and discarded), so a child that
+/// floods a pipe or never reads its input cannot deadlock the step or
+/// balloon the host.
 ///
 /// The child's environment is whatever [`ProcessEnv`](crate::ProcessEnv)
 /// the frontend installed — by default an allow-list, so credentials the
@@ -73,6 +114,7 @@ pub fn process_run<'a>(
             Access::Spawn {
                 argv: argv.clone(),
                 cwd: cwd.clone(),
+                stdin: stdin.clone(),
             },
         );
         approve(ask).await.map_err(StepError::Failed)?;
@@ -88,29 +130,55 @@ pub fn process_run<'a>(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         if let Some(env) = host().process_env.resolve() {
             cmd.env_clear().envs(env);
         }
         let mut child = cmd
             .spawn()
             .map_err(|e| StepError::Failed(format!("spawn {:?}: {e}", argv[0])))?;
+        let pid = child.id();
         if let Some(input) = stdin {
             let mut pipe = child.stdin.take().expect("stdin piped");
-            // A child that exits without reading is not an error.
-            let _ = pipe.write_all(input.as_bytes()).await;
-            drop(pipe);
+            // Concurrent with the drains below, so a child that fills its
+            // stdout before reading its stdin cannot deadlock the step. A
+            // child that exits without reading is not an error.
+            tokio::spawn(async move {
+                let _ = pipe.write_all(input.as_bytes()).await;
+                drop(pipe);
+            });
         }
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        let mut work = Box::pin(async move {
+            let (out, err) = tokio::join!(
+                drain_capped(stdout_pipe, max),
+                drain_capped(stderr_pipe, max)
+            );
+            let status = child.wait().await?;
+            std::io::Result::Ok((status, out?, err?))
+        });
 
         let cancel = ex.cancel_token();
-        let output = tokio::select! {
-            r = child.wait_with_output() => r.map_err(|e| StepError::Failed(format!("wait {:?}: {e}", argv[0])))?,
-            () = tokio::time::sleep(timeout) => return Err(StepError::Failed(format!("{:?} exceeded timeout of {timeout:?}", argv[0]))),
-            () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
+        let (status, stdout_bytes, stderr_bytes) = tokio::select! {
+            r = &mut work => r.map_err(|e| StepError::Failed(format!("wait {:?}: {e}", argv[0])))?,
+            () = tokio::time::sleep(timeout) => {
+                if let Some(pid) = pid { kill_group(pid); }
+                // Reap; SIGKILL makes this return promptly.
+                let _ = work.await;
+                return Err(StepError::Failed(format!("{:?} exceeded timeout of {timeout:?}", argv[0])));
+            }
+            () = cancel.cancelled() => {
+                if let Some(pid) = pid { kill_group(pid); }
+                let _ = work.await;
+                return Err(StepError::Failed("cancelled".into()));
+            }
         };
-        let (stdout, stdout_truncated) = lossy_capped(&output.stdout, max);
-        let (stderr, stderr_truncated) = lossy_capped(&output.stderr, max);
+        let (stdout, stdout_truncated) = lossy_capped(&stdout_bytes, max);
+        let (stderr, stderr_truncated) = lossy_capped(&stderr_bytes, max);
         Ok(json!({
-            "status": output.status.code(),
+            "status": status.code(),
             "stdout": stdout,
             "stderr": stderr,
             "stdout_truncated": stdout_truncated,

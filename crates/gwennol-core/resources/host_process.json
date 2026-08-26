@@ -13,8 +13,8 @@
         "properties": {
           "argv": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Program and arguments. No shell is involved. The child's environment is the frontend's policy, not the plugin's: by default an allow-list, not the agent's own environment." },
           "cwd": { "type": "string", "description": "Working directory (default: workspace root)." },
-          "stdin": { "type": "string" },
-          "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000 },
+          "stdin": { "type": "string", "description": "Piped to the child. Shown to the operator as part of the approval: for an interpreter it is the real payload." },
+          "timeout_ms": { "type": "integer", "minimum": 0, "default": 120000, "description": "Wall-clock limit. On expiry the child's whole process group is killed, so a timed-out shell leaves no orphans." },
           "max_output_bytes": { "type": "integer", "minimum": 0, "default": 1048576, "description": "Cap on captured stdout and stderr, each." }
         }
       },
