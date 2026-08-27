@@ -55,6 +55,7 @@ pub mod host;
 pub mod kernel;
 pub mod operator;
 pub mod secrets;
+pub mod spi;
 pub mod steps;
 
 pub use gwead;
