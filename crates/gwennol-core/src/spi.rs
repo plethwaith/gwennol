@@ -133,6 +133,13 @@ mod tests {
     /// The file list derives from [`SPI_DEFINITIONS`] and is checked
     /// complete against the directory, so a third contract cannot land
     /// on either side without the other.
+    ///
+    /// Accepted residuals: a deliberate *rename* of `plugins/spi/` is
+    /// indistinguishable from true absence and takes the skip (nothing
+    /// short of a repo-layout oracle could tell them apart), and the
+    /// completeness check sees only `*.json` — a contract accidentally
+    /// saved under another extension sits outside it. Both are judged
+    /// unlikely enough to live with.
     #[test]
     fn embedded_contracts_match_the_canonical_documents() {
         let canonical_dir =

@@ -554,9 +554,18 @@ fn the_harvest_sorts_by_name_and_refuses_duplicates() {
     // No tools yet: the harvest is empty, not an error.
     assert!(spi::harvest_tools(&kernel).unwrap().is_empty());
 
-    // Registered anti-sorted, harvested sorted — deleting the sort must
-    // fail this, since tool order is prompt-cache-critical.
-    for (plugin, tool) in [("p1", "zeta"), ("p2", "alpha"), ("p3", "mu")] {
+    // Registered anti-sorted, harvested sorted — with the sort deleted,
+    // this passes only when the random raw order happens to be sorted.
+    // Six names put that below 1/720 per run, so the pin is effectively
+    // deterministic while staying one assertion.
+    for (plugin, tool) in [
+        ("p1", "zeta"),
+        ("p2", "alpha"),
+        ("p3", "mu"),
+        ("p4", "omega"),
+        ("p5", "beta"),
+        ("p6", "kappa"),
+    ] {
         kernel
             .register_plugin_from_json(&named_tool(plugin, tool).to_string())
             .unwrap();
@@ -566,14 +575,14 @@ fn the_harvest_sorts_by_name_and_refuses_duplicates() {
         .into_iter()
         .map(|d| d.tool_name)
         .collect();
-    assert_eq!(names, ["alpha", "mu", "zeta"]);
+    assert_eq!(names, ["alpha", "beta", "kappa", "mu", "omega", "zeta"]);
 
     // A duplicate that is non-adjacent in registration order (p1 holds
-    // "zeta", p2 and p3 sit between) is still refused: the check runs on
-    // the sorted list. Two TOOL plugins advertising one name make
+    // "zeta", the others sit between) is still refused: the check runs
+    // on the sorted list. Two TOOL plugins advertising one name make
     // selection by descriptor ambiguous; refuse, don't pick.
     kernel
-        .register_plugin_from_json(&named_tool("p4", "zeta").to_string())
+        .register_plugin_from_json(&named_tool("p7", "zeta").to_string())
         .unwrap();
     let err = spi::harvest_tools(&kernel).unwrap_err();
     assert!(
