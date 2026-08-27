@@ -226,9 +226,10 @@ the descriptor list comes off a `HashMap`), so the embedder building
 Role dispatch answers "give me *a* fulfiller", which is the right question
 for `LLM_CHAT` (one provider at a time; with several registered, the
 first at the nearest namespace wins, silently — register one) but not for
-tools — a deployment registers many `TOOL` plugins at once. Selection is by descriptor: the
-model names a tool, the loop finds the descriptor with that `name`, and
-its `plugin_key`/`action_name` say exactly what to execute. The role still
+tools — a deployment registers many `TOOL` plugins at once. Selection is
+by descriptor: the model names a tool, the loop finds the descriptor
+with that `name`, and its `plugin_key`/`action_name` say exactly what to
+execute. The role still
 earns its keep: it is the registration-time contract check on every tool
 plugin, the uniform calling convention that makes descriptor-driven
 dispatch possible, and the audit handle — `roles: ["TOOL"]` is one grep
