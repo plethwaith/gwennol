@@ -49,19 +49,33 @@ fn fixture() -> &'static Fixture {
     })
 }
 
-/// A canned `LLM_CHAT` implementation. First call: asks for the first
-/// offered tool with fixed arguments. Follow-up call (three or more
-/// messages, the third a tool result): closes the turn with text quoting
-/// the result. Purely declarative — intrinsics only, no permissions.
+/// A canned `LLM_CHAT` implementation. Streamed call: relays NDJSON
+/// events fetched from the stub server (`$config.stream_url`) as its
+/// stream handle — the same composition a real provider uses, minus the
+/// protocol translation. First buffered call: asks for the first offered
+/// tool with fixed arguments. Follow-up call (three or more messages,
+/// the third a tool result): closes the turn with text quoting the
+/// result.
 fn fixture_provider() -> Value {
     json!({
         "name": "fixture_llm", "version": "0.0.0",
         "description": "Canned LLM_CHAT fixture: one tool call, then a closing turn.",
         "roles": [gwennol_core::spi::llm_chat::ROLE],
+        "permissions": ["step_type:host_http.get", "network:egress:127.0.0.1"],
         "actions": {
             "chat": {
                 "steps": [
                     {"id": "branch", "type": "ifs", "params": {"ifs": [
+                        {
+                            "test": "$input.stream == true",
+                            "then": [
+                                {"id": "fetch", "type": "host_http.get", "params": {
+                                    "url": "{{$config.stream_url}}", "stream": true}},
+                                {"id": "streamed", "type": "return", "params": {"value": {
+                                    "stream": "{{$steps.fetch.result.body}}"
+                                }}}
+                            ]
+                        },
                         {
                             "test": "$input.messages[2].content[0].type == 'tool_result'",
                             "then": [{"id": "closing", "type": "return", "params": {"value": {
@@ -137,6 +151,54 @@ fn wire_tools(kernel: &Kernel) -> Value {
         })
         .collect();
     Value::Array(tools)
+}
+
+/// One canned model turn as `streamEventShape` NDJSON: two text deltas
+/// and the final `end` event.
+const STREAM_BODY: &str = concat!(
+    r#"{"type":"text","text":"hel"}"#,
+    "\n",
+    r#"{"type":"text","text":"lo"}"#,
+    "\n",
+    r#"{"type":"end","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#,
+    "\n",
+);
+
+/// Minimal HTTP/1.1 server answering every request with [`STREAM_BODY`],
+/// written in two flushed halves so the client genuinely streams.
+fn spawn_stream_stub() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = stream.unwrap();
+            std::thread::spawn(move || {
+                // Read until the blank line ending the request head; the
+                // fixture's GET carries no body.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = s.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    STREAM_BODY.len()
+                )
+                .unwrap();
+                let (a, b) = STREAM_BODY.split_at(STREAM_BODY.len() / 2);
+                s.write_all(a.as_bytes()).unwrap();
+                s.flush().unwrap();
+                s.write_all(b.as_bytes()).unwrap();
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/chat")
 }
 
 // ------------------------------------------------------- registration
@@ -315,4 +377,67 @@ async fn a_tool_call_round_trips_with_no_agent_loop() {
         second["message"]["content"][0]["text"],
         "the tool said: echo: hello from the model"
     );
+}
+
+#[tokio::test]
+async fn a_streamed_response_arrives_through_a_stream_handle() {
+    use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
+
+    let f = fixture();
+    // `execute_by_role` cannot carry a streams table, so a streaming
+    // caller resolves the role first and executes the winner — exactly
+    // what the milestone-5 loop will do.
+    let provider = f
+        .kernel
+        .role_candidates(None, spi::llm_chat::ROLE)
+        .into_iter()
+        .next()
+        .expect("an LLM_CHAT fulfiller");
+    assert_eq!(provider, "fixture_llm");
+
+    let streams = Arc::new(std::sync::Mutex::new(StreamRegistry::new()));
+    let out = f
+        .kernel
+        .execute(
+            &provider,
+            spi::llm_chat::CHAT,
+            json!({"messages": [user_text("stream please")], "stream": true}),
+        )
+        .with_config(&json!({"stream_url": spawn_stream_stub()}))
+        .with_streams(streams.clone())
+        .run()
+        .await
+        .unwrap()
+        .output;
+
+    let handle = out["stream"].as_u64().expect("integer stream handle");
+    let id = std::num::NonZeroU32::new(u32::try_from(handle).unwrap()).unwrap();
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 7]; // small, so the body takes many reads
+    loop {
+        let n = read_async_shared(&streams, id, &mut buf).await;
+        if n == STREAM_EOF {
+            break;
+        }
+        assert!(n > 0, "stream read returned {n}");
+        collected.extend_from_slice(&buf[..n as usize]);
+    }
+
+    // The bytes are contract NDJSON: text deltas to concatenate, then
+    // the end event, then end-of-stream.
+    let events: Vec<Value> = String::from_utf8(collected)
+        .unwrap()
+        .lines()
+        .map(|l| gwead::serde_json::from_str(l).unwrap())
+        .collect();
+    let text: String = events
+        .iter()
+        .filter(|e| e["type"] == "text")
+        .map(|e| e["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "hello");
+    let end = events.last().unwrap();
+    assert_eq!(end["type"], "end");
+    assert_eq!(end["stop_reason"], "end_turn");
+    assert_eq!(end["usage"]["output_tokens"], 2);
 }
