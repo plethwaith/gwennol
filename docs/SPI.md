@@ -68,19 +68,32 @@ tool descriptor on the wire: `input_schema` is the implementing action's
 ```json
 {
   "message": {"role": "assistant", "content": [ … ]},
-  "stop_reason": "end_turn" | "tool_use" | "max_tokens",
+  "stop_reason": "end_turn" | "tool_use" | "max_tokens" | "refusal",
   "usage": {"input_tokens": 17, "output_tokens": 42}
 }
 ```
 
 `stop_reason: "tool_use"` means the message contains `tool_use` blocks and
-the model is waiting on their results.
+the model is waiting on their results. `refusal` means the model declined
+to continue; the turn ends and must not be retried or silently continued.
+An assistant `content` array may be empty — a refusal, or `max_tokens`
+hit immediately, can stop a turn before any block completes. `usage` is
+open beyond its two required fields: a provider may add its own counters
+(cache reads, say), and consumers must tolerate and may ignore them.
 
 ### Response, streamed
 
 With `stream: true` the result is instead `{"stream": <handle>}` — an
-integer Gwead stream handle, valid only inside the execution that returned
-it. The stream yields UTF-8 newline-delimited JSON, one event per line
+integer Gwead stream handle. A handle is an index into the
+`StreamRegistry` the caller attached to the execution with
+`.with_streams(…)`, and is meaningless against any other table: each
+table numbers its handles from 1, and an execution run *without* a
+caller-supplied table has its streams drained when it returns. The table
+the caller supplies is granted to the executed action wholesale, so scope
+one table per call. Reading the handle after the action returns is the
+designed pattern — it is how the milestone-5 loop will consume a turn.
+
+The stream yields UTF-8 newline-delimited JSON, one event per line
 (`streamEventShape` in the contract):
 
 - `{"type": "text", "text": "…"}` — an increment of assistant text;
@@ -92,10 +105,19 @@ it. The stream yields UTF-8 newline-delimited JSON, one event per line
   fragments.
 - `{"type": "end", "stop_reason": "…", "usage": { … }}` — the final event
   of every successful stream, followed by end-of-stream.
+- `{"type": "error", "message": "…", "retryable": …, "kind": "…"}` — the
+  turn failed and the provider can still say why. Always the last event:
+  followed by end-of-stream, never by `end`. `retryable` marks failures
+  worth repeating unchanged (rate limit, overload) as opposed to ones
+  that will fail again (bad credentials); absent means unknown. `kind` is
+  a provider-specific identifier, informational only.
 
-End-of-stream **without** an `end` event means the turn failed mid-stream;
-a failure before any bytes flow is an ordinary step error. Consumers must
-treat a truncated stream as a failed turn, not a short answer.
+End-of-stream without an `end` or `error` event means the turn failed
+mid-stream with the cause lost; a failure before any bytes flow is an
+ordinary step error. Either way, consumers must treat a stream that did
+not reach `end` as a failed turn, not a short answer. Events can be
+arbitrarily long — a `tool_use` event carries its whole `input` on one
+line — so consumers must not assume bounded lines.
 
 One dispatch caveat: `Kernel::execute_by_role` cannot carry a streams
 table, so a streaming caller resolves the role first
