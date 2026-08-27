@@ -191,6 +191,11 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "stdin": "{{$input.stdin}}", "timeout_ms": 1000, "max_output_bytes": 1024}}]),
         ),
+        plugin(
+            "denied_getter",
+            &["step_type:host_http.get", "network:egress:127.0.0.1"],
+            json!([{"id": "h", "type": "host_http.get", "params": {"url": "{{$input.url}}"}}]),
+        ),
         {
             let mut p = plugin(
                 "secretive",
@@ -420,11 +425,16 @@ async fn fs_read_refuses_a_fifo_instead_of_blocking_on_it() {
             .unwrap()
             .success()
     );
-    // Pre-refusal, opening a writerless FIFO parks forever and this test
-    // hangs; the refusal must also come before the operator is asked.
-    let err = run("reader", json!({"path": "pipe.fifo", "max_bytes": 10}))
-        .await
-        .unwrap_err();
+    // Pre-refusal, opening a writerless FIFO parks forever; the timeout
+    // turns that regression into a failure rather than a hung suite. The
+    // refusal must also come before the operator is asked.
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run("reader", json!({"path": "pipe.fifo", "max_bytes": 10})),
+    )
+    .await
+    .expect("fs_read blocked on a writerless FIFO")
+    .unwrap_err();
     assert!(err.to_string().contains("fifo"), "{err}");
     assert!(
         !f.requests_for("reader").contains(&Access::ReadFile(path)),
@@ -449,6 +459,27 @@ async fn fs_write_preserves_restrictive_permissions_on_overwrite() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the replacement widened a private file");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_does_not_carry_setuid_across_a_replacement() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let path = f.workspace.join("suid.sh");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    run(
+        "writer",
+        json!({"path": "suid.sh", "content": "new", "dir": "."}),
+    )
+    .await
+    .unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o755,
+        "replacing a setuid file minted a setuid file owned by the agent's user"
+    );
 }
 
 #[cfg(unix)]
@@ -1056,6 +1087,36 @@ async fn a_denial_names_the_shape_but_not_the_payload() {
         f.requests_for("denied_runner")
             .iter()
             .any(|a| matches!(a, Access::Spawn { stdin: Some(s), .. } if s.contains("hunter2")))
+    );
+}
+
+#[tokio::test]
+async fn a_denied_url_loses_its_credentials_but_keeps_its_shape() {
+    let f = fixture();
+    let port = f.echo.rsplit(':').next().unwrap();
+    let err = run(
+        "denied_getter",
+        json!({"url": format!("http://user:pw-secret@127.0.0.1:{port}/secret-path?token=qs-secret")}),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("operator denied"), "{msg}");
+    assert!(msg.contains("GET"), "{msg}");
+    assert!(msg.contains("/secret-path"), "{msg}");
+    assert!(
+        !msg.contains("qs-secret"),
+        "the denial leaked a query-string credential: {msg}"
+    );
+    assert!(
+        !msg.contains("pw-secret") && !msg.contains("user:"),
+        "the denial leaked URL userinfo: {msg}"
+    );
+    // The operator, as ever, saw the whole thing.
+    assert!(
+        f.urls_for("denied_getter")
+            .iter()
+            .any(|u| u.contains("qs-secret"))
     );
 }
 

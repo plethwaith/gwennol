@@ -30,6 +30,9 @@ pub const BODY_BYTES_CEILING: u64 = 64 << 20;
 /// Default budget for reaching a response — the whole redirect chain, and
 /// the body too when it is buffered.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// Hard ceiling on `timeout_ms` and `idle_timeout_ms`: larger requests are
+/// clamped, so neither budget can be voided by asking for forever.
+pub const TIMEOUT_MS_CEILING: u64 = 3_600_000;
 /// Default limit on the gap between chunks of a streamed body.
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
 /// Default limit on redirects followed in one request.
@@ -99,7 +102,8 @@ fn redirect_target(
     }
     if from.scheme() == "https" && url.scheme() == "http" {
         return Err(format!(
-            "refusing a {status} redirect from https to cleartext http ({url})"
+            "refusing a {status} redirect from https to cleartext http ({})",
+            safe_url(&url)
         ));
     }
     // 303 always becomes GET; 301 and 302 do for anything but GET/HEAD,
@@ -151,6 +155,18 @@ fn guarded_body(
             }
         }
     }))
+}
+
+/// A URL rendered safe for error messages: no userinfo, query, or
+/// fragment, any of which can carry credentials — errors travel into
+/// plugin-visible strings and logs.
+fn safe_url(url: &Url) -> String {
+    let mut u = url.clone();
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_query(None);
+    u.set_fragment(None);
+    u.to_string()
 }
 
 fn host_of(url: &Url) -> Result<String, StepError> {
@@ -254,9 +270,12 @@ fn request<'a>(
         let stream = bool_param(&p, "stream", false)?;
         let max =
             u64_param(&p, "max_bytes", DEFAULT_MAX_BODY_BYTES)?.min(BODY_BYTES_CEILING) as usize;
-        let timeout = Duration::from_millis(u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?);
-        let idle =
-            Duration::from_millis(u64_param(&p, "idle_timeout_ms", DEFAULT_IDLE_TIMEOUT_MS)?);
+        let timeout = Duration::from_millis(
+            u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?.min(TIMEOUT_MS_CEILING),
+        );
+        let idle = Duration::from_millis(
+            u64_param(&p, "idle_timeout_ms", DEFAULT_IDLE_TIMEOUT_MS)?.min(TIMEOUT_MS_CEILING),
+        );
         let max_redirects = u64_param(&p, "max_redirects", DEFAULT_MAX_REDIRECTS)?;
 
         // Set after the first approval, so however long the operator
@@ -320,7 +339,8 @@ fn request<'a>(
 
             if hops >= max_redirects {
                 return Err(StepError::Failed(format!(
-                    "more than {max_redirects} redirects following {url_str}"
+                    "more than {max_redirects} redirects following {}",
+                    safe_url(&url)
                 )));
             }
             hops += 1;

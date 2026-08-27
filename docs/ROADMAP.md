@@ -78,7 +78,9 @@ opens sockets.
   `host_fs.write` writes through a temporary file and renames, so a crash or
   a full disk cannot truncate the user's source; a timed-out
   `host_process.run` kills the child's process group, not just the child, so
-  a `sh -c` leaves no orphans; `host_fs.list` caps the entries it returns —
+  a `sh -c` leaves no orphans (best-effort: a descendant that detaches
+  into its own session is out of the group's reach); `host_fs.list` caps
+  the entries it returns —
   each pinned by an integration test against a real kernel.
 - **Not in scope:** any plugin that *uses* these steps; the agent loop; a
   sandbox around an approved child process.

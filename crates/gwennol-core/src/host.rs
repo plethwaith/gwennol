@@ -165,11 +165,18 @@ fn describe(access: &Access) -> String {
             "spawn of {:?}",
             argv.first().map(String::as_str).unwrap_or("?")
         ),
-        // Query strings and fragments carry parameters, which can carry
-        // secrets; the origin and path say what was denied.
-        Access::Http { method, url } => {
-            format!("{method} {}", url.split(['?', '#']).next().unwrap_or(url))
-        }
+        // Userinfo, query strings and fragments can all carry credentials;
+        // the scheme, host and path say what was denied.
+        Access::Http { method, url } => match url::Url::parse(url) {
+            Ok(mut u) => {
+                let _ = u.set_username("");
+                let _ = u.set_password(None);
+                u.set_query(None);
+                u.set_fragment(None);
+                format!("{method} {u}")
+            }
+            Err(_) => format!("{method} request"),
+        },
     }
 }
 

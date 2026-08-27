@@ -54,7 +54,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             let file = opts.open(&path).await?;
             let meta = file.metadata().await?;
             #[cfg(unix)]
-            let file = {
+            {
                 use std::os::unix::fs::FileTypeExt as _;
                 let t = meta.file_type();
                 if t.is_fifo() || t.is_socket() {
@@ -62,18 +62,14 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                         "not a readable file (fifo or socket)",
                     ));
                 }
-                // O_NONBLOCK has served its purpose; cleared so a slow
-                // device read waits instead of failing with EAGAIN and
-                // discarding the bytes already delivered.
-                let std_file = file.into_std().await;
-                let flags = nix::fcntl::fcntl(&std_file, nix::fcntl::FcntlArg::F_GETFL)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                let flags = nix::fcntl::OFlag::from_bits_truncate(flags)
-                    .difference(nix::fcntl::OFlag::O_NONBLOCK);
-                nix::fcntl::fcntl(&std_file, nix::fcntl::FcntlArg::F_SETFL(flags))
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                tokio::fs::File::from_std(std_file)
-            };
+            }
+            // O_NONBLOCK deliberately stays set on the handle. A regular
+            // file ignores it; a character device that has no data ready
+            // then fails the read fast (EAGAIN) instead of parking a
+            // blocking worker forever — a tty could otherwise wedge one
+            // per read, and cancellation cannot reclaim a parked worker.
+            // Failing fast over waiting is the host's side of the
+            // bounded-work bargain.
             let canonical = tokio::fs::canonicalize(&path).await?;
             std::io::Result::Ok((file, meta, canonical))
         };
@@ -102,8 +98,9 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         let read = async {
             let mut bytes = Vec::new();
             // One byte past the cap distinguishes "exactly the cap" from
-            // "truncated" without reading the rest. Saturating: a cap of
-            // u64::MAX must mean "unbounded", not wrap to zero.
+            // "truncated" without reading the rest. The cap is already
+            // clamped; saturating so the arithmetic cannot wrap even for
+            // an unclamped caller.
             file.take((max as u64).saturating_add(1))
                 .read_to_end(&mut bytes)
                 .await?;
@@ -255,7 +252,20 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // Whether this replaces an existing file decides both the
         // temporary's birth mode and the permissions it ends with.
         let dest_perms = match tokio::fs::metadata(&canonical).await {
-            Ok(meta) => Some(meta.permissions()),
+            Ok(meta) => {
+                #[cfg(unix)]
+                let perms = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    // Permission bits only: fchmod after the write means
+                    // the kernel will not strip setuid/setgid for us, and
+                    // replacing an 04755 file must not mint a setuid
+                    // binary owned by the agent's user.
+                    std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
+                };
+                #[cfg(not(unix))]
+                let perms = meta.permissions();
+                Some(perms)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(StepError::Failed(format!(
@@ -307,7 +317,8 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
     Box::pin(async move {
         let p = resolve(ex, params);
         let path = resolve_path(str_param(&p, "path")?);
-        let max = u64_param(&p, "max_entries", DEFAULT_LIST_MAX_ENTRIES)? as usize;
+        let max = u64_param(&p, "max_entries", DEFAULT_LIST_MAX_ENTRIES)?.min(LIST_ENTRIES_CEILING)
+            as usize;
         let cancel = ex.cancel_token();
         let canonical = or_cancelled(&cancel, tokio::fs::canonicalize(&path))
             .await?
@@ -344,4 +355,25 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(json!({"entries": entries, "truncated": truncated}).into())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restricted_temporary_is_born_0600_not_chmodded_down_later() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("private.txt");
+        let (file, tmp) = create_temp_sibling(&dest, true).await.unwrap();
+        // The mode must hold from the instant of creation — before any
+        // write, sync, or chmod — or an opener in the gap keeps an fd no
+        // later chmod can revoke.
+        let mode = file.metadata().await.unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "temporary was created readable");
+        drop(file);
+        let _ = std::fs::remove_file(tmp);
+    }
 }

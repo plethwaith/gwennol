@@ -18,13 +18,17 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1 << 20;
 pub const OUTPUT_BYTES_CEILING: u64 = 64 << 20;
 /// Default wall-clock limit.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// Hard ceiling on `timeout_ms`: larger requests are clamped, so the
+/// wall-clock limit cannot be voided by asking for forever.
+pub const TIMEOUT_MS_CEILING: u64 = 3_600_000;
 
 /// Read everything `r` produces, keeping at most `cap + 1` bytes (one past
 /// the cap marks truncation) and discarding the rest — the pipe is drained
 /// to the end so the child never blocks on it, while the host's memory
 /// stays bounded by the cap rather than by how fast the child can write.
 async fn drain_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Vec<u8>> {
-    // Saturating: a cap of usize::MAX must mean "unbounded", not wrap.
+    // Saturating so the arithmetic cannot wrap even for an unclamped
+    // caller; step bodies clamp the cap before it reaches here.
     let keep = cap.saturating_add(1);
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
@@ -116,7 +120,9 @@ pub fn process_run<'a>(
             Some(Value::String(s)) => Some(s.clone()),
             Some(_) => return Err(StepError::Failed("param 'stdin' must be a string".into())),
         };
-        let timeout = Duration::from_millis(u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?);
+        let timeout = Duration::from_millis(
+            u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?.min(TIMEOUT_MS_CEILING),
+        );
         let max = u64_param(&p, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)?
             .min(OUTPUT_BYTES_CEILING) as usize;
 
