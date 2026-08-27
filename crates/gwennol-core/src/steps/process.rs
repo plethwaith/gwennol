@@ -7,7 +7,7 @@ use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{StepFuture, lossy_capped, resolve, u64_param};
+use super::{StepFuture, capped, lossy_capped, resolve, u64_param};
 use crate::host::{approval, approve, host, resolve_path};
 use crate::operator::Access;
 
@@ -123,8 +123,10 @@ pub fn process_run<'a>(
         let timeout = Duration::from_millis(
             u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?.min(TIMEOUT_MS_CEILING),
         );
-        let max = u64_param(&p, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)?
-            .min(OUTPUT_BYTES_CEILING) as usize;
+        let max = capped(
+            u64_param(&p, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)?,
+            OUTPUT_BYTES_CEILING,
+        );
 
         let ask = approval(
             &*ex,

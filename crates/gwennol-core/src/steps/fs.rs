@@ -6,7 +6,9 @@ use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{StepFuture, bool_param, lossy_capped, or_cancelled, resolve, str_param, u64_param};
+use super::{
+    StepFuture, bool_param, capped, lossy_capped, or_cancelled, resolve, str_param, u64_param,
+};
 use crate::host::{approval, approve, resolve_path};
 use crate::operator::Access;
 
@@ -36,8 +38,10 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
     Box::pin(async move {
         let p = resolve(ex, params);
         let path = resolve_path(str_param(&p, "path")?);
-        let max =
-            u64_param(&p, "max_bytes", DEFAULT_READ_MAX_BYTES)?.min(READ_BYTES_CEILING) as usize;
+        let max = capped(
+            u64_param(&p, "max_bytes", DEFAULT_READ_MAX_BYTES)?,
+            READ_BYTES_CEILING,
+        );
         let cancel = ex.cancel_token();
         // Opened before the approval so the approval can describe the very
         // file this handle holds; opening for read has no side effects.
@@ -69,7 +73,9 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             // blocking worker forever — a tty could otherwise wedge one
             // per read, and cancellation cannot reclaim a parked worker.
             // Failing fast over waiting is the host's side of the
-            // bounded-work bargain.
+            // bounded-work bargain. The cost, accepted: a slow device's
+            // partially-read bytes are discarded with a generic I/O error
+            // rather than returned.
             let canonical = tokio::fs::canonicalize(&path).await?;
             std::io::Result::Ok((file, meta, canonical))
         };
@@ -317,8 +323,10 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
     Box::pin(async move {
         let p = resolve(ex, params);
         let path = resolve_path(str_param(&p, "path")?);
-        let max = u64_param(&p, "max_entries", DEFAULT_LIST_MAX_ENTRIES)?.min(LIST_ENTRIES_CEILING)
-            as usize;
+        let max = capped(
+            u64_param(&p, "max_entries", DEFAULT_LIST_MAX_ENTRIES)?,
+            LIST_ENTRIES_CEILING,
+        );
         let cancel = ex.cancel_token();
         let canonical = or_cancelled(&cancel, tokio::fs::canonicalize(&path))
             .await?

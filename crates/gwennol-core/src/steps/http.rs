@@ -18,7 +18,7 @@ use reqwest::Method;
 use tokio::time::Instant;
 use url::Url;
 
-use super::{StepFuture, bool_param, lossy_capped, resolve, str_param, u64_param};
+use super::{StepFuture, bool_param, capped, lossy_capped, resolve, str_param, u64_param};
 use crate::host::{approval, approve};
 use crate::operator::Access;
 
@@ -157,6 +157,20 @@ fn guarded_body(
     }))
 }
 
+/// reqwest's `Display` appends `for url (…)` with the URL unredacted, so
+/// a connect/TLS/read failure would carry the query string and userinfo
+/// into plugin-visible strings and logs. Scrub the error's own copy of
+/// the URL before formatting it.
+fn scrubbed(mut e: reqwest::Error) -> reqwest::Error {
+    if let Some(u) = e.url_mut() {
+        let _ = u.set_username("");
+        let _ = u.set_password(None);
+        u.set_query(None);
+        u.set_fragment(None);
+    }
+    e
+}
+
 /// A URL rendered safe for error messages: no userinfo, query, or
 /// fragment, any of which can carry credentials — errors travel into
 /// plugin-visible strings and logs.
@@ -268,8 +282,10 @@ fn request<'a>(
             other => other.cloned(),
         };
         let stream = bool_param(&p, "stream", false)?;
-        let max =
-            u64_param(&p, "max_bytes", DEFAULT_MAX_BODY_BYTES)?.min(BODY_BYTES_CEILING) as usize;
+        let max = capped(
+            u64_param(&p, "max_bytes", DEFAULT_MAX_BODY_BYTES)?,
+            BODY_BYTES_CEILING,
+        );
         let timeout = Duration::from_millis(
             u64_param(&p, "timeout_ms", DEFAULT_TIMEOUT_MS)?.min(TIMEOUT_MS_CEILING),
         );
@@ -320,7 +336,9 @@ fn request<'a>(
 
             let resp = tokio::select! {
                 r = tokio::time::timeout_at(hop_deadline, req.send()) => match r {
-                    Ok(r) => r.map_err(|e| StepError::Failed(format!("request to {host}: {e}")))?,
+                    Ok(r) => r.map_err(|e| {
+                        StepError::Failed(format!("request to {host}: {}", scrubbed(e)))
+                    })?,
                     Err(_) => return Err(StepError::Failed(format!(
                         "request to {host} exceeded timeout of {timeout:?}"
                     ))),
@@ -377,7 +395,10 @@ fn request<'a>(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            let source = resp.bytes_stream().map_err(std::io::Error::other).boxed();
+            let source = resp
+                .bytes_stream()
+                .map_err(|e| std::io::Error::other(scrubbed(e)))
+                .boxed();
             let handle = lock_shared(ex.streams())
                 .register_readable(content_type, guarded_body(source, idle, cancel));
             return Ok(StepOutput::with_metadata(
@@ -401,8 +422,9 @@ fn request<'a>(
                 () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
             };
             let Some(chunk) = chunk else { break };
-            let chunk = chunk
-                .map_err(|e| StepError::Failed(format!("reading response from {host}: {e}")))?;
+            let chunk = chunk.map_err(|e| {
+                StepError::Failed(format!("reading response from {host}: {}", scrubbed(e)))
+            })?;
             bytes.extend_from_slice(&chunk);
             if bytes.len() > max {
                 // Already past the cap: the rest of the body stays unread,

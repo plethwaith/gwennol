@@ -425,16 +425,26 @@ async fn fs_read_refuses_a_fifo_instead_of_blocking_on_it() {
             .unwrap()
             .success()
     );
-    // Pre-refusal, opening a writerless FIFO parks forever; the timeout
-    // turns that regression into a failure rather than a hung suite. The
-    // refusal must also come before the operator is asked.
-    let err = tokio::time::timeout(
+    // Losing the refusal makes this an unwrap_err failure (a nonblocking
+    // writerless-FIFO open reads as instant EOF). Losing O_NONBLOCK parks
+    // the open; the timeout turns that into a failure, and the writer
+    // thread below then releases the parked blocking worker so the suite
+    // can exit instead of hanging on it. The refusal must also come
+    // before the operator is asked.
+    let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         run("reader", json!({"path": "pipe.fifo", "max_bytes": 10})),
     )
-    .await
-    .expect("fs_read blocked on a writerless FIFO")
-    .unwrap_err();
+    .await;
+    if result.is_err() {
+        let unblock = path.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(unblock);
+        });
+    }
+    let err = result
+        .expect("fs_read blocked on a writerless FIFO")
+        .unwrap_err();
     assert!(err.to_string().contains("fifo"), "{err}");
     assert!(
         !f.requests_for("reader").contains(&Access::ReadFile(path)),
@@ -870,6 +880,56 @@ async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one()
         None,
         "a non-standard credential header followed a redirect off its origin: {echoed}"
     );
+}
+
+#[tokio::test]
+async fn a_failed_connection_does_not_leak_the_url_credentials() {
+    // reqwest's error Display appends `for url (…)` unredacted; the host
+    // must scrub the error's own URL before formatting it.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }; // dropped: nothing listens here any more
+    let err = run(
+        "getter",
+        json!({"url": format!("http://user:pw-secret@127.0.0.1:{port}/p?token=qs-secret"), "stream": false}),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("request to 127.0.0.1"), "{msg}");
+    assert!(
+        !msg.contains("qs-secret") && !msg.contains("pw-secret"),
+        "a transport error leaked URL credentials: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_invocation_tears_a_running_step_down() {
+    let f = fixture();
+    let cancel = gwennol_core::gwead::tokio_util::sync::CancellationToken::new();
+    let kernel = f.kernel.clone();
+    let token = cancel.clone();
+    let handle = tokio::spawn(async move {
+        kernel
+            .execute(
+                "runner",
+                "go",
+                json!({"argv": ["sleep", "30"], "stdin": "", "timeout_ms": 60000, "max_output_bytes": 1024}),
+            )
+            .with_config(&json!({}))
+            .with_cancel(token)
+            .run()
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cancel.cancel();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("cancellation did not tear the step down")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
 }
 
 #[tokio::test]

@@ -35,6 +35,14 @@ use gwead::tokio_util::sync::CancellationToken;
 pub(crate) type StepFuture<'a> =
     Pin<Box<dyn Future<Output = Result<StepOutput, StepError>> + Send + 'a>>;
 
+/// A plugin-requested cap, clamped to the host's ceiling. Every byte- and
+/// entry-cap site goes through here so the arithmetic is pinned once —
+/// a raw `as usize` on an unclamped u64 is how a cap silently becomes
+/// unbounded.
+pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
+    requested.min(ceiling) as usize
+}
+
 /// Run `work` to completion, unless the invocation is cancelled first.
 pub(crate) async fn or_cancelled<T>(
     cancel: &CancellationToken,
@@ -110,5 +118,17 @@ impl CharBoundary for [u8] {
         // 0b10xxxxxx. Valid on arbitrary bytes; lossy decoding handles the
         // rest.
         i == self.len() || (self[i] as i8) >= -0x40
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capped;
+
+    #[test]
+    fn a_cap_beyond_the_ceiling_clamps_instead_of_wrapping_or_ballooning() {
+        assert_eq!(capped(u64::MAX, 64 << 20), 64 << 20);
+        assert_eq!(capped(0, 64 << 20), 0);
+        assert_eq!(capped(5, 64 << 20), 5);
     }
 }
