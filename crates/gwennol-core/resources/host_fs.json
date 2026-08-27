@@ -1,0 +1,83 @@
+{
+  "formatVersion": 1,
+  "name": "host_fs",
+  "version": "0.1.0",
+  "description": "Gwennol filesystem step types. Native code; every step asks the operator before acting. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_fs.* grant.",
+  "stepTypeDefs": [
+    {
+      "name": "host_fs.read",
+      "inputSchema": {
+        "type": "object",
+        "required": ["path"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "description": "File path; relative paths resolve against the workspace root." },
+          "max_bytes": { "type": "integer", "minimum": 0, "description": "Cap on returned bytes (default 1 MiB, clamped to 64 MiB). Bounds what is read, not just what is returned; the result reports truncation." }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["content", "truncated", "size"],
+        "properties": {
+          "content": { "type": "string", "description": "File contents, lossily decoded as UTF-8." },
+          "truncated": { "type": "boolean" },
+          "size": { "type": "integer", "description": "Full size of the file in bytes." }
+        }
+      }
+    },
+    {
+      "name": "host_fs.write",
+      "inputSchema": {
+        "type": "object",
+        "required": ["path", "content"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" },
+          "create_dirs": { "type": "boolean", "default": false, "description": "Create missing parent directories." }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["bytes_written"],
+        "properties": { "bytes_written": { "type": "integer" } }
+      }
+    },
+    {
+      "name": "host_fs.list",
+      "inputSchema": {
+        "type": "object",
+        "required": ["path"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "max_entries": { "type": "integer", "minimum": 0, "description": "Cap on returned entries (default 1000, clamped to 100000). The result reports truncation; a truncated listing is the first entries the directory yielded (sorted), not the lexicographically first." }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["entries", "truncated"],
+        "properties": {
+          "truncated": { "type": "boolean" },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "kind"],
+              "properties": {
+                "name": { "type": "string" },
+                "kind": { "enum": ["file", "dir", "symlink", "unknown"] },
+                "size": { "type": ["integer", "null"] }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "stepTypeImpls": [
+    { "stepType": "host_fs.read", "kind": "native", "implRef": "gwennol.host_fs.read" },
+    { "stepType": "host_fs.write", "kind": "native", "implRef": "gwennol.host_fs.write" },
+    { "stepType": "host_fs.list", "kind": "native", "implRef": "gwennol.host_fs.list" }
+  ]
+}

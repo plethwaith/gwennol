@@ -22,7 +22,7 @@ feature-complete rival to existing harnesses.
   path, argv or URL, the plugin asking, and the model's tool call behind it.
   Per *hop*, not per step: the HTTP client follows no redirects of its own,
   so a `Location` faces both gates like any other request, and one that
-  leaves the origin travels without the plugin's credential headers.
+  leaves the origin travels without the plugin's headers.
 - **No ambient authority.** A plugin reaches only what its manifest declares
   and the operator allows. A spawned child therefore gets the environment the
   frontend's policy describes, not the one the agent was launched from.
@@ -70,23 +70,31 @@ opens sockets.
   an approval; `boot` / `boot_with`.
 - **Done when:** the kernel refuses an ungranted step type *before* the
   operator is asked; every step asks the operator with its concrete
-  arguments; an HTTP redirect faces both gates again per hop and loses its
-  credential headers when it leaves the origin; a spawned child receives only
+  arguments; an HTTP redirect faces both gates again per hop and loses the
+  plugin's headers when it leaves the origin; a spawned child receives only
   the allow-listed environment; an approval raised two plugins deep still
   names the tool call that caused it; `host_fs.read` bounds what it reads
   rather than allocating the whole file and truncating afterwards;
   `host_fs.write` writes through a temporary file and renames, so a crash or
   a full disk cannot truncate the user's source; a timed-out
   `host_process.run` kills the child's process group, not just the child, so
-  a `sh -c` leaves no orphans; `host_fs.list` caps the entries it returns —
+  a `sh -c` leaves no orphans (best-effort: a descendant that detaches
+  into its own session is out of the group's reach); `host_fs.list` caps
+  the entries it returns —
   each pinned by an integration test against a real kernel.
 - **Not in scope:** any plugin that *uses* these steps; the agent loop; a
   sandbox around an approved child process.
-- **Open question to settle here:** symlinks. The operator is shown a
-  lexically normalised path, which may still be a symlink out of the
-  workspace, and nothing re-checks between approval and open. Interactive
-  review tolerates that; a policy file matching on paths (milestone 6) does
-  not.
+- **Settled: an approval binds to the real file, not the name.**
+  `host_fs.read` opens the file, canonicalises the path, verifies by device
+  and inode that the canonical path names the opened handle, shows the
+  operator that canonical path, and reads from that same handle — a symlink
+  into `~/.ssh` is judged as `~/.ssh`, and the bytes provably come from the
+  approved file. `host_fs.write` refuses a symlink destination outright and
+  canonicalises the deepest existing ancestor, so the approved path is
+  where the bytes will land; `host_fs.list` lists the canonical directory.
+  The residual race — a parent directory swapped between approval and
+  rename — is tolerable under interactive review; the milestone-6 policy
+  file should close it with directory-handle (`openat`-family) I/O.
 
 ### 2. SPI contracts
 
