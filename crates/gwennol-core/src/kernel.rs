@@ -9,6 +9,7 @@ use gwead::kernel::{Kernel, KernelConfig, KernelError};
 use crate::host::{HostConfig, ProcessEnv, install};
 use crate::operator::Operator;
 use crate::secrets::OperatorSecrets;
+use crate::spi;
 use crate::steps;
 
 /// The `host_fs` plugin manifest, as shipped.
@@ -66,6 +67,11 @@ pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
         .with_native_step_impls(NativeStepImplTable::discover()?)
         .with_secret_resolver(Arc::new(OperatorSecrets(operator)));
     let mut kernel = Kernel::boot(config)?;
+    // Contracts first: Gwead checks a plugin against a role's contract only
+    // if the contract is already registered, so registering the SPI
+    // definitions here — before any caller can add a plugin — is what makes
+    // the check unskippable for the bundled roles.
+    spi::register(&mut kernel)?;
     for manifest in HOST_MANIFESTS {
         kernel.register_plugin_from_json(manifest)?;
     }

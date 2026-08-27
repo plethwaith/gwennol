@@ -31,9 +31,11 @@ manifests.
 
 ## Status
 
-**Pre-alpha.** The native host step types (milestone 1) exist and are
-exercised by integration tests against a real kernel; nothing user-facing
-runs yet. The 0.0.0 release on crates.io is a name reservation.
+**Pre-alpha.** The native host step types (milestone 1) and the
+`LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md))
+exist and are exercised by integration tests against a real kernel;
+nothing user-facing runs yet. The 0.0.0 release on crates.io is a name
+reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.

@@ -29,3 +29,7 @@ nix.workspace = true
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true
+# The same JSON Schema validator Gwead uses for its meta-schemas; here it
+# pins fixture payloads to the SPI contract schemas, which the kernel
+# deliberately never does at dispatch.
+boon = "0.6"

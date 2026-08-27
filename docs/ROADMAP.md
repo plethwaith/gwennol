@@ -109,8 +109,13 @@ implements them.
   exercised end to end through a stream handle; a tool call round-trips from
   provider output to tool input to tool result with no agent loop involved.
 - **Not in scope:** any real provider or tool; the substrate decision below.
-- **Open question to settle here:** how a tool's input schema reaches the
-  model — derived from the `TOOL` plugin's manifest, or declared separately.
+- **Settled: a tool's input schema is derived from the manifest.** The
+  `tool` block on the implementing plugin's `call` action is the single
+  declaration of the tool's name, description and argument schema; the
+  embedder harvests Gwead's tool descriptors and hands them to the model
+  as `chat`'s `tools` input. A second declaration in the contract would
+  only be a copy that can drift — the manifest is already the audit
+  surface, so it is also the source of truth. See `docs/SPI.md`.
 
 ### 3. Plugin substrate
 
@@ -127,6 +132,17 @@ written, and it must be settled before a provider exists.
 - **Done when:** one non-trivial plugin — parses a chunked body, builds a
   JSON request — runs sandboxed in a test, built by a documented command that
   CI runs, rather than from a blob committed to the repo.
+- **Constraint (verified against Gwead, so the decision is made against
+  reality):** a *streaming* provider needs guest code running concurrently
+  with its consumer, and Gwead's streams are reachable only from the
+  script-runtime ABI — the wasm *step-type* ABI has no stream imports. The
+  feasible shape is: `chat` stays a plain action that calls
+  `io.invoke_streaming` on a sibling `dataflow` action, whose single
+  long-running guest step reads the SSE bytes and writes contract NDJSON;
+  the readable end lands in the caller's own stream table, and a callee
+  failure surfaces as early end-of-stream — exactly the contract's
+  failed-turn rule. Whichever substrate is chosen must be able to occupy
+  that long-running slot.
 - **Not in scope:** the Anthropic provider itself; installing plugins from
   outside the binary.
 
@@ -138,6 +154,15 @@ written, and it must be settled before a provider exists.
 - **Done when:** the provider streams a response against a stub HTTP server;
   every tool manifest declares only the host step types it actually uses; a
   model-issued tool call executes end to end against a stubbed provider.
+- **Owed to the `TOOL` contract:** an outcome the model should react to
+  must reach the tool as *data*, never as an error to string-match — a
+  declarative `try`/`catch` sees only English error text, which cannot
+  safely separate "file not found" from "the operator said no". Where a
+  host step lacks the data form (a `host_fs.read` miss), this milestone
+  extends the host step rather than letting a tool match strings; it also
+  writes the shared truncation convention for tool `content`. And the
+  provider owes the buffered-path error taxonomy `docs/SPI.md` defers to
+  here.
 - **Not in scope:** the loop; any frontend.
 
 ### 5. Agent loop
