@@ -9,6 +9,9 @@ contracts must be registered before the plugins that claim them.
 - `spi/` — role contracts, one document per role: `llm_chat.json`
   (`LLM_CHAT`, streaming) and `tool.json` (`TOOL`). SPI definitions are
   not plugins; they are the contracts plugins are checked against.
+  These files are canonical; `gwennol-core` ships byte-identical copies
+  under `crates/gwennol-core/resources/spi/` (a published crate cannot
+  embed files outside its own directory), pinned equal by a test.
 - `providers/` — plugins implementing `LLM_CHAT`: `anthropic.json`, built
   on `host_http.post`.
 - `tools/` — plugins implementing `TOOL`: `read.json`, `write.json`,

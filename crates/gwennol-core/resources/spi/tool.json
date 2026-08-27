@@ -1,0 +1,32 @@
+{
+  "formatVersion": 1,
+  "name": "TOOL",
+  "displayName": "Model-callable tool",
+  "version": "0.1.0",
+  "description": "A tool the model can call. One required action, `call`: the model's arguments in, one uniform result out. The tool's name, description and argument schema are NOT declared here — they live in the `tool` block on the implementing plugin's `call` action, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the action name and the result shape.",
+  "actions": {
+    "call": {
+      "description": "Execute the tool once with model-supplied arguments.",
+      "input": {
+        "type": "object",
+        "description": "The arguments of one tool call, shaped by the implementing action's own `tool.parameters` schema — which is why this contract cannot close the object. Gwead validates no payloads at dispatch; the caller is responsible for checking model-emitted arguments against the declared schema before dispatching."
+      },
+      "output": {
+        "type": "object",
+        "required": ["content"],
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The tool result as the model will see it, verbatim."
+          },
+          "is_error": {
+            "type": "boolean",
+            "default": false,
+            "description": "True when `content` describes a failure the model should react to (file not found, command failed). Infrastructure failures are step errors, not `is_error` results."
+          }
+        }
+      }
+    }
+  }
+}

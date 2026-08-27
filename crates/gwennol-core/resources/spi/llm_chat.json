@@ -1,0 +1,210 @@
+{
+  "formatVersion": 1,
+  "name": "LLM_CHAT",
+  "displayName": "Chat-model provider",
+  "version": "0.1.0",
+  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
+  "actions": {
+    "chat": {
+      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`.",
+      "input": {
+        "type": "object",
+        "required": ["messages"],
+        "additionalProperties": false,
+        "properties": {
+          "system": {
+            "type": "string",
+            "description": "System prompt. A top-level field, not a message: `messages` roles are only `user` and `assistant`."
+          },
+          "messages": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/Message" },
+            "description": "The conversation so far, oldest first."
+          },
+          "tools": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/Tool" },
+            "description": "Tools the model may call this turn. Derived from TOOL plugins' manifests (each `call` action's `tool` block); absent or empty means no tools."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Cap on generated tokens. Optional; the provider applies its own default and ceiling."
+          },
+          "stream": {
+            "type": "boolean",
+            "default": false,
+            "description": "Ask for the streamed output form."
+          }
+        }
+      },
+      "output": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["message", "stop_reason"],
+            "additionalProperties": false,
+            "description": "The buffered form (`stream` false or absent).",
+            "properties": {
+              "message": { "$ref": "#/$defs/AssistantMessage" },
+              "stop_reason": { "$ref": "#/$defs/StopReason" },
+              "usage": { "$ref": "#/$defs/Usage" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["stream"],
+            "additionalProperties": false,
+            "description": "The streamed form (`stream: true`).",
+            "properties": {
+              "stream": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "A Gwead stream handle, valid only inside the execution that returned it. It yields UTF-8 newline-delimited JSON, one `streamEventShape` event per line, ending with an `end` event followed by end-of-stream. End-of-stream without an `end` event means the turn failed mid-stream."
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "streamEventShape": {
+    "oneOf": [
+      {
+        "type": "object",
+        "required": ["type", "text"],
+        "additionalProperties": false,
+        "description": "An increment of assistant text, to be concatenated in arrival order.",
+        "properties": {
+          "type": { "const": "text" },
+          "text": { "type": "string" }
+        }
+      },
+      {
+        "type": "object",
+        "required": ["type", "id", "name", "input"],
+        "additionalProperties": false,
+        "description": "A complete tool call. Providers buffer partial tool-call deltas and emit the call whole: arguments are machine-consumed, so incremental display buys nothing and every consumer would otherwise reassemble JSON fragments.",
+        "properties": {
+          "type": { "const": "tool_use" },
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "input": { "type": "object" }
+        }
+      },
+      {
+        "type": "object",
+        "required": ["type", "stop_reason"],
+        "additionalProperties": false,
+        "description": "The final event of every successful stream.",
+        "properties": {
+          "type": { "const": "end" },
+          "stop_reason": { "$ref": "#/$defs/StopReason" },
+          "usage": { "$ref": "#/$defs/Usage" }
+        }
+      }
+    ]
+  },
+  "$defs": {
+    "Message": {
+      "oneOf": [
+        { "$ref": "#/$defs/UserMessage" },
+        { "$ref": "#/$defs/AssistantMessage" }
+      ]
+    },
+    "UserMessage": {
+      "type": "object",
+      "required": ["role", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "role": { "const": "user" },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/TextBlock" },
+              { "$ref": "#/$defs/ToolResultBlock" }
+            ]
+          }
+        }
+      }
+    },
+    "AssistantMessage": {
+      "type": "object",
+      "required": ["role", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "role": { "const": "assistant" },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/TextBlock" },
+              { "$ref": "#/$defs/ToolUseBlock" }
+            ]
+          }
+        }
+      }
+    },
+    "TextBlock": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "text" },
+        "text": { "type": "string" }
+      }
+    },
+    "ToolUseBlock": {
+      "type": "object",
+      "required": ["type", "id", "name", "input"],
+      "additionalProperties": false,
+      "description": "The model asks for a tool. `id` is the provider's identifier for this call, echoed back by the matching ToolResultBlock; `input` is arguments per the tool's declared schema.",
+      "properties": {
+        "type": { "const": "tool_use" },
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "input": { "type": "object" }
+      }
+    },
+    "ToolResultBlock": {
+      "type": "object",
+      "required": ["type", "tool_use_id", "content"],
+      "additionalProperties": false,
+      "description": "A TOOL `call` result, carried back to the model in the next user message.",
+      "properties": {
+        "type": { "const": "tool_result" },
+        "tool_use_id": { "type": "string" },
+        "content": { "type": "string" },
+        "is_error": { "type": "boolean", "default": false }
+      }
+    },
+    "Tool": {
+      "type": "object",
+      "required": ["name", "description", "input_schema"],
+      "additionalProperties": false,
+      "description": "A tool offered to the model — a Gwead tool descriptor on the wire. `input_schema` is the JSON Schema for the call's arguments, taken verbatim from the TOOL plugin's `tool.parameters`.",
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "input_schema": { "type": "object" }
+      }
+    },
+    "StopReason": {
+      "enum": ["end_turn", "tool_use", "max_tokens"],
+      "description": "Why generation stopped: the model finished, the model wants tool results, or `max_tokens` was hit."
+    },
+    "Usage": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
