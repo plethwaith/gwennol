@@ -109,8 +109,13 @@ implements them.
   exercised end to end through a stream handle; a tool call round-trips from
   provider output to tool input to tool result with no agent loop involved.
 - **Not in scope:** any real provider or tool; the substrate decision below.
-- **Open question to settle here:** how a tool's input schema reaches the
-  model — derived from the `TOOL` plugin's manifest, or declared separately.
+- **Settled: a tool's input schema is derived from the manifest.** The
+  `tool` block on the implementing plugin's `call` action is the single
+  declaration of the tool's name, description and argument schema; the
+  embedder harvests Gwead's tool descriptors and hands them to the model
+  as `chat`'s `tools` input. A second declaration in the contract would
+  only be a copy that can drift — the manifest is already the audit
+  surface, so it is also the source of truth. See `docs/SPI.md`.
 
 ### 3. Plugin substrate
 
