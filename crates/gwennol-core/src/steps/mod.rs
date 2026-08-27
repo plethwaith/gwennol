@@ -38,7 +38,9 @@ pub(crate) type StepFuture<'a> =
 /// A plugin-requested cap, clamped to the host's ceiling. Every byte- and
 /// entry-cap site goes through here so the arithmetic is pinned once —
 /// a raw `as usize` on an unclamped u64 is how a cap silently becomes
-/// unbounded.
+/// unbounded. Ceilings must fit in `usize` on every supported target: the
+/// cast truncates a >usize ceiling on a 32-bit platform, which today's
+/// 64 MiB values cannot reach.
 pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
     requested.min(ceiling) as usize
 }

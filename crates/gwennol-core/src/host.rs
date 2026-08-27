@@ -169,10 +169,7 @@ fn describe(access: &Access) -> String {
         // the scheme, host and path say what was denied.
         Access::Http { method, url } => match url::Url::parse(url) {
             Ok(mut u) => {
-                let _ = u.set_username("");
-                let _ = u.set_password(None);
-                u.set_query(None);
-                u.set_fragment(None);
+                crate::steps::http::scrub(&mut u);
                 format!("{method} {u}")
             }
             Err(_) => format!("{method} request"),

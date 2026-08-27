@@ -731,6 +731,34 @@ async fn process_run_times_out() {
     assert!(err.to_string().contains("exceeded timeout"), "{err}");
 }
 
+#[tokio::test]
+async fn cancelling_an_invocation_tears_a_running_step_down() {
+    let f = fixture();
+    let cancel = gwennol_core::gwead::tokio_util::sync::CancellationToken::new();
+    let kernel = f.kernel.clone();
+    let token = cancel.clone();
+    let handle = tokio::spawn(async move {
+        kernel
+            .execute(
+                "runner",
+                "go",
+                json!({"argv": ["sleep", "30"], "stdin": "", "timeout_ms": 60000, "max_output_bytes": 1024}),
+            )
+            .with_config(&json!({}))
+            .with_cancel(token)
+            .run()
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cancel.cancel();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("cancellation did not tear the step down")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+}
+
 // ---------------------------------------------------------------- http
 
 #[tokio::test]
@@ -803,6 +831,35 @@ async fn http_post_secret_reaches_header_only_for_declaring_plugin() {
         .unwrap();
     let echoed: Value = gwead::serde_json::from_str(out["h"]["body"].as_str().unwrap()).unwrap();
     assert_eq!(echoed["headers"]["authorization"], "Bearer s3cr3t");
+}
+
+#[tokio::test]
+async fn a_failed_connection_does_not_leak_the_url_credentials() {
+    // reqwest's error Display appends `for url (…)` unredacted; the host
+    // must scrub the error's own URL before formatting it.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }; // dropped: nothing listens here any more
+    let err = run(
+        "getter",
+        json!({"url": format!("http://user:pw-secret@127.0.0.1:{port}/p?token=qs-secret"), "stream": false}),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("request to 127.0.0.1"), "{msg}");
+    assert!(
+        !msg.contains("qs-secret"),
+        "a transport error leaked the query string: {msg}"
+    );
+    // Defensive, not a pin: reqwest moves userinfo into a basic-auth
+    // header at request build, so today no send error can carry it. The
+    // scrub guards a future reqwest that keeps it in the URL.
+    assert!(
+        !msg.contains("pw-secret"),
+        "a transport error leaked URL userinfo: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------- http redirects
@@ -880,56 +937,6 @@ async fn redirect_keeps_credentials_within_an_origin_and_drops_them_across_one()
         None,
         "a non-standard credential header followed a redirect off its origin: {echoed}"
     );
-}
-
-#[tokio::test]
-async fn a_failed_connection_does_not_leak_the_url_credentials() {
-    // reqwest's error Display appends `for url (…)` unredacted; the host
-    // must scrub the error's own URL before formatting it.
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    }; // dropped: nothing listens here any more
-    let err = run(
-        "getter",
-        json!({"url": format!("http://user:pw-secret@127.0.0.1:{port}/p?token=qs-secret"), "stream": false}),
-    )
-    .await
-    .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("request to 127.0.0.1"), "{msg}");
-    assert!(
-        !msg.contains("qs-secret") && !msg.contains("pw-secret"),
-        "a transport error leaked URL credentials: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn cancelling_an_invocation_tears_a_running_step_down() {
-    let f = fixture();
-    let cancel = gwennol_core::gwead::tokio_util::sync::CancellationToken::new();
-    let kernel = f.kernel.clone();
-    let token = cancel.clone();
-    let handle = tokio::spawn(async move {
-        kernel
-            .execute(
-                "runner",
-                "go",
-                json!({"argv": ["sleep", "30"], "stdin": "", "timeout_ms": 60000, "max_output_bytes": 1024}),
-            )
-            .with_config(&json!({}))
-            .with_cancel(token)
-            .run()
-            .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    cancel.cancel();
-    let err = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-        .await
-        .expect("cancellation did not tear the step down")
-        .unwrap()
-        .unwrap_err();
-    assert!(err.to_string().contains("cancelled"), "{err}");
 }
 
 #[tokio::test]

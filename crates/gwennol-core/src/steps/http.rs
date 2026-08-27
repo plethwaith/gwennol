@@ -157,36 +157,38 @@ fn guarded_body(
     }))
 }
 
-/// reqwest's `Display` appends `for url (…)` with the URL unredacted, so
-/// a connect/TLS/read failure would carry the query string and userinfo
-/// into plugin-visible strings and logs. Scrub the error's own copy of
-/// the URL before formatting it.
-fn scrubbed(mut e: reqwest::Error) -> reqwest::Error {
-    if let Some(u) = e.url_mut() {
-        let _ = u.set_username("");
-        let _ = u.set_password(None);
-        u.set_query(None);
-        u.set_fragment(None);
-    }
-    e
-}
-
-/// A URL rendered safe for error messages: no userinfo, query, or
-/// fragment, any of which can carry credentials — errors travel into
-/// plugin-visible strings and logs.
-fn safe_url(url: &Url) -> String {
-    let mut u = url.clone();
+/// Strip everything from a URL that can carry a credential — userinfo,
+/// query, fragment — leaving scheme, host and path. Every URL headed for
+/// a plugin-visible string or a log goes through here.
+pub(crate) fn scrub(u: &mut Url) {
     let _ = u.set_username("");
     let _ = u.set_password(None);
     u.set_query(None);
     u.set_fragment(None);
+}
+
+/// reqwest's `Display` appends `for url (…)` with the URL unredacted, so
+/// a send failure would carry the query string into plugin-visible
+/// strings and logs. Scrub the error's own copy of the URL before
+/// formatting it.
+fn scrubbed(mut e: reqwest::Error) -> reqwest::Error {
+    if let Some(u) = e.url_mut() {
+        scrub(u);
+    }
+    e
+}
+
+/// A URL rendered safe for error messages, via [`scrub`].
+fn safe_url(url: &Url) -> String {
+    let mut u = url.clone();
+    scrub(&mut u);
     u.to_string()
 }
 
 fn host_of(url: &Url) -> Result<String, StepError> {
     url.host_str()
         .map(str::to_string)
-        .ok_or_else(|| StepError::Failed(format!("URL '{url}' has no host")))
+        .ok_or_else(|| StepError::Failed(format!("URL '{}' has no host", safe_url(url))))
 }
 
 /// `host_http.get`:
