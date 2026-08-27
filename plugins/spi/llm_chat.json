@@ -43,7 +43,7 @@
         "oneOf": [
           {
             "type": "object",
-            "required": ["message", "stop_reason"],
+            "required": ["message", "stop_reason", "usage"],
             "additionalProperties": false,
             "description": "The buffered form (`stream` false or absent).",
             "properties": {
@@ -95,7 +95,7 @@
       },
       {
         "type": "object",
-        "required": ["type", "stop_reason"],
+        "required": ["type", "stop_reason", "usage"],
         "additionalProperties": false,
         "description": "The final event of every successful stream.",
         "properties": {

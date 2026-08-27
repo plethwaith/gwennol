@@ -97,8 +97,10 @@ the model is waiting on their results. `refusal` means the model declined
 to continue; the turn ends and must not be retried or silently continued.
 An assistant `content` array may be empty — a refusal, or `max_tokens`
 hit immediately, can stop a turn before any block completes. `usage` is
-open beyond its two required fields: a provider may add its own counters
-(cache reads, say), and consumers must tolerate and may ignore them.
+always present — on the buffered form and on the stream's `end` event
+alike — and open beyond its two required fields: a provider may add its
+own counters (cache reads, say), and consumers must tolerate and may
+ignore them.
 
 A buffered turn that fails — the request never succeeded, there is no
 message — is an ordinary step error. A structured taxonomy for those
