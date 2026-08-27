@@ -211,6 +211,15 @@ fn fixture_tool() -> Value {
     })
 }
 
+/// A minimal `TOOL` plugin whose `call` advertises `tool_name` — for
+/// harvest tests that need several distinct (or clashing) tools.
+fn named_tool(plugin_name: &str, tool_name: &str) -> Value {
+    let mut manifest = fixture_tool();
+    manifest["name"] = json!(plugin_name);
+    manifest["actions"]["call"]["tool"]["name"] = json!(tool_name);
+    manifest
+}
+
 /// A plugin carrying a `tool` block that never claimed the `TOOL` role:
 /// Gwead's raw descriptor list includes it anyway, and the docs/SPI.md
 /// harvest rules must screen it out before anything reaches the model.
@@ -313,8 +322,27 @@ fn stream_stub() -> &'static str {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
+            let mut consecutive_failures = 0u32;
             for stream in listener.incoming() {
-                let Ok(mut s) = stream else { continue };
+                let mut s = match stream {
+                    Ok(s) => {
+                        consecutive_failures = 0;
+                        s
+                    }
+                    Err(e) => {
+                        // Transient under load (ECONNABORTED, EMFILE) —
+                        // but don't busy-spin if it's persistent, and
+                        // don't die silently either way.
+                        consecutive_failures += 1;
+                        eprintln!("stream stub: accept failed ({e}), {consecutive_failures} in a row");
+                        if consecutive_failures >= 16 {
+                            eprintln!("stream stub: persistent accept failure, giving up");
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
                     // Read until the blank line ending the request head;
                     // the fixture's GET carries no body.
@@ -434,24 +462,42 @@ fn the_conformance_harness_rejects_violating_payloads() {
     for (schema, bad) in [
         (c.chat_input, json!({"messages": []})),
         (c.chat_output, json!({"stream": 0})),
-        // usage is required, on the buffered form and the end event both.
-        (
-            c.chat_output,
-            json!({
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
-                "stop_reason": "end_turn"
-            }),
-        ),
-        (
-            c.stream_event,
-            json!({"type": "end", "stop_reason": "end_turn"}),
-        ),
         (c.stream_event, json!({"type": "bogus"})),
         (c.call_output, json!({"is_error": true})),
     ] {
         assert!(
             c.schemas.validate(&bad, schema).is_err(),
             "schema accepted a violating payload: {bad}"
+        );
+    }
+
+    // usage is required on the buffered form and the end event — pinned
+    // as minimal pairs: each payload is valid until usage alone is
+    // removed, so the rejection is attributable to exactly that field.
+    for (schema, valid) in [
+        (
+            c.chat_output,
+            json!({
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }),
+        ),
+        (
+            c.stream_event,
+            json!({
+                "type": "end",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }),
+        ),
+    ] {
+        assert_conforms(schema, &valid);
+        let mut missing_usage = valid.clone();
+        missing_usage.as_object_mut().unwrap().remove("usage");
+        assert!(
+            c.schemas.validate(&missing_usage, schema).is_err(),
+            "schema accepted a payload without usage: {missing_usage}"
         );
     }
 }
@@ -501,23 +547,77 @@ fn a_tool_missing_the_call_action_is_rejected() {
 }
 
 #[test]
-fn the_harvest_refuses_duplicate_tool_names() {
-    // Two TOOL plugins advertising the same tool.name make selection by
-    // descriptor ambiguous; spi::harvest_tools must refuse, not pick.
+fn the_harvest_sorts_by_name_and_refuses_duplicates() {
     let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
     spi::register(&mut kernel).unwrap();
-    for plugin_name in ["clash_one", "clash_two"] {
-        let mut manifest = fixture_tool();
-        manifest["name"] = json!(plugin_name);
+
+    // No tools yet: the harvest is empty, not an error.
+    assert!(spi::harvest_tools(&kernel).unwrap().is_empty());
+
+    // Registered anti-sorted, harvested sorted — deleting the sort must
+    // fail this, since tool order is prompt-cache-critical.
+    for (plugin, tool) in [("p1", "zeta"), ("p2", "alpha"), ("p3", "mu")] {
         kernel
-            .register_plugin_from_json(&manifest.to_string())
+            .register_plugin_from_json(&named_tool(plugin, tool).to_string())
             .unwrap();
     }
+    let names: Vec<String> = spi::harvest_tools(&kernel)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.tool_name)
+        .collect();
+    assert_eq!(names, ["alpha", "mu", "zeta"]);
+
+    // A duplicate that is non-adjacent in registration order (p1 holds
+    // "zeta", p2 and p3 sit between) is still refused: the check runs on
+    // the sorted list. Two TOOL plugins advertising one name make
+    // selection by descriptor ambiguous; refuse, don't pick.
+    kernel
+        .register_plugin_from_json(&named_tool("p4", "zeta").to_string())
+        .unwrap();
     let err = spi::harvest_tools(&kernel).unwrap_err();
     assert!(
-        matches!(&err, spi::HarvestError::DuplicateToolName(name) if name == "fixture_echo"),
+        matches!(&err, spi::HarvestError::DuplicateToolName(name) if name == "zeta"),
         "{err}"
     );
+}
+
+#[test]
+fn the_harvest_ignores_tool_blocks_on_other_actions_of_a_tool_plugin() {
+    // A bona fide TOOL plugin may carry a second action with its own
+    // tool block; only `call` faced the contract check, so only `call`'s
+    // tool is harvested.
+    let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
+    spi::register(&mut kernel).unwrap();
+    let mut manifest = named_tool("sidecar", "real_tool");
+    manifest["actions"]["extra"] = json!({
+        "tool": {
+            "name": "extra_tool",
+            "description": "A tool block on a non-call action.",
+            "parameters": {"type": "object"}
+        },
+        "steps": [
+            {"id": "out", "type": "return", "params": {"value": {"content": "no"}}}
+        ]
+    });
+    kernel
+        .register_plugin_from_json(&manifest.to_string())
+        .unwrap();
+
+    assert!(
+        kernel
+            .registry()
+            .get_tool_descriptors()
+            .iter()
+            .any(|d| d.tool_name == "extra_tool"),
+        "the raw engine list should contain the non-call tool block"
+    );
+    let names: Vec<String> = spi::harvest_tools(&kernel)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.tool_name)
+        .collect();
+    assert_eq!(names, ["real_tool"]);
 }
 
 // ---------------------------------------------------- dispatch by role

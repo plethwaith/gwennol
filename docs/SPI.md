@@ -210,18 +210,21 @@ schema open.
 
 The harvest is not a passthrough. Gwead collects a `tool` block from
 *any* action of *any* plugin, in unspecified order (its own docs say so —
-the descriptor list comes off a `HashMap`), so the embedder building
-`tools` must:
+the descriptor list comes off a `HashMap`), so the raw list is never what
+the model gets. `gwennol_core::spi::harvest_tools` is the one
+implementation of the harvest rules — call it rather than re-deriving
+them:
 
-- **keep only descriptors whose plugin claims the `TOOL` role and whose
-  action is `call`** — anything else never faced the contract check and
-  is not offered to the model;
-- **refuse duplicate tool names** at startup — two plugins declaring the
-  same `tool.name` make "the descriptor with that name" ambiguous, and
-  real provider APIs reject duplicate tools anyway;
-- **sort by name** — tool order is model-visible and prefix-sensitive,
-  so an unspecified order changes the prompt every process start and
-  busts provider-side prompt caching.
+- **only descriptors whose plugin fulfils the `TOOL` role through its
+  `call` action survive** — anything else never faced the contract check
+  and is not offered to the model;
+- **duplicate tool names are refused, not resolved**
+  (`HarvestError::DuplicateToolName`) — two plugins declaring the same
+  `tool.name` make "the descriptor with that name" ambiguous, and real
+  provider APIs reject duplicate tools anyway;
+- **the result is sorted by name** — tool order is model-visible and
+  prefix-sensitive, so an unspecified order changes the prompt every
+  process start and busts provider-side prompt caching.
 
 ### Selecting a tool
 

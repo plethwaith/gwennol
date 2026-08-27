@@ -36,6 +36,9 @@ pub mod tool {
 }
 
 /// Every bundled contract as `(role, definition)`, in registration order.
+///
+/// Inventory, not a registration path: to put the contracts on a kernel,
+/// call [`register`] rather than looping over this by hand.
 pub const SPI_DEFINITIONS: [(&str, &str); 2] = [
     (llm_chat::ROLE, llm_chat::DEFINITION),
     (tool::ROLE, tool::DEFINITION),
@@ -45,9 +48,10 @@ pub const SPI_DEFINITIONS: [(&str, &str); 2] = [
 ///
 /// Must run before any plugin claims a bundled role: Gwead checks a claim
 /// against a contract only when the contract is already registered — an
-/// unknown role loads with nothing but a warning. [`crate::boot`] calls
-/// this; any other registration path (a test kernel, a future embedder
-/// seam) must call it too rather than hand-rolling the loop.
+/// unknown role loads with nothing but a warning. [`crate::boot_with`]
+/// (and so [`crate::boot`]) calls this; any other registration path (a
+/// test kernel, a future embedder seam) must call it too rather than
+/// hand-rolling the loop.
 pub fn register(kernel: &mut gwead::kernel::Kernel) -> Result<(), gwead::kernel::KernelError> {
     for (role, definition) in SPI_DEFINITIONS {
         kernel.register_spi_from_json(role, definition)?;
@@ -84,6 +88,14 @@ pub enum HarvestError {
 /// name`, `description → description`, `parameters → input_schema`, and
 /// its `plugin_key`/`action_name` say exactly what to execute when the
 /// model names the tool.
+///
+/// Root-scoped, like `Kernel::execute_by_role`: fulfillers are resolved
+/// from the root namespace, which is where Gwennol registers every
+/// plugin — a `TOOL` plugin loaded into a non-root namespace would pass
+/// its contract check yet not be harvested. That is the deliberate MVP
+/// posture; namespaced deployments arrive with installable third-party
+/// plugins ("Beyond the MVP" in the roadmap), and this signature grows a
+/// namespace argument with them.
 pub fn harvest_tools(
     kernel: &gwead::kernel::Kernel,
 ) -> Result<Vec<gwead::kernel::registry::ToolDescriptor>, HarvestError> {
@@ -108,28 +120,51 @@ pub fn harvest_tools(
 mod tests {
     use super::*;
 
+    /// The name of a contract's canonical file under `plugins/spi/`,
+    /// by convention: the role, lowercased.
+    fn canonical_file(role: &str) -> String {
+        format!("{}.json", role.to_lowercase())
+    }
+
     /// The embedded copies must be byte-identical to the canonical
     /// documents in `plugins/spi/`. The one legitimate skip is the whole
-    /// directory being absent (a packaged crate has only the copies);
-    /// inside a present repository layout, every read must succeed and
-    /// match, so a moved or misnamed canonical file fails loudly instead
-    /// of silently disarming the repo's only drift check.
+    /// directory not existing (a packaged crate has only the copies) —
+    /// any other failure to read it, permissions included, is an error.
+    /// The file list derives from [`SPI_DEFINITIONS`] and is checked
+    /// complete against the directory, so a third contract cannot land
+    /// on either side without the other.
     #[test]
     fn embedded_contracts_match_the_canonical_documents() {
         let canonical_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/spi");
-        if !canonical_dir.is_dir() {
-            eprintln!(
-                "skipping: no repository layout at {}",
-                canonical_dir.display()
-            );
-            return;
-        }
-        for (role, embedded, file) in [
-            (llm_chat::ROLE, llm_chat::DEFINITION, "llm_chat.json"),
-            (tool::ROLE, tool::DEFINITION, "tool.json"),
-        ] {
-            let path = canonical_dir.join(file);
+        let entries = match std::fs::read_dir(&canonical_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping: no repository layout at {}",
+                    canonical_dir.display()
+                );
+                return;
+            }
+            other => {
+                other.unwrap_or_else(|e| panic!("cannot read {}: {e}", canonical_dir.display()))
+            }
+        };
+
+        let on_disk: std::collections::BTreeSet<String> = entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        let expected: std::collections::BTreeSet<String> = SPI_DEFINITIONS
+            .iter()
+            .map(|(role, _)| canonical_file(role))
+            .collect();
+        assert_eq!(
+            on_disk, expected,
+            "plugins/spi/*.json and SPI_DEFINITIONS disagree — a contract exists on one side only"
+        );
+
+        for (role, embedded) in SPI_DEFINITIONS {
+            let path = canonical_dir.join(canonical_file(role));
             let canonical = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{role}: cannot read {}: {e}", path.display()));
             assert_eq!(
