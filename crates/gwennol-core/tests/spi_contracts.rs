@@ -51,7 +51,7 @@ fn fixture() -> &'static Fixture {
         // approval paths against workspace joins.
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         let mut kernel = gwennol_core::boot(Arc::new(Permissive), workspace).unwrap();
-        for plugin in [fixture_provider(), fixture_tool()] {
+        for plugin in [fixture_provider(), fixture_tool(), decoy_tool()] {
             kernel
                 .register_plugin_from_json(&plugin.to_string())
                 .unwrap();
@@ -64,9 +64,10 @@ fn fixture() -> &'static Fixture {
 
 // ------------------------------------------------ contract validation
 
-/// The contract schemas, compiled for instance validation. Each is made
-/// self-contained by attaching the document's top-level `$defs`, since
-/// `#/$defs/…` references resolve against the compiled resource's root.
+/// The contract schemas, compiled for instance validation. boon compiles
+/// JSON-pointer fragments of a registered document directly, and
+/// `#/$defs/…` references resolve against the document root, so each
+/// subschema is addressed in place — no synthetic copies.
 struct Contracts {
     schemas: Schemas,
     chat_input: SchemaIndex,
@@ -75,45 +76,30 @@ struct Contracts {
     call_output: SchemaIndex,
 }
 
-fn self_contained(document: &Value, pointer: &str) -> Value {
-    let mut schema = document.pointer(pointer).expect(pointer).clone();
-    if let Some(defs) = document.get("$defs") {
-        schema["$defs"] = defs.clone();
-    }
-    schema
-}
-
 fn contracts() -> &'static Contracts {
     static C: OnceLock<Contracts> = OnceLock::new();
     C.get_or_init(|| {
-        let llm: Value = gwead::serde_json::from_str(spi::llm_chat::DEFINITION).unwrap();
-        let tool: Value = gwead::serde_json::from_str(spi::tool::DEFINITION).unwrap();
-        let sources = [
-            (
-                "http://gwennol.dev/spi/chat-input.json",
-                self_contained(&llm, "/actions/chat/input"),
-            ),
-            (
-                "http://gwennol.dev/spi/chat-output.json",
-                self_contained(&llm, "/actions/chat/output"),
-            ),
-            (
-                "http://gwennol.dev/spi/stream-event.json",
-                self_contained(&llm, "/streamEventShape"),
-            ),
-            (
-                "http://gwennol.dev/spi/call-output.json",
-                self_contained(&tool, "/actions/call/output"),
-            ),
-        ];
+        const LLM: &str = "http://gwennol.dev/spi/llm_chat.json";
+        const TOOL: &str = "http://gwennol.dev/spi/tool.json";
         let mut compiler = Compiler::new();
         let mut schemas = Schemas::new();
-        for (url, schema) in &sources {
-            compiler.add_resource(url, schema.clone()).unwrap();
-        }
-        let [chat_input, chat_output, stream_event, call_output] = sources.map(|(url, _)| {
+        for (url, document) in [
+            (LLM, spi::llm_chat::DEFINITION),
+            (TOOL, spi::tool::DEFINITION),
+        ] {
             compiler
-                .compile(url, &mut schemas)
+                .add_resource(url, gwead::serde_json::from_str(document).unwrap())
+                .unwrap();
+        }
+        let [chat_input, chat_output, stream_event, call_output] = [
+            format!("{LLM}#/actions/chat/input"),
+            format!("{LLM}#/actions/chat/output"),
+            format!("{LLM}#/streamEventShape"),
+            format!("{TOOL}#/actions/call/output"),
+        ]
+        .map(|url| {
+            compiler
+                .compile(&url, &mut schemas)
                 .unwrap_or_else(|e| panic!("{url} is not a compilable schema: {e}"))
         });
         Contracts {
@@ -225,24 +211,35 @@ fn fixture_tool() -> Value {
     })
 }
 
-/// The `tools` input for `chat`, built by the harvest rules in
-/// `docs/SPI.md` the way the agent loop will: only descriptors from
-/// `TOOL`-role plugins' `call` actions, no duplicate names, sorted by
-/// name (Gwead's descriptor order is explicitly unspecified).
+/// A plugin carrying a `tool` block that never claimed the `TOOL` role:
+/// Gwead's raw descriptor list includes it anyway, and the docs/SPI.md
+/// harvest rules must screen it out before anything reaches the model.
+fn decoy_tool() -> Value {
+    json!({
+        "name": "decoy", "version": "0.0.0",
+        "description": "test fixture: a tool block outside the TOOL role",
+        "actions": {
+            "tempt": {
+                "tool": {
+                    "name": "sneaky_tool",
+                    "description": "Must never be offered to the model.",
+                    "parameters": {"type": "object"}
+                },
+                "steps": [
+                    {"id": "out", "type": "return", "params": {"value": {"content": "gotcha"}}}
+                ]
+            }
+        }
+    })
+}
+
+/// The `tools` input for `chat`, mapped from [`spi::harvest_tools`] —
+/// the core's one implementation of the docs/SPI.md harvest rules, never
+/// the raw descriptor list.
 fn wire_tools(kernel: &Kernel) -> Value {
-    let tool_plugins = kernel.role_candidates(None, spi::tool::ROLE);
-    let mut descriptors: Vec<_> = kernel
-        .registry()
-        .get_tool_descriptors()
-        .into_iter()
-        .filter(|d| tool_plugins.contains(&d.plugin_key) && d.action_name == spi::tool::CALL)
-        .collect();
-    descriptors.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
-    for pair in descriptors.windows(2) {
-        assert_ne!(pair[0].tool_name, pair[1].tool_name, "duplicate tool name");
-    }
     Value::Array(
-        descriptors
+        spi::harvest_tools(kernel)
+            .unwrap()
             .into_iter()
             .map(|d| {
                 json!({
@@ -256,11 +253,12 @@ fn wire_tools(kernel: &Kernel) -> Value {
 }
 
 /// Run one tool call the milestone-5 way: the model named a tool, the
-/// harvested descriptor says what to execute — by plugin and action,
-/// not by role, since many `TOOL` plugins register at once.
+/// *harvested* descriptor (filtered and checked, not the raw list) says
+/// what to execute — by plugin and action, not by role, since many
+/// `TOOL` plugins register at once.
 async fn call_by_descriptor(f: &Fixture, call: &Value) -> Value {
     let name = call["name"].as_str().unwrap();
-    let descriptors = f.kernel.registry().get_tool_descriptors();
+    let descriptors = spi::harvest_tools(&f.kernel).unwrap();
     let d = descriptors
         .iter()
         .find(|d| d.tool_name == name)
@@ -304,46 +302,55 @@ const TRUNCATED_BODY: &str = concat!(
 
 /// Minimal HTTP/1.1 server: `/truncated` gets [`TRUNCATED_BODY`], any
 /// other path [`STREAM_BODY`], each written in two flushed halves so the
-/// client genuinely streams. Returns the base URL.
-fn spawn_stream_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut s = stream.unwrap();
-            std::thread::spawn(move || {
-                // Read until the blank line ending the request head; the
-                // fixture's GET carries no body.
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = s.read(&mut tmp).unwrap();
-                    if n == 0 {
-                        return;
+/// client genuinely streams. One process-wide instance — the path
+/// routing exists so a single listener serves every streaming test —
+/// and a failed `accept` (possible under parallel CI load) skips that
+/// connection rather than killing the accept thread. Returns the base
+/// URL.
+fn stream_stub() -> &'static str {
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    // Read until the blank line ending the request head;
+                    // the fixture's GET carries no body.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = s.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-                let head = String::from_utf8_lossy(&buf);
-                let path = head.split_whitespace().nth(1).unwrap_or("/");
-                let body = if path.ends_with("/truncated") {
-                    TRUNCATED_BODY
-                } else {
-                    STREAM_BODY
-                };
-                write!(
-                    s,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                let (a, b) = body.split_at(body.len() / 2);
-                s.write_all(a.as_bytes()).unwrap();
-                s.flush().unwrap();
-                s.write_all(b.as_bytes()).unwrap();
-            });
-        }
-    });
-    format!("http://127.0.0.1:{port}")
+                    let head = String::from_utf8_lossy(&buf);
+                    let path = head.split_whitespace().nth(1).unwrap_or("/");
+                    let body: &[u8] = if path.ends_with("/truncated") {
+                        TRUNCATED_BODY.as_bytes()
+                    } else {
+                        STREAM_BODY.as_bytes()
+                    };
+                    write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    // Split on bytes: a UTF-8 boundary mid-body must not
+                    // matter to the halving.
+                    let (a, b) = body.split_at(body.len() / 2);
+                    s.write_all(a).unwrap();
+                    s.flush().unwrap();
+                    s.write_all(b).unwrap();
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    })
 }
 
 /// Stream a chat turn from `url` through the fixture provider and return
@@ -427,6 +434,18 @@ fn the_conformance_harness_rejects_violating_payloads() {
     for (schema, bad) in [
         (c.chat_input, json!({"messages": []})),
         (c.chat_output, json!({"stream": 0})),
+        // usage is required, on the buffered form and the end event both.
+        (
+            c.chat_output,
+            json!({
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+                "stop_reason": "end_turn"
+            }),
+        ),
+        (
+            c.stream_event,
+            json!({"type": "end", "stop_reason": "end_turn"}),
+        ),
         (c.stream_event, json!({"type": "bogus"})),
         (c.call_output, json!({"is_error": true})),
     ] {
@@ -445,20 +464,19 @@ async fn boot_registers_both_roles() {
     assert!(roles.contains(&spi::tool::ROLE), "{roles:?}");
 }
 
-#[tokio::test]
-async fn a_provider_missing_the_chat_action_is_rejected() {
+/// A claim on `role` without its required action must be refused. Runs
+/// on a bare Gwead kernel: registration is `&mut`, and the shared
+/// fixture kernel is already behind its `Arc`.
+#[track_caller]
+fn assert_hollow_claim_rejected(role: &str, required_action: &str) {
     // The reason boot registers the contracts first: with the definition
     // present, an incomplete claim is an error rather than a warning.
-    // (On a bare Gwead kernel — registration is `&mut`, and the shared
-    // fixture kernel is already behind its `Arc`.)
     let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
-    for (role, definition) in spi::SPI_DEFINITIONS {
-        kernel.register_spi_from_json(role, definition).unwrap();
-    }
+    spi::register(&mut kernel).unwrap();
     let claim = json!({
-        "name": "hollow_provider", "version": "0.0.0",
-        "description": "claims LLM_CHAT but provides no chat action",
-        "roles": [spi::llm_chat::ROLE],
+        "name": "hollow", "version": "0.0.0",
+        "description": "claims a role but omits its required action",
+        "roles": [role],
         "actions": {"other": {"steps": [
             {"id": "s", "type": "let", "params": {"value": 1}}
         ]}}
@@ -468,37 +486,65 @@ async fn a_provider_missing_the_chat_action_is_rejected() {
         .register()
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("chat"), "{msg}");
-    assert!(msg.contains(spi::llm_chat::ROLE), "{msg}");
+    assert!(msg.contains(required_action), "{msg}");
+    assert!(msg.contains(role), "{msg}");
 }
 
-#[tokio::test]
-async fn a_tool_missing_the_call_action_is_rejected() {
+#[test]
+fn a_provider_missing_the_chat_action_is_rejected() {
+    assert_hollow_claim_rejected(spi::llm_chat::ROLE, spi::llm_chat::CHAT);
+}
+
+#[test]
+fn a_tool_missing_the_call_action_is_rejected() {
+    assert_hollow_claim_rejected(spi::tool::ROLE, spi::tool::CALL);
+}
+
+#[test]
+fn the_harvest_refuses_duplicate_tool_names() {
+    // Two TOOL plugins advertising the same tool.name make selection by
+    // descriptor ambiguous; spi::harvest_tools must refuse, not pick.
     let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
-    for (role, definition) in spi::SPI_DEFINITIONS {
-        kernel.register_spi_from_json(role, definition).unwrap();
+    spi::register(&mut kernel).unwrap();
+    for plugin_name in ["clash_one", "clash_two"] {
+        let mut manifest = fixture_tool();
+        manifest["name"] = json!(plugin_name);
+        kernel
+            .register_plugin_from_json(&manifest.to_string())
+            .unwrap();
     }
-    let claim = json!({
-        "name": "hollow_tool", "version": "0.0.0",
-        "description": "claims TOOL but provides no call action",
-        "roles": [spi::tool::ROLE],
-        "actions": {"other": {"steps": [
-            {"id": "s", "type": "let", "params": {"value": 1}}
-        ]}}
-    });
-    let err = kernel
-        .load_manifest(&claim.to_string())
-        .register()
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("call"), "{msg}");
-    assert!(msg.contains(spi::tool::ROLE), "{msg}");
+    let err = spi::harvest_tools(&kernel).unwrap_err();
+    assert!(
+        matches!(&err, spi::HarvestError::DuplicateToolName(name) if name == "fixture_echo"),
+        "{err}"
+    );
 }
 
 // ---------------------------------------------------- dispatch by role
 
 fn user_text(text: &str) -> Value {
     json!({"role": "user", "content": [{"type": "text", "text": text}]})
+}
+
+#[tokio::test]
+async fn the_harvest_screens_out_tool_blocks_outside_the_role() {
+    let f = fixture();
+    // Gwead's raw descriptor list contains the decoy…
+    assert!(
+        f.kernel
+            .registry()
+            .get_tool_descriptors()
+            .iter()
+            .any(|d| d.tool_name == "sneaky_tool"),
+        "the decoy fixture should be harvestable by the raw engine list"
+    );
+    // …the docs/SPI.md harvest does not.
+    let names: Vec<String> = spi::harvest_tools(&f.kernel)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.tool_name)
+        .collect();
+    assert_eq!(names, ["fixture_echo"]);
 }
 
 #[tokio::test]
@@ -644,7 +690,7 @@ async fn a_tool_call_round_trips_with_no_agent_loop() {
 #[tokio::test]
 async fn a_streamed_response_arrives_through_a_stream_handle() {
     let f = fixture();
-    let events = stream_events_from(f, format!("{}/chat", spawn_stream_stub())).await;
+    let events = stream_events_from(f, format!("{}/chat", stream_stub())).await;
 
     // Text deltas concatenate in arrival order; the tool call arrives
     // whole; the end event closes the turn before end-of-stream.
@@ -671,7 +717,7 @@ async fn a_stream_ending_without_end_is_a_failed_turn() {
     // End-of-stream with no `end` (or `error`) event: the consumer must
     // classify the turn as failed, not treat "hello" as a short answer.
     let f = fixture();
-    let events = stream_events_from(f, format!("{}/truncated", spawn_stream_stub())).await;
+    let events = stream_events_from(f, format!("{}/truncated", stream_stub())).await;
 
     assert!(!events.is_empty(), "the truncated turn did stream bytes");
     let failed = !events
