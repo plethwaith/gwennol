@@ -71,9 +71,7 @@ pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     // if the contract is already registered, so registering the SPI
     // definitions here — before any caller can add a plugin — is what makes
     // the check unskippable for the bundled roles.
-    for (role, definition) in spi::SPI_DEFINITIONS {
-        kernel.register_spi_from_json(role, definition)?;
-    }
+    spi::register(&mut kernel)?;
     for manifest in HOST_MANIFESTS {
         kernel.register_plugin_from_json(manifest)?;
     }
