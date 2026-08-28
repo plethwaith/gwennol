@@ -56,16 +56,23 @@ pub fn boot(operator: Arc<dyn Operator>, workspace_root: PathBuf) -> Result<Kern
         operator,
         workspace_root,
         process_env: ProcessEnv::default(),
+        trusted_step_type_providers: Vec::new(),
     })
 }
 
-/// [`boot`], with the host policy the frontend chose — today the
-/// environment spawned processes get.
+/// [`boot`], with the host policy the frontend chose — the environment
+/// spawned processes get, and which plugins may supply script runtimes.
 pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     let operator = host.operator.clone();
-    let config = KernelConfig::default()
+    let mut config = KernelConfig::default()
         .with_native_step_impls(NativeStepImplTable::discover()?)
         .with_secret_resolver(Arc::new(OperatorSecrets(operator)));
+    // The embedder half of the script-runtime authorization; the other
+    // half is the provide:step_type: declaration in the trusted
+    // plugin's own manifest. See HostConfig::trusted_step_type_providers.
+    for provider in &host.trusted_step_type_providers {
+        config = config.trusting_step_type_provider(provider.clone());
+    }
     let mut kernel = Kernel::boot(config)?;
     // Contracts first: Gwead checks a plugin against a role's contract only
     // if the contract is already registered, so registering the SPI

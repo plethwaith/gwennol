@@ -798,6 +798,7 @@ name = "gwennol-core"
 version = "0.1.0-dev"
 dependencies = [
  "async-trait",
+ "base64",
  "boon",
  "gwead",
  "nix",

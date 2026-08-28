@@ -29,6 +29,9 @@ nix.workspace = true
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true
+# Guest wasm modules travel inline in plugin manifests as base64; the
+# substrate tests encode the compiled example guest with it.
+base64 = "0.22"
 # The same JSON Schema validator Gwead uses for its meta-schemas; here it
 # pins fixture payloads to the SPI contract schemas, which the kernel
 # deliberately never does at dispatch.
