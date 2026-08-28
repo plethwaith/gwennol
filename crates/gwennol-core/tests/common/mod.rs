@@ -180,9 +180,9 @@ pub fn read_http_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
 /// Take a `chat` action's streamed output, validate it against the
 /// contract's output schema, drain the handle from `streams`, and
 /// return the NDJSON events — each validated against the contract's
-/// `streamEventShape`. The kernel deliberately validates nothing at
-/// dispatch, so this drain is where streamed conformance is enforced
-/// for every suite that uses it.
+/// `streamEventShape`. The kernel deliberately validates no payloads
+/// at dispatch, so this drain is where streamed conformance is
+/// enforced for every suite that uses it.
 pub async fn drain_stream_events(streams: &Arc<Mutex<StreamRegistry>>, out: &Value) -> Vec<Value> {
     assert_conforms(contracts().chat_output, out);
     let handle = out["stream"]

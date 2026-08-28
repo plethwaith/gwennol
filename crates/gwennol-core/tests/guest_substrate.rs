@@ -237,15 +237,31 @@ fn sse_stub() -> &'static SseStub {
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
             stub.requests.lock().unwrap().push((path.clone(), parsed));
             // The vendor said no: a non-2xx JSON answer, not an event
-            // stream — what a real rate limit looks like.
-            if path == "/http-error-turn" {
-                let reason = br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+            // stream. Three flavours: a retryable rate limit, a
+            // don't-retry client error, and a rate limit whose body
+            // overflows the relay's excerpt cap (the sentinel sits past
+            // the cap and must never surface).
+            let http_error: Option<(&str, String)> = match path.as_str() {
+                "/http-error-turn" => Some((
+                    "429 Too Many Requests",
+                    r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#.to_string(),
+                )),
+                "/http-notfound-turn" => Some((
+                    "404 Not Found",
+                    r#"{"error":{"type":"not_found_error","message":"no such model"}}"#.to_string(),
+                )),
+                "/http-bloated-error-turn" => {
+                    Some(("429 Too Many Requests", format!("{}TAIL_SENTINEL", "B".repeat(8000))))
+                }
+                _ => None,
+            };
+            if let Some((status, reason)) = http_error {
                 let _ = write!(
                     socket,
-                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     reason.len()
                 );
-                let _ = socket.write_all(reason);
+                let _ = socket.write_all(reason.as_bytes());
                 return;
             }
             let sse = match path.as_str() {
@@ -460,6 +476,54 @@ async fn an_http_error_becomes_the_contract_error_event() {
     assert!(
         message.contains("slow down"),
         "carries the vendor's reason: {message}"
+    );
+}
+
+/// A plain client error is not marked worth repeating: only the
+/// `retryable` classifier's true branch was pinned before, so a
+/// regression to always-retryable would have sent consumers retrying
+/// 401s and 404s forever without failing the suite.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_error_is_not_marked_retryable() {
+    let f = fixture();
+    let events = stream_turn_events(f, "/http-notfound-turn").await;
+
+    assert_eq!(
+        events.len(),
+        1,
+        "the error event is the whole stream: {events:?}"
+    );
+    assert_eq!(events[0]["type"], json!("error"));
+    assert_eq!(
+        events[0]["retryable"],
+        json!(false),
+        "a 404 will fail again"
+    );
+    let message = events[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("404") && message.contains("no such model"),
+        "{message}"
+    );
+}
+
+/// An oversized error body is cut at the excerpt cap and says so — and
+/// the bytes past the cap (the stub plants a sentinel there) never
+/// reach the message.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_error_body_is_truncated_with_a_marker() {
+    let f = fixture();
+    let events = stream_turn_events(f, "/http-bloated-error-turn").await;
+
+    assert_eq!(
+        events.len(),
+        1,
+        "the error event is the whole stream: {events:?}"
+    );
+    let message = events[0]["message"].as_str().unwrap();
+    assert!(message.contains("…(truncated)"), "marks the cut: {message}");
+    assert!(
+        !message.contains("TAIL_SENTINEL"),
+        "nothing past the cap leaks through: {message}"
     );
 }
 

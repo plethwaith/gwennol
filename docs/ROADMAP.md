@@ -188,6 +188,12 @@ written, and it must be settled before a provider exists.
 - **Done when:** a multi-turn conversation with tool calls runs against a
   stubbed provider; a failing tool is reported *to the model* rather than
   ending the turn; cancelling mid-stream tears the turn down cleanly.
+- **Owed to milestone 3:** the loop harness is the first place a
+  consumer-hangs-up turn becomes observable end to end (a step outcome
+  the test can see), so it owes the pin on the example guest's
+  reader-gone wind-down — the relay treating a closed output as a
+  graceful stop, not a failed step — which milestone 3 could verify
+  only by inspection.
 - **Not in scope:** any frontend beyond a test `Operator`.
 
 ### 6. Non-interactive CLI
