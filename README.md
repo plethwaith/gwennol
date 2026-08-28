@@ -31,11 +31,12 @@ manifests.
 
 ## Status
 
-**Pre-alpha.** The native host step types (milestone 1) and the
-`LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md))
-exist and are exercised by integration tests against a real kernel;
-nothing user-facing runs yet. The 0.0.0 release on crates.io is a name
-reservation.
+**Pre-alpha.** The native host step types (milestone 1), the
+`LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md)),
+and the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
+[docs/SUBSTRATE.md](docs/SUBSTRATE.md)) exist and are exercised by
+integration tests against a real kernel; nothing user-facing runs yet.
+The 0.0.0 release on crates.io is a name reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.
@@ -45,6 +46,8 @@ naming rules, and the seven milestones to a usable harness.
 ```
 crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
 crates/gwennol-cli/    first frontend (non-interactive CLI)
+crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
+crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
 plugins/               bundled SPI + plugin manifests
 docs/                  roadmap and design notes
 ```

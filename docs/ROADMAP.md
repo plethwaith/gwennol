@@ -145,6 +145,21 @@ written, and it must be settled before a provider exists.
   that long-running slot.
 - **Not in scope:** the Anthropic provider itself; installing plugins from
   outside the binary.
+- **Settled: Rust guests, not a bundled interpreter** — decision record
+  in [docs/SUBSTRATE.md](SUBSTRATE.md). The script-runtime slot's
+  contract nowhere requires interpreting: a plugin's guest logic is
+  ordinary Rust compiled to `wasm32-unknown-unknown`
+  (`crates/gwennol-guest` is the helper), registered as the plugin's
+  own runtime under its own name, with the step's `source` string
+  selecting an entry point. An interpreter would have been the same
+  binding work *plus* an interpreter, with the plugin logic itself
+  demoted to untyped strings in JSON; it remains available later as
+  just another plugin, through the same trust gate and slot, when
+  third-party authoring warrants it. Supplying a runtime is double-
+  keyed — the manifest's `provide:` grant and the embedder's
+  `trusted_step_type_providers` list at boot — and the example
+  (`crates/sse-guest`) runs the constraint's exact composition end to
+  end in CI, built from source by the test suite.
 
 ### 4. Provider and tools
 

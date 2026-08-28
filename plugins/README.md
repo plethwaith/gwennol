@@ -19,11 +19,14 @@ contracts must be registered before the plugins that claim them.
   `host_process.run`.
 
 The contracts come first (milestone 2), then the substrate
-non-declarative plugins are written in (milestone 3), then the plugins
-themselves (milestone 4). See [../docs/ROADMAP.md](../docs/ROADMAP.md).
-If milestone 3 chooses wasm guests, their source lives under `crates/`
-and the build injects the compiled module into the manifest; the file
-here remains the plugin.
+non-declarative plugins are written in (milestone 3 — settled: Rust
+compiled to wasm32, see [../docs/SUBSTRATE.md](../docs/SUBSTRATE.md)),
+then the plugins themselves (milestone 4). See
+[../docs/ROADMAP.md](../docs/ROADMAP.md). A guest-backed plugin's Rust
+source lives under `crates/` (the milestone-3 example is
+`crates/sse-guest`) and the build injects the compiled module into the
+manifest's `wasmModules` slot; the JSON file here remains the plugin,
+and no compiled blob is committed.
 
 The host step types these use are *not* here: they are native code in
 `gwennol-core`, published by the `host_fs`, `host_process` and
