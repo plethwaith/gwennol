@@ -64,15 +64,26 @@ mod imp {
         fn host_call_result_read(buf_ptr: i32, max_len: i32) -> i32;
     }
 
+    // The ABI carries lengths as i32. A buffer past i32::MAX cannot be
+    // described to the host at all — `as` would wrap it negative and
+    // the host would answer with a misleading STREAM_OOB — so panic
+    // instead. (In a release wasm build the panic aborts to a trap
+    // whose message may not survive; that is still strictly better
+    // than the silent misdescription.) Unreachable below a 2 GiB wasm
+    // memory, which no default configuration allows; guarded on the
+    // read side too so the property does not depend on which wrapper a
+    // future import goes through.
+    fn abi_len(len: usize) -> i32 {
+        i32::try_from(len)
+            .expect("buffer length exceeds i32::MAX — not expressible in the gwead1 ABI")
+    }
+
     fn ptr_len(buf: &[u8]) -> (i32, i32) {
-        // The ABI carries lengths as i32. A buffer past i32::MAX cannot
-        // be described to the host at all — `as` would wrap it negative
-        // and the host would answer with a misleading STREAM_OOB — so
-        // trap with the real reason instead. Unreachable below a 2 GiB
-        // wasm memory, which no default configuration allows.
-        let len = i32::try_from(buf.len())
-            .expect("buffer length exceeds i32::MAX — not expressible in the gwead1 ABI");
-        (buf.as_ptr() as usize as i32, len)
+        (buf.as_ptr() as usize as i32, abi_len(buf.len()))
+    }
+
+    fn ptr_len_mut(buf: &mut [u8]) -> (i32, i32) {
+        (buf.as_mut_ptr() as usize as i32, abi_len(buf.len()))
     }
 
     pub fn set_result(bytes: &[u8]) {
@@ -91,8 +102,7 @@ mod imp {
     }
 
     pub fn read(handle: i32, buf: &mut [u8]) -> i32 {
-        let ptr = buf.as_mut_ptr() as usize as i32;
-        let len = buf.len() as i32;
+        let (ptr, len) = ptr_len_mut(buf);
         unsafe { stream_read(handle, ptr, len) }
     }
 
@@ -132,8 +142,7 @@ mod imp {
     }
 
     pub fn call_result_read(buf: &mut [u8]) -> i32 {
-        let ptr = buf.as_mut_ptr() as usize as i32;
-        let len = buf.len() as i32;
+        let (ptr, len) = ptr_len_mut(buf);
         unsafe { host_call_result_read(ptr, len) }
     }
 }

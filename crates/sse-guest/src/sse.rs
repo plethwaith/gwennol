@@ -35,6 +35,14 @@ pub struct SseEvent {
 /// with a readable message like every other malformed-input path.
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most `data:` payload one event may accumulate before its
+/// terminating blank line. The other shape of the same flood
+/// [`MAX_LINE_BYTES`] bounds: endless *short* `data:` lines with the
+/// blank line never coming pass the line cap on every byte, so the
+/// per-event total needs its own bound — the two caps together are
+/// what actually closes the unbounded-buffer trap.
+pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Incremental parser state. Feed it chunks as they arrive; it returns
 /// each event exactly once, as soon as the terminating empty line is
 /// complete.
@@ -46,6 +54,13 @@ pub struct SseParser {
     event_type: Option<String>,
     /// The in-progress event's accumulated `data:` lines.
     data: Vec<String>,
+    /// Running byte total of `data`, checked against
+    /// [`MAX_EVENT_BYTES`].
+    data_bytes: usize,
+    /// Set once [`Self::feed`] has returned an error; every later call
+    /// fails too, making "the parser is spent" a property the type
+    /// enforces rather than a doc-comment plea.
+    spent: bool,
 }
 
 impl SseParser {
@@ -53,15 +68,23 @@ impl SseParser {
         SseParser::default()
     }
 
-    /// Consume one chunk, returning every event it completed, or an
-    /// error once any single line exceeds [`MAX_LINE_BYTES`] — input
-    /// that long without a newline is not an event stream. After an
-    /// error the parser is spent; the caller aborts the stream.
+    /// Consume one chunk, returning every event it completed.
+    ///
+    /// Fails once any single line exceeds [`MAX_LINE_BYTES`], or once
+    /// one event accumulates more than [`MAX_EVENT_BYTES`] of `data:`
+    /// payload without its terminating blank line — either way the
+    /// input is not a plausible event stream. After an error the
+    /// parser is spent: every further call fails, so a caller cannot
+    /// accidentally resume mid-flood.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, String> {
+        if self.spent {
+            return Err("SSE parser already failed; the stream should have been aborted".into());
+        }
         let mut out = Vec::new();
         for &b in bytes {
             if b != b'\n' {
                 if self.line.len() >= MAX_LINE_BYTES {
+                    self.spent = true;
                     return Err(format!(
                         "SSE line exceeded {MAX_LINE_BYTES} bytes without a newline — \
                          this is not an event stream"
@@ -78,7 +101,7 @@ impl SseParser {
             // lossy decoding keeps a torn byte from killing the stream
             // while never touching well-formed input.
             let line = String::from_utf8_lossy(&line).into_owned();
-            if let Some(event) = self.take_line(&line) {
+            if let Some(event) = self.take_line(&line)? {
                 out.push(event);
             }
         }
@@ -86,24 +109,26 @@ impl SseParser {
     }
 
     /// Handle one complete line; returns an event when the line
-    /// terminated one.
-    fn take_line(&mut self, line: &str) -> Option<SseEvent> {
+    /// terminated one, or an error when it pushed the in-progress
+    /// event past [`MAX_EVENT_BYTES`].
+    fn take_line(&mut self, line: &str) -> Result<Option<SseEvent>, String> {
         if line.is_empty() {
             let data = std::mem::take(&mut self.data);
+            self.data_bytes = 0;
             let event_type = self.event_type.take();
             // An event with no data is not dispatched — that's the
             // format's rule, and it is what makes a lone keepalive
             // comment plus blank line invisible.
             if data.is_empty() {
-                return None;
+                return Ok(None);
             }
-            return Some(SseEvent {
+            return Ok(Some(SseEvent {
                 event: event_type.unwrap_or_else(|| "message".to_string()),
                 data: data.join("\n"),
-            });
+            }));
         }
         if line.starts_with(':') {
-            return None; // comment
+            return Ok(None); // comment
         }
         let (field, value) = match line.split_once(':') {
             Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
@@ -112,10 +137,21 @@ impl SseParser {
         };
         match field {
             "event" => self.event_type = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                if self.data_bytes.saturating_add(value.len()) > MAX_EVENT_BYTES {
+                    self.spent = true;
+                    return Err(format!(
+                        "one SSE event accumulated more than {MAX_EVENT_BYTES} bytes of \
+                         data without its terminating blank line — this is not an \
+                         event stream"
+                    ));
+                }
+                self.data_bytes += value.len();
+                self.data.push(value.to_string());
+            }
             _ => {} // id, retry, anything newer: ignored
         }
-        None
+        Ok(None)
     }
 }
 
@@ -233,5 +269,41 @@ mod tests {
         assert!(p.feed(&flood).is_ok(), "the cap itself still fits");
         let err = p.feed(b"z").expect_err("the byte after the cap fails");
         assert!(err.contains("not an event stream"), "{err}");
+    }
+
+    #[test]
+    fn an_endless_stream_of_short_data_lines_fails_too() {
+        // The other shape of the flood: every line passes the line cap,
+        // the blank line never comes, and the per-event accumulator is
+        // what has to say no.
+        let mut p = SseParser::new();
+        let line = b"data: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
+        let payload_per_line = line.len() - "data: ".len() - 1;
+        let lines_to_cap = MAX_EVENT_BYTES / payload_per_line + 2;
+        let mut err = None;
+        for _ in 0..lines_to_cap {
+            match p.feed(line) {
+                Ok(events) => assert!(events.is_empty(), "no blank line ever arrives"),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("the event cap fires before the loop ends");
+        assert!(err.contains("not an event stream"), "{err}");
+    }
+
+    #[test]
+    fn a_spent_parser_refuses_to_resume() {
+        let mut p = SseParser::new();
+        let flood = vec![b'z'; MAX_LINE_BYTES + 1];
+        p.feed(&flood).expect_err("over the line cap");
+        // Without the spent flag, this newline would complete the flood
+        // as an ordinary line and parsing would silently resume.
+        let err = p
+            .feed(b"\ndata: x\n\n")
+            .expect_err("the parser stays failed");
+        assert!(err.contains("already failed"), "{err}");
     }
 }

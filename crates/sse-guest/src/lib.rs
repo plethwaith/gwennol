@@ -136,9 +136,10 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             // Wind down without an `end` event: the consumer reads the
             // early end-of-stream as a failed turn, which a cancelled
             // turn is. Polling here only catches cancellation between
-            // chunks — a read blocked on a stalled vendor is torn down
-            // by the host instead, whose wallclock and idle timeouts
-            // drop the whole invocation, reads included.
+            // chunks — a read blocked on a stalled vendor ends when the
+            // fetch's streaming idle timeout ends the body, which ends
+            // the read (a dataflow callee carries no wallclock deadline
+            // of its own under the kernel's defaults).
             upstream.close();
             output.close();
             return Ok(Value::Null);
@@ -154,20 +155,12 @@ fn relay_sse(args: Args) -> Result<Value, String> {
                 // Vendor keepalive — real streams carry these and the
                 // contract does not, so the relay is where they die.
                 "ping" => continue,
-                // The vendor reported the turn failed. The contract
-                // error event is always last: emit it, stop reading,
-                // and end the stream without an `end` event.
-                "error" => {
-                    let _ = emit_data(&output, &event.data)?;
-                    upstream.close();
-                    output.close();
-                    return Ok(Value::Null);
-                }
-                // `end` is the last event of every successful stream —
-                // the contract's shape, so the relay enforces it: a
-                // vendor straggler after `end` (trailing diagnostics, a
-                // retry artifact) is never relayed.
-                "end" => {
+                // Both terminal events: the contract makes `error` and
+                // `end` each the last event of its kind of turn, so the
+                // relay enforces it — emit, stop reading, close. A
+                // vendor straggler after either (trailing diagnostics,
+                // a retry artifact) is never relayed.
+                "error" | "end" => {
                     let _ = emit_data(&output, &event.data)?;
                     upstream.close();
                     output.close();
@@ -197,9 +190,10 @@ fn relay_sse(args: Args) -> Result<Value, String> {
 enum Delivery {
     /// The consumer took it.
     Delivered,
-    /// The consumer has closed its handle — [`StreamError::Closed`],
-    /// which the stream docs call "the normal way to learn the reader
-    /// stopped listening". Wind down; don't treat it as a failure.
+    /// The consumer has closed its handle —
+    /// [`gwennol_guest::StreamError::Closed`], which the stream docs
+    /// call "the normal way to learn the reader stopped listening".
+    /// Wind down; don't treat it as a failure.
     ReaderGone,
 }
 
@@ -229,20 +223,36 @@ fn emit(output: &Stream, value: &Value) -> Result<Delivery, String> {
     }
 }
 
-/// Read at most `cap` bytes of a stream as lossy UTF-8, trimmed — the
-/// error-body excerpt for a non-2xx answer. Read errors just end the
-/// excerpt: the HTTP status alone is still worth reporting.
+/// Read a stream as lossy UTF-8, trimmed and truncated to `cap` bytes
+/// — the error-body excerpt for a non-2xx answer. (Up to one extra
+/// chunk is consumed past the cap; that overshoot is how truncation is
+/// detected, and is trimmed away.) A truncated excerpt says so, and a
+/// body that could not be read at all says that instead of posing as
+/// empty: the HTTP status alone is still worth reporting.
 fn read_capped(stream: &Stream, cap: usize) -> String {
     let mut collected = Vec::new();
     let mut buf = [0u8; 1024];
-    while collected.len() < cap {
+    let mut unreadable = false;
+    while collected.len() <= cap {
         match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => collected.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                unreadable = true;
+                break;
+            }
         }
     }
+    let truncated = collected.len() > cap;
     collected.truncate(cap);
-    String::from_utf8_lossy(&collected).trim().to_string()
+    let mut text = String::from_utf8_lossy(&collected).trim().to_string();
+    if truncated {
+        text.push_str(" …(truncated)");
+    }
+    if unreadable && text.is_empty() {
+        text = "(error body unreadable)".to_string();
+    }
+    text
 }
 
 entrypoints! {
