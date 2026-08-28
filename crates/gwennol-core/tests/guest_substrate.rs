@@ -250,9 +250,18 @@ fn sse_stub() -> &'static SseStub {
                     "404 Not Found",
                     r#"{"error":{"type":"not_found_error","message":"no such model"}}"#.to_string(),
                 )),
-                "/http-bloated-error-turn" => {
-                    Some(("429 Too Many Requests", format!("{}TAIL_SENTINEL", "B".repeat(8000))))
-                }
+                // One sentinel inside the excerpt's overshoot window
+                // (bytes the relay reads but must trim away) and one
+                // past everything it reads — a dropped truncate would
+                // leak the first, a dropped cap the second.
+                "/http-bloated-error-turn" => Some((
+                    "429 Too Many Requests",
+                    format!(
+                        "{}WINDOW_SENTINEL{}TAIL_SENTINEL",
+                        "B".repeat(4400),
+                        "B".repeat(3600)
+                    ),
+                )),
                 _ => None,
             };
             if let Some((status, reason)) = http_error {
@@ -507,8 +516,9 @@ async fn a_client_error_is_not_marked_retryable() {
 }
 
 /// An oversized error body is cut at the excerpt cap and says so — and
-/// the bytes past the cap (the stub plants a sentinel there) never
-/// reach the message.
+/// neither the bytes the relay read past the cap (the overshoot window
+/// that detects truncation) nor the bytes it never read reach the
+/// message, whose length is itself bounded near the cap.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_error_body_is_truncated_with_a_marker() {
     let f = fixture();
@@ -522,8 +532,17 @@ async fn an_oversized_error_body_is_truncated_with_a_marker() {
     let message = events[0]["message"].as_str().unwrap();
     assert!(message.contains("…(truncated)"), "marks the cut: {message}");
     assert!(
+        !message.contains("WINDOW_SENTINEL"),
+        "read-but-past-the-cap bytes are trimmed, not kept: {message}"
+    );
+    assert!(
         !message.contains("TAIL_SENTINEL"),
-        "nothing past the cap leaks through: {message}"
+        "nothing past what the relay reads leaks through: {message}"
+    );
+    assert!(
+        message.len() < 4096 + 64,
+        "the message stays near the cap ({} bytes)",
+        message.len()
     );
 }
 

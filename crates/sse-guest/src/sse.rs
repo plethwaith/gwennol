@@ -35,12 +35,14 @@ pub struct SseEvent {
 /// with a readable message like every other malformed-input path.
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
-/// The most `data:` payload one event may accumulate before its
-/// terminating blank line. The other shape of the same flood
+/// The most an in-progress event's data buffer may hold before its
+/// terminating blank line — the other shape of the flood
 /// [`MAX_LINE_BYTES`] bounds: endless *short* `data:` lines with the
-/// blank line never coming pass the line cap on every byte, so the
-/// per-event total needs its own bound — the two caps together are
-/// what actually closes the unbounded-buffer trap.
+/// blank line never coming pass the line cap on every byte. The bound
+/// is on the buffer's **actual bytes** (`\n` separators included), not
+/// on a payload tally that a parallel structure could outgrow — the
+/// accounting cannot diverge from the memory, so the parser's whole
+/// buffering is bounded by these two caps plus one bounded field name.
 pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Incremental parser state. Feed it chunks as they arrive; it returns
@@ -52,11 +54,14 @@ pub struct SseParser {
     line: Vec<u8>,
     /// The in-progress event's `event:` field, if seen.
     event_type: Option<String>,
-    /// The in-progress event's accumulated `data:` lines.
-    data: Vec<String>,
-    /// Running byte total of `data`, checked against
-    /// [`MAX_EVENT_BYTES`].
-    data_bytes: usize,
+    /// The in-progress event's data buffer: `data:` values joined with
+    /// `\n` as they arrive. One `String`, so `self.data.len()` *is* the
+    /// memory the event holds — no per-line container overhead to
+    /// escape [`MAX_EVENT_BYTES`], and empty `data:` values buffer at
+    /// most their separator. (An event whose values were all empty
+    /// leaves the buffer empty and is not dispatched, which is the
+    /// format's own empty-data-buffer rule.)
+    data: String,
     /// Set once [`Self::feed`] has returned an error; every later call
     /// fails too, making "the parser is spent" a property the type
     /// enforces rather than a doc-comment plea.
@@ -114,17 +119,16 @@ impl SseParser {
     fn take_line(&mut self, line: &str) -> Result<Option<SseEvent>, String> {
         if line.is_empty() {
             let data = std::mem::take(&mut self.data);
-            self.data_bytes = 0;
             let event_type = self.event_type.take();
-            // An event with no data is not dispatched — that's the
-            // format's rule, and it is what makes a lone keepalive
-            // comment plus blank line invisible.
+            // An event with an empty data buffer is not dispatched —
+            // that's the format's rule, and it is what makes a lone
+            // keepalive comment plus blank line invisible.
             if data.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(SseEvent {
                 event: event_type.unwrap_or_else(|| "message".to_string()),
-                data: data.join("\n"),
+                data,
             }));
         }
         if line.starts_with(':') {
@@ -138,7 +142,18 @@ impl SseParser {
         match field {
             "event" => self.event_type = Some(value.to_string()),
             "data" => {
-                if self.data_bytes.saturating_add(value.len()) > MAX_EVENT_BYTES {
+                // Charge what will actually be stored: the value plus
+                // its separator. A parallel byte tally once bounded
+                // only payloads while every accepted line also bought
+                // container overhead — bounding the buffer itself is
+                // what makes the cap mean memory.
+                if self
+                    .data
+                    .len()
+                    .saturating_add(value.len())
+                    .saturating_add(1)
+                    > MAX_EVENT_BYTES
+                {
                     self.spent = true;
                     return Err(format!(
                         "one SSE event accumulated more than {MAX_EVENT_BYTES} bytes of \
@@ -146,8 +161,10 @@ impl SseParser {
                          event stream"
                     ));
                 }
-                self.data_bytes += value.len();
-                self.data.push(value.to_string());
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
             }
             _ => {} // id, retry, anything newer: ignored
         }
@@ -283,6 +300,58 @@ mod tests {
         let mut err = None;
         for _ in 0..lines_to_cap {
             match p.feed(line) {
+                Ok(events) => assert!(events.is_empty(), "no blank line ever arrives"),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("the event cap fires before the loop ends");
+        assert!(err.contains("not an event stream"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_value_flood_buys_no_memory_and_no_event() {
+        // `data:\n` forever: six wire bytes must not buy any buffered
+        // bytes. Under the old per-payload tally each such line cost a
+        // container slot the accounting never saw; now an empty value
+        // before any content stores nothing at all. The proof is
+        // behavioral: if the flood had buffered anything, the eventual
+        // real value would arrive with a million separators in front.
+        let mut p = SseParser::new();
+        let flood = "data:\n".repeat(1_000_000);
+        assert!(p.feed(flood.as_bytes()).unwrap().is_empty());
+        let events = p.feed(b"data: x\n\n").unwrap();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: "message".into(),
+                data: "x".into()
+            }],
+            "the empty-value flood left no trace in the buffer"
+        );
+
+        // And an event whose values were ALL empty is not dispatched —
+        // the format's empty-data-buffer rule.
+        let mut q = SseParser::new();
+        assert!(q.feed(b"data:\ndata:\n\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_separator_only_flood_after_content_is_capped() {
+        // Once the buffer holds anything, every further empty value
+        // costs its separator — so the same endless-`data:` stream that
+        // buffers nothing up front is capped the moment it grows the
+        // event. Charged as actual bytes, so the cap fires at
+        // MAX_EVENT_BYTES of real memory, not at some tally the
+        // representation can outgrow.
+        let mut p = SseParser::new();
+        p.feed(b"data: a\n").unwrap();
+        let chunk = "data:\n".repeat(64 * 1024);
+        let mut err = None;
+        for _ in 0..(MAX_EVENT_BYTES / (64 * 1024) + 2) {
+            match p.feed(chunk.as_bytes()) {
                 Ok(events) => assert!(events.is_empty(), "no blank line ever arrives"),
                 Err(e) => {
                     err = Some(e);

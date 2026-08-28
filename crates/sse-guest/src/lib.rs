@@ -139,7 +139,11 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             // chunks — a read blocked on a stalled vendor ends when the
             // fetch's streaming idle timeout ends the body, which ends
             // the read (a dataflow callee carries no wallclock deadline
-            // of its own under the kernel's defaults).
+            // of its own under the kernel's defaults). The write side
+            // has no such backstop today: a consumer that stays open
+            // but stops reading can park the relay on a full channel
+            // indefinitely — pre-existing kernel behaviour, listed so
+            // this enumeration of hang exits is honest.
             upstream.close();
             output.close();
             return Ok(Value::Null);
@@ -226,19 +230,21 @@ fn emit(output: &Stream, value: &Value) -> Result<Delivery, String> {
 /// Read a stream as lossy UTF-8, trimmed and truncated to `cap` bytes
 /// — the error-body excerpt for a non-2xx answer. (Up to one extra
 /// chunk is consumed past the cap; that overshoot is how truncation is
-/// detected, and is trimmed away.) A truncated excerpt says so, and a
-/// body that could not be read at all says that instead of posing as
-/// empty: the HTTP status alone is still worth reporting.
+/// detected, and is trimmed away.) Every degraded state marks itself:
+/// a truncated excerpt says so, a read error mid-body marks the
+/// partial excerpt as interrupted, and a body that could not be read
+/// at all says that instead of posing as empty — the HTTP status alone
+/// is still worth reporting.
 fn read_capped(stream: &Stream, cap: usize) -> String {
     let mut collected = Vec::new();
     let mut buf = [0u8; 1024];
-    let mut unreadable = false;
+    let mut interrupted = false;
     while collected.len() <= cap {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => collected.extend_from_slice(&buf[..n]),
             Err(_) => {
-                unreadable = true;
+                interrupted = true;
                 break;
             }
         }
@@ -246,12 +252,16 @@ fn read_capped(stream: &Stream, cap: usize) -> String {
     let truncated = collected.len() > cap;
     collected.truncate(cap);
     let mut text = String::from_utf8_lossy(&collected).trim().to_string();
-    if truncated {
-        text.push_str(" …(truncated)");
+    let marker = match (text.is_empty(), truncated, interrupted) {
+        (true, false, true) => "(error body unreadable)",
+        (_, true, _) => "…(truncated)",
+        (false, false, true) => "…(read interrupted)",
+        _ => return text,
+    };
+    if !text.is_empty() {
+        text.push(' ');
     }
-    if unreadable && text.is_empty() {
-        text = "(error body unreadable)".to_string();
-    }
+    text.push_str(marker);
     text
 }
 

@@ -25,8 +25,9 @@ then the plugins themselves (milestone 4). See
 [../docs/ROADMAP.md](../docs/ROADMAP.md). A guest-backed plugin's Rust
 source lives under `crates/` (the milestone-3 example is
 `crates/sse-guest`, which gwennol-core's integration suite compiles
-and injects into its manifest at test time). When milestone 4 bundles guest-backed
-plugins *here*, it owes the build-time equivalent: a packaging step
+and injects into its manifest at test time). When milestone 4 bundles
+guest-backed plugins *here*, it owes the build-time equivalent: a
+packaging step
 that fills the JSON file's `wasmModules` slot from the compiled
 artifact — the file stays the plugin, and no compiled blob is ever
 committed.
