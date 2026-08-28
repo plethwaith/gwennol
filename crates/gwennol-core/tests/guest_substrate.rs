@@ -18,38 +18,23 @@
 //! directory so the two builds' locks never meet. No compiled blob is
 //! committed anywhere; CI compiles the guest like everything else.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
+use gwead::kernel::streams::StreamRegistry;
 use gwead::kernel::{Kernel, KernelConfig};
 use gwead::serde_json::{Value, json};
-use gwennol_core::{ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Turn, spi};
+use gwennol_core::{HostConfig, ProcessEnv, spi};
+// The guest's own exported names: the manifest and these tests name the
+// plugin, its actions, and its entry points from the one declaration
+// the guest crate carries, instead of retyping string literals that
+// could drift from it.
+use sse_guest::{ENTRY_CHAT, ENTRY_RELAY_SSE, PLUGIN_NAME as PLUGIN, STREAM_ACTION};
 
-/// The example plugin's name — also its `language` selector, under the
-/// substrate convention that a guest-backed plugin's module registers
-/// under the plugin's own name.
-const PLUGIN: &str = "sse-guest";
-
-/// Allows everything, knows no secrets.
-struct Permissive;
-
-#[async_trait::async_trait]
-impl Operator for Permissive {
-    async fn approve(&self, _: ApprovalRequest) -> Decision {
-        Decision::Allow
-    }
-    async fn secret(&self, _: &str, _: &str) -> Option<String> {
-        None
-    }
-    fn emit(&self, _: Event) {}
-    async fn input(&self) -> Option<Turn> {
-        None
-    }
-}
+mod common;
+use common::{Permissive, assert_conforms, contracts, drain_stream_events};
 
 // ----------------------------------------------- building the guest
 
@@ -121,13 +106,13 @@ fn sse_guest_manifest() -> Value {
             {"stepType": "script", "matches": PLUGIN, "wasmModule": "guest"}
         ],
         "actions": {
-            "chat": {
+            (spi::llm_chat::CHAT): {
                 "steps": [
                     {"id": "run", "type": "script", "params": {
-                        "language": PLUGIN, "source": "chat"}}
+                        "language": PLUGIN, "source": ENTRY_CHAT}}
                 ]
             },
-            "stream_turn": {
+            (STREAM_ACTION): {
                 "dataflow": true,
                 "steps": [
                     {"id": "fetch", "type": "host_http.post", "params": {
@@ -136,7 +121,7 @@ fn sse_guest_manifest() -> Value {
                         "stream": true}},
                     {"id": "relay", "type": "script", "longRunning": true,
                      "dependsOn": ["fetch"],
-                     "params": {"language": PLUGIN, "source": "relay_sse"}}
+                     "params": {"language": PLUGIN, "source": ENTRY_RELAY_SSE}}
                 ]
             }
         }
@@ -191,8 +176,10 @@ struct SseStub {
 
 /// The happy-path SSE body. One keepalive comment, a `ping` event the
 /// relay must drop, a text event, a text event whose JSON spans two
-/// `data:` lines and carries a multi-byte character, a tool call, and
-/// the terminating `end`.
+/// `data:` lines and carries a multi-byte character, a tool call, the
+/// terminating `end` — and a straggler event after `end` that must
+/// never be relayed, because the contract makes `end` the last event of
+/// every successful stream.
 const HAPPY_SSE: &str = concat!(
     ": keepalive, carrying nothing\n\n",
     "event: ping\ndata: {}\n\n",
@@ -202,6 +189,7 @@ const HAPPY_SSE: &str = concat!(
     "data: {\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"echo\",\"input\":{\"message\":\"hi\"}}\n\n",
     "event: end\n",
     "data: {\"type\":\"end\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n",
+    "event: text\ndata: {\"type\":\"text\",\"text\":\"straggler after end\"}\n\n",
 );
 
 /// A stream the vendor aborts: the error event must be the last thing
@@ -234,106 +222,61 @@ fn sse_stub() -> &'static SseStub {
             addr: listener.local_addr().unwrap(),
             requests: Mutex::new(Vec::new()),
         }));
-        std::thread::spawn(move || {
-            let mut consecutive_failures = 0u32;
-            loop {
-                let mut socket = match listener.accept() {
-                    Ok((s, _)) => {
-                        consecutive_failures = 0;
-                        s
-                    }
-                    Err(e) => {
-                        eprintln!("sse stub accept failed: {e}");
-                        consecutive_failures += 1;
-                        if consecutive_failures >= 16 {
-                            return;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                };
-                std::thread::spawn(move || {
-                    // A wedged connection (a client that never finishes
-                    // its request) fails this handler loudly via a read
-                    // timeout instead of parking the thread forever.
-                    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    let Some((path, body)) = read_request(&mut socket) else {
-                        // Socket drop sends FIN/RST, so the kernel-side
-                        // fetch step errors loudly — the early return
-                        // is the error signal, not a swallow.
-                        return;
-                    };
-                    let parsed = gwead::serde_json::from_slice::<Value>(&body)
-                        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
-                    stub.requests.lock().unwrap().push((path.clone(), parsed));
-                    let sse = match path.as_str() {
-                        "/error-turn" => ERROR_SSE,
-                        "/garbage-turn" => GARBAGE_SSE,
-                        _ => HAPPY_SSE,
-                    };
-                    let _ = socket.write_all(
-                        b"HTTP/1.1 200 OK\r\n\
-                          Content-Type: text/event-stream\r\n\
-                          Connection: close\r\n\r\n",
-                    );
-                    let _ = socket.flush();
-                    // Byte-level splits that respect neither lines nor
-                    // fields, exercised through the whole kernel pipe;
-                    // the fixture's multi-byte character rides along.
-                    // (Whether a split lands mid-sequence depends on
-                    // byte offsets — the parser's unit tests pin the
-                    // torn-UTF-8 guarantee deterministically.) Flush +
-                    // pause coaxes each slice into its own TCP segment.
-                    for chunk in sse.as_bytes().chunks(23) {
-                        if socket.write_all(chunk).is_err() {
-                            // The relay hung up mid-stream (the error
-                            // and garbage turns do this by design).
-                            return;
-                        }
-                        let _ = socket.flush();
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                });
+        common::serve(listener, move |mut socket| {
+            // A wedged connection (a client that never finishes its
+            // request) fails this handler loudly via a read timeout
+            // instead of parking the thread forever.
+            let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let Some((path, body)) = common::read_http_request(&mut socket) else {
+                // Socket drop sends FIN/RST, so the kernel-side fetch
+                // step errors loudly — the early return is the error
+                // signal, not a swallow.
+                return;
+            };
+            let parsed = gwead::serde_json::from_slice::<Value>(&body)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
+            stub.requests.lock().unwrap().push((path.clone(), parsed));
+            // The vendor said no: a non-2xx JSON answer, not an event
+            // stream — what a real rate limit looks like.
+            if path == "/http-error-turn" {
+                let reason = br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    reason.len()
+                );
+                let _ = socket.write_all(reason);
+                return;
+            }
+            let sse = match path.as_str() {
+                "/error-turn" => ERROR_SSE,
+                "/garbage-turn" => GARBAGE_SSE,
+                _ => HAPPY_SSE,
+            };
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: text/event-stream\r\n\
+                  Connection: close\r\n\r\n",
+            );
+            let _ = socket.flush();
+            // Byte-level splits that respect neither lines nor fields,
+            // exercised through the whole kernel pipe; the fixture's
+            // multi-byte character rides along. (Whether a split lands
+            // mid-sequence depends on byte offsets — the parser's unit
+            // tests pin the torn-UTF-8 guarantee deterministically.)
+            // Flush + pause coaxes each slice into its own TCP segment.
+            for chunk in sse.as_bytes().chunks(23) {
+                if socket.write_all(chunk).is_err() {
+                    // The relay hung up mid-stream (the error, garbage
+                    // and happy-path-straggler turns do this by design).
+                    return;
+                }
+                let _ = socket.flush();
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
         stub
     })
-}
-
-/// Minimal HTTP request reader: headers, then a Content-Length body.
-fn read_request(socket: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = socket.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        raw.extend_from_slice(&buf[..n]);
-    };
-    let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
-    let path = head.split_whitespace().nth(1)?.to_string();
-    let content_length: usize = head
-        .lines()
-        .find_map(|l| {
-            let (name, value) = l.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().ok())?
-        })
-        .unwrap_or(0);
-    let mut body = raw[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = socket.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        body.extend_from_slice(&buf[..n]);
-    }
-    body.truncate(content_length);
-    Some((path, body))
 }
 
 // ------------------------------------------------------- exercising
@@ -374,6 +317,8 @@ async fn stream_turn_events_unbounded(f: &Fixture, path: &str) -> Vec<Value> {
         .expect("an LLM_CHAT fulfiller");
     assert_eq!(provider, PLUGIN);
 
+    let input = chat_input();
+    assert_conforms(contracts().chat_input, &input);
     let config = json!({
         "model": "m3-fixture",
         "stream_url": format!("http://{}{path}", f.stub.addr)
@@ -381,7 +326,7 @@ async fn stream_turn_events_unbounded(f: &Fixture, path: &str) -> Vec<Value> {
     let streams = Arc::new(Mutex::new(StreamRegistry::new()));
     let out = f
         .kernel
-        .execute(&provider, spi::llm_chat::CHAT, chat_input())
+        .execute(&provider, spi::llm_chat::CHAT, input)
         .with_config(&config)
         .with_streams(streams.clone())
         .run()
@@ -389,25 +334,10 @@ async fn stream_turn_events_unbounded(f: &Fixture, path: &str) -> Vec<Value> {
         .expect("streamed chat dispatch succeeds")
         .output;
 
-    let handle = out["stream"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("chat output is the streamed form: {out}"));
-    let id = NonZeroU32::new(u32::try_from(handle).unwrap()).unwrap();
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 64];
-    loop {
-        let n = read_async_shared(&streams, id, &mut buf).await;
-        if n == STREAM_EOF {
-            break;
-        }
-        assert!(n > 0, "stream read returned {n}");
-        collected.extend_from_slice(&buf[..n as usize]);
-    }
-    String::from_utf8(collected)
-        .expect("NDJSON is UTF-8")
-        .lines()
-        .map(|l| gwead::serde_json::from_str(l).expect("one JSON document per line"))
-        .collect()
+    // The shared drain validates the output shape and every event
+    // against the contract schemas — the example guest is held to the
+    // same wire the declarative fixture is.
+    drain_stream_events(&streams, &out).await
 }
 
 // ------------------------------------------------------------ tests
@@ -447,19 +377,20 @@ async fn the_guest_builds_the_vendor_request() {
     let events = stream_turn_events(f, "/turn-request-pin").await;
     assert_eq!(events.last().unwrap()["type"], json!("end"));
 
-    // Clone out of the guard before asserting: a failed assertion under
-    // the lock would poison the mutex, and the stub's handler threads
-    // would then take the whole suite down with them.
-    let request = {
+    // Everything — the expects included — happens outside the guard: a
+    // panic while holding the lock would poison the mutex, and the
+    // stub's handler threads would then take the whole suite down with
+    // them instead of surfacing the one-line failure.
+    let mine: Vec<Value> = {
         let requests = f.stub.requests.lock().unwrap();
-        let mut mine = requests
+        requests
             .iter()
             .filter(|(path, _)| path == "/turn-request-pin")
-            .map(|(_, body)| body.clone());
-        let request = mine.next().expect("the stub saw this test's POST");
-        assert!(mine.next().is_none(), "one turn sends exactly one POST");
-        request
+            .map(|(_, body)| body.clone())
+            .collect()
     };
+    assert_eq!(mine.len(), 1, "one turn sends exactly one POST: {mine:?}");
+    let request = &mine[0];
     assert_eq!(request["model"], json!("m3-fixture"), "from config");
     assert_eq!(request["stream"], json!(true));
     assert_eq!(request["system"], json!("be brief"), "passed through");
@@ -507,6 +438,31 @@ async fn a_failing_relay_step_surfaces_as_early_end_of_stream() {
     );
 }
 
+/// A non-2xx vendor answer is not swallowed into an unexplained empty
+/// turn: the relay reads the error body and emits it as the contract's
+/// error event — status named, vendor reason carried, rate limits
+/// marked retryable — and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http_error_becomes_the_contract_error_event() {
+    let f = fixture();
+    let events = stream_turn_events(f, "/http-error-turn").await;
+
+    assert_eq!(
+        events.len(),
+        1,
+        "the error event is the whole stream: {events:?}"
+    );
+    let event = &events[0];
+    assert_eq!(event["type"], json!("error"));
+    assert_eq!(event["retryable"], json!(true), "429 is worth repeating");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("429"), "names the status: {message}");
+    assert!(
+        message.contains("slow down"),
+        "carries the vendor's reason: {message}"
+    );
+}
+
 /// The example implements only the streamed form and says so as a step
 /// error, rather than returning something shaped like a buffered turn.
 #[tokio::test(flavor = "multi_thread")]
@@ -523,6 +479,26 @@ async fn the_buffered_form_is_refused_with_a_readable_error() {
         .expect_err("the buffered form is not implemented");
     let msg = err.to_string();
     assert!(msg.contains("streamed form"), "names the limitation: {msg}");
+}
+
+/// gwennol-guest re-declares the six STREAM_* return codes because it
+/// deliberately cannot depend on gwead — so nothing but this test keeps
+/// the copies equal. A gwead renumbering would otherwise silently
+/// misclassify stream errors in every guest (Closed decoded as Io turns
+/// "reader hung up, wind down" into a failed step).
+#[test]
+fn the_guest_stream_codes_match_gwead() {
+    use gwead::kernel::streams as host;
+    use gwennol_guest::sys as guest;
+    assert_eq!(guest::STREAM_EOF, host::STREAM_EOF);
+    assert_eq!(guest::STREAM_INVALID_HANDLE, host::STREAM_INVALID_HANDLE);
+    assert_eq!(
+        guest::STREAM_DIRECTION_MISMATCH,
+        host::STREAM_DIRECTION_MISMATCH
+    );
+    assert_eq!(guest::STREAM_CLOSED, host::STREAM_CLOSED);
+    assert_eq!(guest::STREAM_IO_ERROR, host::STREAM_IO_ERROR);
+    assert_eq!(guest::STREAM_OOB, host::STREAM_OOB);
 }
 
 /// The two-key authorization holds, first key: the manifest's

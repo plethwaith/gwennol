@@ -11,33 +11,17 @@
 //! The host is a process singleton, so this binary boots one kernel with
 //! every fixture plugin registered up front and shares it across tests.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use boon::{Compiler, SchemaIndex, Schemas};
 use gwead::kernel::Kernel;
-use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
+use gwead::kernel::streams::StreamRegistry;
 use gwead::serde_json::{Value, json};
-use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn, spi};
+use gwennol_core::spi;
 
-/// Allows everything, knows no secrets: contract dispatch needs no policy.
-struct Permissive;
-
-#[async_trait::async_trait]
-impl Operator for Permissive {
-    async fn approve(&self, _: ApprovalRequest) -> Decision {
-        Decision::Allow
-    }
-    async fn secret(&self, _: &str, _: &str) -> Option<String> {
-        None
-    }
-    fn emit(&self, _: Event) {}
-    async fn input(&self) -> Option<Turn> {
-        None
-    }
-}
+mod common;
+use common::{Permissive, assert_conforms, contracts, drain_stream_events};
 
 struct Fixture {
     kernel: Arc<Kernel>,
@@ -60,63 +44,6 @@ fn fixture() -> &'static Fixture {
             kernel: kernel.into_arc(),
         }
     })
-}
-
-// ------------------------------------------------ contract validation
-
-/// The contract schemas, compiled for instance validation. boon compiles
-/// JSON-pointer fragments of a registered document directly, and
-/// `#/$defs/…` references resolve against the document root, so each
-/// subschema is addressed in place — no synthetic copies.
-struct Contracts {
-    schemas: Schemas,
-    chat_input: SchemaIndex,
-    chat_output: SchemaIndex,
-    stream_event: SchemaIndex,
-    call_output: SchemaIndex,
-}
-
-fn contracts() -> &'static Contracts {
-    static C: OnceLock<Contracts> = OnceLock::new();
-    C.get_or_init(|| {
-        const LLM: &str = "http://gwennol.dev/spi/llm_chat.json";
-        const TOOL: &str = "http://gwennol.dev/spi/tool.json";
-        let mut compiler = Compiler::new();
-        let mut schemas = Schemas::new();
-        for (url, document) in [
-            (LLM, spi::llm_chat::DEFINITION),
-            (TOOL, spi::tool::DEFINITION),
-        ] {
-            compiler
-                .add_resource(url, gwead::serde_json::from_str(document).unwrap())
-                .unwrap();
-        }
-        let [chat_input, chat_output, stream_event, call_output] = [
-            format!("{LLM}#/actions/chat/input"),
-            format!("{LLM}#/actions/chat/output"),
-            format!("{LLM}#/streamEventShape"),
-            format!("{TOOL}#/actions/call/output"),
-        ]
-        .map(|url| {
-            compiler
-                .compile(&url, &mut schemas)
-                .unwrap_or_else(|e| panic!("{url} is not a compilable schema: {e}"))
-        });
-        Contracts {
-            schemas,
-            chat_input,
-            chat_output,
-            stream_event,
-            call_output,
-        }
-    })
-}
-
-#[track_caller]
-fn assert_conforms(schema: SchemaIndex, instance: &Value) {
-    if let Err(e) = contracts().schemas.validate(instance, schema) {
-        panic!("payload violates the contract schema: {e:#}\npayload: {instance}");
-    }
 }
 
 // -------------------------------------------------------------- fixtures
@@ -321,61 +248,29 @@ fn stream_stub() -> &'static str {
     URL.get_or_init(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let mut consecutive_failures = 0u32;
-            for stream in listener.incoming() {
-                let mut s = match stream {
-                    Ok(s) => {
-                        consecutive_failures = 0;
-                        s
-                    }
-                    Err(e) => {
-                        // Transient under load (ECONNABORTED, EMFILE) —
-                        // but don't busy-spin if it's persistent, and
-                        // don't die silently either way.
-                        consecutive_failures += 1;
-                        eprintln!("stream stub: accept failed ({e}), {consecutive_failures} in a row");
-                        if consecutive_failures >= 16 {
-                            eprintln!("stream stub: persistent accept failure, giving up");
-                            return;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                };
-                std::thread::spawn(move || {
-                    // Read until the blank line ending the request head;
-                    // the fixture's GET carries no body.
-                    let mut buf = Vec::new();
-                    let mut tmp = [0u8; 1024];
-                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        let n = s.read(&mut tmp).unwrap();
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                    let head = String::from_utf8_lossy(&buf);
-                    let path = head.split_whitespace().nth(1).unwrap_or("/");
-                    let body: &[u8] = if path.ends_with("/truncated") {
-                        TRUNCATED_BODY.as_bytes()
-                    } else {
-                        STREAM_BODY.as_bytes()
-                    };
-                    write!(
-                        s,
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .unwrap();
-                    // Split on bytes: a UTF-8 boundary mid-body must not
-                    // matter to the halving.
-                    let (a, b) = body.split_at(body.len() / 2);
-                    s.write_all(a).unwrap();
-                    s.flush().unwrap();
-                    s.write_all(b).unwrap();
-                });
-            }
+        common::serve(listener, |mut s| {
+            // The fixture's GET carries no body; a dropped connection
+            // (None) surfaces kernel-side as a transport error.
+            let Some((path, _)) = common::read_http_request(&mut s) else {
+                return;
+            };
+            let body: &[u8] = if path.ends_with("/truncated") {
+                TRUNCATED_BODY.as_bytes()
+            } else {
+                STREAM_BODY.as_bytes()
+            };
+            write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            // Split on bytes: a UTF-8 boundary mid-body must not
+            // matter to the halving.
+            let (a, b) = body.split_at(body.len() / 2);
+            s.write_all(a).unwrap();
+            s.flush().unwrap();
+            s.write_all(b).unwrap();
         });
         format!("http://127.0.0.1:{port}")
     })
@@ -408,30 +303,9 @@ async fn stream_events_from(f: &Fixture, url: String) -> Vec<Value> {
         .await
         .unwrap()
         .output;
-    assert_conforms(contracts().chat_output, &out);
-
-    let handle = out["stream"].as_u64().expect("integer stream handle");
-    let id = NonZeroU32::new(u32::try_from(handle).unwrap()).unwrap();
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 7]; // small, so the body takes many reads
-    loop {
-        let n = read_async_shared(&streams, id, &mut buf).await;
-        if n == STREAM_EOF {
-            break;
-        }
-        assert!(n > 0, "stream read returned {n}");
-        collected.extend_from_slice(&buf[..n as usize]);
-    }
-
-    String::from_utf8(collected)
-        .unwrap()
-        .lines()
-        .map(|l| {
-            let event: Value = gwead::serde_json::from_str(l).unwrap();
-            assert_conforms(contracts().stream_event, &event);
-            event
-        })
-        .collect()
+    // The shared drain validates the output shape and every event
+    // against the contract schemas.
+    drain_stream_events(&streams, &out).await
 }
 
 // ------------------------------------------------------- registration

@@ -32,6 +32,12 @@ async-trait.workspace = true
 # Guest wasm modules travel inline in plugin manifests as base64; the
 # substrate tests encode the compiled example guest with it.
 base64 = "0.22"
+# The substrate tests pin gwennol-guest's re-declared STREAM_* codes
+# against gwead's, and build the example guest's manifest from the
+# names sse-guest itself exports. Path-only dev-dependencies, stripped
+# by `cargo package`.
+gwennol-guest = { path = "../gwennol-guest" }
+sse-guest = { path = "../sse-guest" }
 # The same JSON Schema validator Gwead uses for its meta-schemas; here it
 # pins fixture payloads to the SPI contract schemas, which the kernel
 # deliberately never does at dispatch.
