@@ -153,13 +153,15 @@ pub unsafe fn __execute_impl(
 /// }
 /// ```
 ///
-/// Each name is what a manifest step's `source` field selects; each
-/// value is a `fn(Args) -> Result<serde_json::Value, String>`. Use the
-/// macro exactly once per guest crate — it defines the module-level
-/// `alloc` and `execute` exports.
+/// Each name is what a manifest step's `source` field selects — a
+/// string literal, or a `const &str` the crate also exports so its
+/// manifest and tests can name the entry from one place; each value is
+/// a `fn(Args) -> Result<serde_json::Value, String>`. Use the macro
+/// exactly once per guest crate — it defines the module-level `alloc`
+/// and `execute` exports.
 #[macro_export]
 macro_rules! entrypoints {
-    ( $( $name:literal => $func:expr ),+ $(,)? ) => {
+    ( $( $name:expr => $func:expr ),+ $(,)? ) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn alloc(len: i32) -> i32 {
             $crate::__alloc_impl(len)

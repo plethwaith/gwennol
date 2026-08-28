@@ -65,7 +65,14 @@ mod imp {
     }
 
     fn ptr_len(buf: &[u8]) -> (i32, i32) {
-        (buf.as_ptr() as usize as i32, buf.len() as i32)
+        // The ABI carries lengths as i32. A buffer past i32::MAX cannot
+        // be described to the host at all — `as` would wrap it negative
+        // and the host would answer with a misleading STREAM_OOB — so
+        // trap with the real reason instead. Unreachable below a 2 GiB
+        // wasm memory, which no default configuration allows.
+        let len = i32::try_from(buf.len())
+            .expect("buffer length exceeds i32::MAX — not expressible in the gwead1 ABI");
+        (buf.as_ptr() as usize as i32, len)
     }
 
     pub fn set_result(bytes: &[u8]) {

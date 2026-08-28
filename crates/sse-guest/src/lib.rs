@@ -39,6 +39,12 @@ pub const PLUGIN_NAME: &str = "sse-guest";
 /// The sibling `dataflow: true` action `chat` dispatches.
 pub const STREAM_ACTION: &str = "stream_turn";
 
+/// Entry-point name the manifest's `chat` action selects via `source`.
+pub const ENTRY_CHAT: &str = "chat";
+
+/// Entry-point name the dataflow action's `long_running` step selects.
+pub const ENTRY_RELAY_SSE: &str = "relay_sse";
+
 /// `chat` — the plain action's entry point.
 fn chat(args: Args) -> Result<Value, String> {
     if args.field("stream").and_then(Value::as_bool) != Some(true) {
@@ -82,6 +88,11 @@ fn chat(args: Args) -> Result<Value, String> {
     Ok(json!({ "stream": stream.handle() }))
 }
 
+/// How much of a non-2xx response body is read into the error event's
+/// message. Vendor error bodies are small JSON documents; the cap only
+/// keeps a broken endpoint from ballooning the message.
+const ERROR_BODY_CAP: usize = 4096;
+
 /// `relay_sse` — the `long_running` dataflow step's entry point.
 fn relay_sse(args: Args) -> Result<Value, String> {
     let upstream = args
@@ -93,6 +104,30 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         .ok_or("the fetch step produced no streamed body handle")?;
     let output = Stream::output()
         .ok_or("relay_sse must run as the long_running step of a dataflow action")?;
+
+    // A non-2xx answer is not an event stream: its body is the vendor's
+    // reason (a rate-limit or auth error, typically), and discarding it
+    // would make every HTTP-level failure an unexplained empty turn.
+    // This is exactly the contract's "error event when the provider can
+    // still say why" case, so say why.
+    let status = args
+        .step_meta("fetch", "status")
+        .and_then(Value::as_i64)
+        .ok_or("the fetch step recorded no HTTP status")?;
+    if !(200..300).contains(&status) {
+        let reason = read_capped(&upstream, ERROR_BODY_CAP);
+        let event = json!({
+            "type": "error",
+            "message": format!("vendor answered HTTP {status}: {reason}"),
+            // Timeouts, rate limits and server-side failures are worth
+            // repeating unchanged; the other 4xx will fail again.
+            "retryable": matches!(status, 408 | 429) || (500..=599).contains(&status),
+        });
+        let _ = emit(&output, &event)?; // reader-gone changes nothing here
+        upstream.close();
+        output.close();
+        return Ok(Value::Null);
+    }
 
     let mut parser = SseParser::new();
     let mut buf = [0u8; 4096];
@@ -114,7 +149,7 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         if n == 0 {
             break; // vendor end-of-stream
         }
-        for event in parser.feed(&buf[..n]) {
+        for event in parser.feed(&buf[..n])? {
             match event.event.as_str() {
                 // Vendor keepalive — real streams carry these and the
                 // contract does not, so the relay is where they die.
@@ -123,12 +158,32 @@ fn relay_sse(args: Args) -> Result<Value, String> {
                 // error event is always last: emit it, stop reading,
                 // and end the stream without an `end` event.
                 "error" => {
-                    write_ndjson_line(&output, &event.data)?;
+                    let _ = emit_data(&output, &event.data)?;
                     upstream.close();
                     output.close();
                     return Ok(Value::Null);
                 }
-                _ => write_ndjson_line(&output, &event.data)?,
+                // `end` is the last event of every successful stream —
+                // the contract's shape, so the relay enforces it: a
+                // vendor straggler after `end` (trailing diagnostics, a
+                // retry artifact) is never relayed.
+                "end" => {
+                    let _ = emit_data(&output, &event.data)?;
+                    upstream.close();
+                    output.close();
+                    return Ok(Value::Null);
+                }
+                _ => match emit_data(&output, &event.data)? {
+                    Delivery::Delivered => {}
+                    // The consumer closed its handle: a benign hangup,
+                    // not a failure — the same wind-down as
+                    // cancellation, not a failed step.
+                    Delivery::ReaderGone => {
+                        upstream.close();
+                        output.close();
+                        return Ok(Value::Null);
+                    }
+                },
             }
         }
     }
@@ -138,7 +193,17 @@ fn relay_sse(args: Args) -> Result<Value, String> {
     Ok(Value::Null)
 }
 
-/// Re-serialise one SSE data payload as one NDJSON line.
+/// What became of one emitted NDJSON line.
+enum Delivery {
+    /// The consumer took it.
+    Delivered,
+    /// The consumer has closed its handle — [`StreamError::Closed`],
+    /// which the stream docs call "the normal way to learn the reader
+    /// stopped listening". Wind down; don't treat it as a failure.
+    ReaderGone,
+}
+
+/// Re-serialise one SSE data payload as one NDJSON line on `output`.
 ///
 /// The parse is load-bearing twice over: multi-line `data:` joins with
 /// a raw newline, which NDJSON cannot carry, so compact re-serialisation
@@ -146,17 +211,41 @@ fn relay_sse(args: Args) -> Result<Value, String> {
 /// at all fails the step here, surfacing to the consumer as an early
 /// end-of-stream rather than as a garbage line it would have to parse to
 /// distrust.
-fn write_ndjson_line(output: &Stream, data: &str) -> Result<(), String> {
+fn emit_data(output: &Stream, data: &str) -> Result<Delivery, String> {
     let value: Value = serde_json::from_str(data)
         .map_err(|e| format!("vendor event payload is not JSON: {e}; payload: {data:?}"))?;
-    let mut line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    emit(output, &value)
+}
+
+/// Write one JSON value as one NDJSON line, folding the consumer's
+/// hangup into [`Delivery::ReaderGone`] instead of an error.
+fn emit(output: &Stream, value: &Value) -> Result<Delivery, String> {
+    let mut line = serde_json::to_string(value).map_err(|e| e.to_string())?;
     line.push('\n');
-    output
-        .write_all(line.as_bytes())
-        .map_err(|e| format!("output write failed: {e}"))
+    match output.write_all(line.as_bytes()) {
+        Ok(()) => Ok(Delivery::Delivered),
+        Err(gwennol_guest::StreamError::Closed) => Ok(Delivery::ReaderGone),
+        Err(e) => Err(format!("output write failed: {e}")),
+    }
+}
+
+/// Read at most `cap` bytes of a stream as lossy UTF-8, trimmed — the
+/// error-body excerpt for a non-2xx answer. Read errors just end the
+/// excerpt: the HTTP status alone is still worth reporting.
+fn read_capped(stream: &Stream, cap: usize) -> String {
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 1024];
+    while collected.len() < cap {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => collected.extend_from_slice(&buf[..n]),
+        }
+    }
+    collected.truncate(cap);
+    String::from_utf8_lossy(&collected).trim().to_string()
 }
 
 entrypoints! {
-    "chat" => chat,
-    "relay_sse" => relay_sse,
+    ENTRY_CHAT => chat,
+    ENTRY_RELAY_SSE => relay_sse,
 }

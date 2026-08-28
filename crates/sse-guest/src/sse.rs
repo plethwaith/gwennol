@@ -27,6 +27,14 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// The longest line the parser will buffer. Generous — a provider's
+/// whole tool-call payload can ride on one `data:` line — but bounded:
+/// without it, a misbehaving endpoint answering with a large
+/// newline-free body (binary, one giant line) grows the buffer until
+/// the wasm memory cap traps opaquely, where this limit fails the step
+/// with a readable message like every other malformed-input path.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Incremental parser state. Feed it chunks as they arrive; it returns
 /// each event exactly once, as soon as the terminating empty line is
 /// complete.
@@ -45,11 +53,20 @@ impl SseParser {
         SseParser::default()
     }
 
-    /// Consume one chunk, returning every event it completed.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+    /// Consume one chunk, returning every event it completed, or an
+    /// error once any single line exceeds [`MAX_LINE_BYTES`] — input
+    /// that long without a newline is not an event stream. After an
+    /// error the parser is spent; the caller aborts the stream.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, String> {
         let mut out = Vec::new();
         for &b in bytes {
             if b != b'\n' {
+                if self.line.len() >= MAX_LINE_BYTES {
+                    return Err(format!(
+                        "SSE line exceeded {MAX_LINE_BYTES} bytes without a newline — \
+                         this is not an event stream"
+                    ));
+                }
                 self.line.push(b);
                 continue;
             }
@@ -65,7 +82,7 @@ impl SseParser {
                 out.push(event);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Handle one complete line; returns an event when the line
@@ -109,7 +126,7 @@ mod tests {
     fn feed_all(parser: &mut SseParser, chunks: &[&str]) -> Vec<SseEvent> {
         chunks
             .iter()
-            .flat_map(|c| parser.feed(c.as_bytes()))
+            .flat_map(|c| parser.feed(c.as_bytes()).expect("within the line cap"))
             .collect()
     }
 
@@ -162,8 +179,8 @@ mod tests {
         let mut p = SseParser::new();
         let payload = "data: caf\u{e9} {\"ok\":true}\n\n".as_bytes();
         let split = payload.iter().position(|&b| b == 0xC3).unwrap() + 1;
-        let mut events = p.feed(&payload[..split]);
-        events.extend(p.feed(&payload[split..]));
+        let mut events = p.feed(&payload[..split]).unwrap();
+        events.extend(p.feed(&payload[split..]).unwrap());
         assert_eq!(
             events,
             vec![SseEvent {
@@ -202,8 +219,19 @@ mod tests {
     #[test]
     fn incomplete_trailing_event_is_never_dispatched() {
         let mut p = SseParser::new();
-        assert!(p.feed(b"data: never terminated\n").is_empty());
+        assert!(p.feed(b"data: never terminated\n").unwrap().is_empty());
         // No blank line arrives; the event stays undelivered, which is
         // what makes a truncated stream detectable downstream.
+    }
+
+    #[test]
+    fn a_newline_free_flood_fails_instead_of_growing_forever() {
+        let mut p = SseParser::new();
+        // One byte past the cap, delivered in two chunks so the check
+        // provably spans feeds.
+        let flood = vec![b'z'; MAX_LINE_BYTES];
+        assert!(p.feed(&flood).is_ok(), "the cap itself still fits");
+        let err = p.feed(b"z").expect_err("the byte after the cap fails");
+        assert!(err.contains("not an event stream"), "{err}");
     }
 }
