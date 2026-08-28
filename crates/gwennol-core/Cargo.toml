@@ -11,6 +11,12 @@ authors.workspace = true
 readme = "README.md"
 keywords = ["agent", "llm", "wasm", "gwead"]
 categories = ["development-tools"]
+# The integration suites cannot run from a published tarball — they use
+# path-only dev-dependencies (stripped by `cargo package`) and shell
+# out to build workspace crates — and shipping them would leave the
+# package with test files that no longer compile. `cargo package`'s
+# verify step builds only the lib, so nothing else would catch that.
+exclude = ["tests/"]
 
 [dependencies]
 gwead.workspace = true
