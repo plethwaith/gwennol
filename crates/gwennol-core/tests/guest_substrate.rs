@@ -180,18 +180,24 @@ fn fixture() -> &'static Fixture {
 /// deliberately awkward splits.
 struct SseStub {
     addr: std::net::SocketAddr,
-    /// Request bodies received, in arrival order.
-    requests: Mutex<Vec<Value>>,
+    /// `(path, body)` for every request received, in arrival order.
+    /// Tests run concurrently against one shared stub, so a test that
+    /// asserts on a recorded request must select by a path only it
+    /// uses. An unparseable body is recorded as a JSON string rather
+    /// than dropped, so a broken request shows up in an assertion diff
+    /// instead of vanishing.
+    requests: Mutex<Vec<(String, Value)>>,
 }
 
 /// The happy-path SSE body. One keepalive comment, a `ping` event the
 /// relay must drop, a text event, a text event whose JSON spans two
-/// `data:` lines, a tool call, and the terminating `end`.
+/// `data:` lines and carries a multi-byte character, a tool call, and
+/// the terminating `end`.
 const HAPPY_SSE: &str = concat!(
     ": keepalive, carrying nothing\n\n",
     "event: ping\ndata: {}\n\n",
     "event: text\ndata: {\"type\":\"text\",\"text\":\"Hel\"}\n\n",
-    "event: text\ndata: {\"type\":\"text\",\ndata:  \"text\":\"lo\"}\n\n",
+    "event: text\ndata: {\"type\":\"text\",\ndata:  \"text\":\"l\u{f4}\"}\n\n",
     "event: tool_use\n",
     "data: {\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"echo\",\"input\":{\"message\":\"hi\"}}\n\n",
     "event: end\n",
@@ -205,6 +211,18 @@ const ERROR_SSE: &str = concat!(
     "event: text\ndata: {\"type\":\"text\",\"text\":\"so far so\"}\n\n",
     "event: error\ndata: {\"type\":\"error\",\"message\":\"vendor melted\",\"retryable\":true}\n\n",
     "event: text\ndata: {\"type\":\"text\",\"text\":\"never seen\"}\n\n",
+    "event: end\ndata: {\"type\":\"end\",\"stop_reason\":\"end_turn\",\"usage\":{}}\n\n",
+);
+
+/// A stream whose second event's payload is not JSON: the relay's step
+/// fails there, and the consumer must see the events so far and then
+/// end-of-stream — no `end`, no `error` event, no garbage line. This is
+/// the pin on the kernel's post-invocation drain closing the
+/// pre-provisioned output when the long-running step errors instead of
+/// closing it itself.
+const GARBAGE_SSE: &str = concat!(
+    "event: text\ndata: {\"type\":\"text\",\"text\":\"before the garbage\"}\n\n",
+    "event: text\ndata: this is not JSON\n\n",
     "event: end\ndata: {\"type\":\"end\",\"stop_reason\":\"end_turn\",\"usage\":{}}\n\n",
 );
 
@@ -235,14 +253,22 @@ fn sse_stub() -> &'static SseStub {
                     }
                 };
                 std::thread::spawn(move || {
+                    // A wedged connection (a client that never finishes
+                    // its request) fails this handler loudly via a read
+                    // timeout instead of parking the thread forever.
+                    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     let Some((path, body)) = read_request(&mut socket) else {
+                        // Socket drop sends FIN/RST, so the kernel-side
+                        // fetch step errors loudly — the early return
+                        // is the error signal, not a swallow.
                         return;
                     };
-                    if let Ok(parsed) = gwead::serde_json::from_slice::<Value>(&body) {
-                        stub.requests.lock().unwrap().push(parsed);
-                    }
+                    let parsed = gwead::serde_json::from_slice::<Value>(&body)
+                        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
+                    stub.requests.lock().unwrap().push((path.clone(), parsed));
                     let sse = match path.as_str() {
                         "/error-turn" => ERROR_SSE,
+                        "/garbage-turn" => GARBAGE_SSE,
                         _ => HAPPY_SSE,
                     };
                     let _ = socket.write_all(
@@ -251,16 +277,17 @@ fn sse_stub() -> &'static SseStub {
                           Connection: close\r\n\r\n",
                     );
                     let _ = socket.flush();
-                    // Byte-level splits that respect nothing — not
-                    // lines, not fields, not UTF-8 for the parser to
-                    // reassemble (its unit tests pin the strict
-                    // guarantee; this exercises it through the whole
-                    // kernel pipe). Flush + pause coaxes each slice
-                    // into its own TCP segment.
+                    // Byte-level splits that respect neither lines nor
+                    // fields, exercised through the whole kernel pipe;
+                    // the fixture's multi-byte character rides along.
+                    // (Whether a split lands mid-sequence depends on
+                    // byte offsets — the parser's unit tests pin the
+                    // torn-UTF-8 guarantee deterministically.) Flush +
+                    // pause coaxes each slice into its own TCP segment.
                     for chunk in sse.as_bytes().chunks(23) {
                         if socket.write_all(chunk).is_err() {
                             // The relay hung up mid-stream (the error
-                            // turn does this by design).
+                            // and garbage turns do this by design).
                             return;
                         }
                         let _ = socket.flush();
@@ -325,7 +352,20 @@ fn chat_input() -> Value {
 /// Run one streamed `chat` turn against the stub `path` and return the
 /// NDJSON events, resolving the provider by role and reading the handle
 /// after the action returns — the milestone-5 loop's pattern.
+///
+/// Bounded: a stub or kernel regression that stalls the stream fails
+/// here with a named timeout instead of hanging the suite until the
+/// CI job dies with no diagnostics.
 async fn stream_turn_events(f: &Fixture, path: &str) -> Vec<Value> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        stream_turn_events_unbounded(f, path),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("streamed turn against {path} did not finish within 30s"))
+}
+
+async fn stream_turn_events_unbounded(f: &Fixture, path: &str) -> Vec<Value> {
     let provider = f
         .kernel
         .role_candidates(None, spi::llm_chat::ROLE)
@@ -384,27 +424,42 @@ async fn the_guest_streams_a_turn_end_to_end() {
         events,
         vec![
             json!({"type": "text", "text": "Hel"}),
-            json!({"type": "text", "text": "lo"}),
+            json!({"type": "text", "text": "l\u{f4}"}),
             json!({"type": "tool_use", "id": "call_1", "name": "echo",
                    "input": {"message": "hi"}}),
             json!({"type": "end", "stop_reason": "end_turn",
                    "usage": {"input_tokens": 1, "output_tokens": 2}}),
         ],
         "keepalives and pings dropped, split events reassembled, \
-         multi-line data re-serialised to one line, end last"
+         multi-line data re-serialised to one line, multi-byte text \
+         intact, end last"
     );
 }
 
 /// The request the vendor received is the one the guest built: the
-/// `LLM_CHAT` input translated, not templated through.
+/// `LLM_CHAT` input translated, not templated through. Selected from
+/// the shared stub's log by a path only this test uses, so a dropped or
+/// mangled request cannot be papered over by another test's identical
+/// POST.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_guest_builds_the_vendor_request() {
     let f = fixture();
-    let events = stream_turn_events(f, "/turn").await;
+    let events = stream_turn_events(f, "/turn-request-pin").await;
     assert_eq!(events.last().unwrap()["type"], json!("end"));
 
-    let requests = f.stub.requests.lock().unwrap();
-    let request = requests.last().expect("the stub saw the POST").clone();
+    // Clone out of the guard before asserting: a failed assertion under
+    // the lock would poison the mutex, and the stub's handler threads
+    // would then take the whole suite down with them.
+    let request = {
+        let requests = f.stub.requests.lock().unwrap();
+        let mut mine = requests
+            .iter()
+            .filter(|(path, _)| path == "/turn-request-pin")
+            .map(|(_, body)| body.clone());
+        let request = mine.next().expect("the stub saw this test's POST");
+        assert!(mine.next().is_none(), "one turn sends exactly one POST");
+        request
+    };
     assert_eq!(request["model"], json!("m3-fixture"), "from config");
     assert_eq!(request["stream"], json!(true));
     assert_eq!(request["system"], json!("be brief"), "passed through");
@@ -433,6 +488,25 @@ async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     );
 }
 
+/// A relay step that *fails* (a non-JSON vendor payload) reaches the
+/// consumer as the contract's failed-turn shape: the events so far,
+/// then end-of-stream with no `end` and no `error` event. The relay
+/// does not close its output on this path — this pins the kernel's
+/// post-invocation drain doing it, which everything in
+/// `docs/SUBSTRATE.md` about `Err` surfacing as early EOF relies on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_relay_step_surfaces_as_early_end_of_stream() {
+    let f = fixture();
+    let events = stream_turn_events(f, "/garbage-turn").await;
+
+    assert_eq!(
+        events,
+        vec![json!({"type": "text", "text": "before the garbage"})],
+        "the garbage line is not relayed, and the vendor's later end \
+         event never reaches the consumer"
+    );
+}
+
 /// The example implements only the streamed form and says so as a step
 /// error, rather than returning something shaped like a buffered turn.
 #[tokio::test(flavor = "multi_thread")]
@@ -451,9 +525,10 @@ async fn the_buffered_form_is_refused_with_a_readable_error() {
     assert!(msg.contains("streamed form"), "names the limitation: {msg}");
 }
 
-/// The two-key authorization holds: the manifest's `provide:` grant
-/// alone does not let a plugin supply a script runtime — a kernel whose
-/// embedder did not trust the plugin refuses it at registration.
+/// The two-key authorization holds, first key: the manifest's
+/// `provide:` grant alone does not let a plugin supply a script
+/// runtime — a kernel whose embedder did not trust the plugin refuses
+/// it at registration.
 #[test]
 fn an_untrusted_guest_plugin_is_refused_at_registration() {
     let mut kernel = Kernel::boot(KernelConfig::default()).unwrap();
@@ -464,5 +539,29 @@ fn an_untrusted_guest_plugin_is_refused_at_registration() {
     assert!(
         msg.contains("trust"),
         "the refusal names the missing trust: {msg}"
+    );
+}
+
+/// …and second key: embedder trust alone is not enough either — a
+/// manifest that omits its own `provide:step_type:script:<name>`
+/// declaration is refused even by a kernel that trusts the plugin.
+#[test]
+fn a_guest_plugin_without_the_provide_grant_is_refused() {
+    let mut kernel =
+        Kernel::boot(KernelConfig::default().trusting_step_type_provider(PLUGIN.to_string()))
+            .unwrap();
+    let mut manifest = sse_guest_manifest();
+    let permissions = manifest["permissions"].as_array_mut().unwrap();
+    permissions.retain(|p| {
+        !p.as_str()
+            .is_some_and(|s| s.starts_with("provide:step_type:script:"))
+    });
+    let err = kernel
+        .register_plugin_from_json(&manifest.to_string())
+        .expect_err("registration is refused without the provide grant");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("provide"),
+        "the refusal names the missing declaration: {msg}"
     );
 }

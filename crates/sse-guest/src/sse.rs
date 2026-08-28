@@ -155,6 +155,25 @@ mod tests {
     }
 
     #[test]
+    fn chunk_boundaries_may_tear_multi_byte_utf8() {
+        // "é" is 0xC3 0xA9; split between the two bytes. Buffering is
+        // byte-level and decoding happens per complete line, so the
+        // torn sequence reassembles losslessly.
+        let mut p = SseParser::new();
+        let payload = "data: caf\u{e9} {\"ok\":true}\n\n".as_bytes();
+        let split = payload.iter().position(|&b| b == 0xC3).unwrap() + 1;
+        let mut events = p.feed(&payload[..split]);
+        events.extend(p.feed(&payload[split..]));
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: "message".into(),
+                data: "caf\u{e9} {\"ok\":true}".into()
+            }]
+        );
+    }
+
+    #[test]
     fn multi_line_data_joins_with_newline() {
         let mut p = SseParser::new();
         let events = feed_all(&mut p, &["data: {\"x\":\ndata:  1}\n\n"]);

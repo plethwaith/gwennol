@@ -6,11 +6,14 @@ use serde_json::Value;
 /// step.
 ///
 /// The layout is the kernel's, not this crate's: the **action input's
-/// top-level fields are flattened at the root**, alongside four
-/// namespace keys the kernel adds — `config`, `secrets`, `vars`, and
-/// `steps`. An input field that shares a name with one of those four is
-/// shadowed by the kernel's namespace; contracts for guest-backed
-/// actions should avoid such field names.
+/// top-level fields are flattened at the root**, alongside the
+/// namespace keys the kernel adds — and the kernel's keys always win.
+/// Four are always present (`config`, `secrets`, `vars`, `steps`) and
+/// three appear conditionally (`item` inside a `for_each`/`repeat`
+/// body, `error` inside a `try` step's catch, `trigger` for
+/// event-dispatched actions), so an input field named `error` would be
+/// shadowed only sometimes — the worst way. Contracts for guest-backed
+/// actions should avoid all seven names.
 ///
 /// `secrets` holds only the keys the step's `passSecrets` allowlist
 /// names — absent `passSecrets` means an empty object, by the kernel's

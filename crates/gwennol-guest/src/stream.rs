@@ -16,6 +16,13 @@ pub enum StreamError {
     Closed,
     /// The readable's underlying source reported an I/O error.
     Io,
+    /// [`Stream::read`] was handed an empty buffer, whose 0-byte read
+    /// would be indistinguishable from end-of-stream. Guest-side; the
+    /// host was never asked.
+    EmptyBuffer,
+    /// The host committed zero bytes on a non-empty write — not an ABI
+    /// error code, but not the documented success shape either.
+    ZeroCommit,
     /// A code this crate does not know; carries the raw value. Seeing
     /// one means the kernel speaks a newer ABI revision than this
     /// crate was built for.
@@ -44,6 +51,10 @@ impl std::fmt::Display for StreamError {
             StreamError::DirectionMismatch => write!(f, "stream direction mismatch"),
             StreamError::Closed => write!(f, "stream closed"),
             StreamError::Io => write!(f, "stream source I/O error"),
+            StreamError::EmptyBuffer => {
+                write!(f, "zero-length read buffer is ambiguous with end-of-stream")
+            }
+            StreamError::ZeroCommit => write!(f, "host committed zero bytes on a stream write"),
             StreamError::Other(code) => write!(f, "unknown stream error code {code}"),
         }
     }
@@ -87,11 +98,14 @@ impl Stream {
     }
 
     /// Read into `buf`, blocking (via the host) until bytes arrive.
-    /// Returns the number of bytes read; `Ok(0)` means end-of-stream
-    /// when `buf` is non-empty. Pass a non-empty buffer — a zero-length
-    /// read also returns 0 and is indistinguishable from EOF.
+    /// Returns the number of bytes read; `Ok(0)` means end-of-stream.
+    /// An empty `buf` is refused ([`StreamError::EmptyBuffer`]) — its
+    /// 0-byte read would be indistinguishable from EOF, and guests ship
+    /// as release builds where a debug assertion would never fire.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, StreamError> {
-        debug_assert!(!buf.is_empty(), "zero-length reads are ambiguous with EOF");
+        if buf.is_empty() {
+            return Err(StreamError::EmptyBuffer);
+        }
         match sys::stream_read(self.handle, buf) {
             n if n >= 0 => Ok(n as usize),
             sys::STREAM_EOF => Ok(0),
@@ -108,7 +122,7 @@ impl Stream {
         while !rest.is_empty() {
             match sys::stream_write(self.handle, rest) {
                 n if n > 0 => rest = &rest[(n as usize).min(rest.len())..],
-                0 => return Err(StreamError::Other(0)),
+                0 => return Err(StreamError::ZeroCommit),
                 code => return Err(StreamError::from_code(code)),
             }
         }

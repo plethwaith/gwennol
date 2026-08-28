@@ -100,7 +100,10 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         if cancelled() {
             // Wind down without an `end` event: the consumer reads the
             // early end-of-stream as a failed turn, which a cancelled
-            // turn is.
+            // turn is. Polling here only catches cancellation between
+            // chunks — a read blocked on a stalled vendor is torn down
+            // by the host instead, whose wallclock and idle timeouts
+            // drop the whole invocation, reads included.
             upstream.close();
             output.close();
             return Ok(Value::Null);

@@ -50,7 +50,10 @@ pub fn dispatch(
 #[doc(hidden)]
 pub fn __alloc_impl(len: i32) -> i32 {
     let Ok(size) = usize::try_from(len) else {
-        return 0;
+        // The host never asks for a negative allocation; a caller that
+        // does has broken the ABI, and trapping is the honest answer —
+        // returning 0 would invite a write over offset 0.
+        panic!("alloc called with a negative length ({len})");
     };
     if size == 0 {
         // The host writes zero bytes through a zero-length allocation;
@@ -73,37 +76,56 @@ pub fn __alloc_impl(len: i32) -> i32 {
     ptr as usize as i32
 }
 
+/// Validate one host-supplied `(ptr, len)` pair down to a raw range.
+///
+/// Pure, so the guards are unit-tested on the host target. Returns the
+/// byte count (possibly 0 — the pointer is unused then) or an error the
+/// caller reports; a valid non-empty range has a positive pointer.
+fn guest_range(ptr: i32, len: i32) -> Result<usize, String> {
+    let Ok(size) = usize::try_from(len) else {
+        return Err(format!("host passed a negative buffer length ({len})"));
+    };
+    if size > 0 && ptr <= 0 {
+        return Err(format!("host passed a non-positive buffer pointer ({ptr})"));
+    }
+    Ok(size)
+}
+
 /// Implementation behind the `execute` export `entrypoints!` generates:
 /// read the two host-written buffers, dispatch, report through
 /// `host_set_result`/`host_set_error`.
+///
+/// # Safety
+///
+/// Each `(ptr, len)` pair must denote `len` readable bytes in this
+/// module's linear memory — concretely, a pointer this module's own
+/// `alloc` returned for at least `len` bytes, into which the host wrote
+/// exactly `len` bytes, still live for the whole call. The kernel's
+/// `script` step upholds this; nothing else should call this function.
 #[doc(hidden)]
-pub fn __execute_impl(
+pub unsafe fn __execute_impl(
     source_ptr: i32,
     source_len: i32,
     args_ptr: i32,
     args_len: i32,
     table: &[(&str, EntryFn)],
 ) -> i32 {
-    fn guest_slice<'a>(ptr: i32, len: i32) -> Result<&'a [u8], String> {
-        let Ok(size) = usize::try_from(len) else {
-            return Err(format!("host passed a negative buffer length ({len})"));
-        };
-        if size == 0 {
-            return Ok(&[]);
-        }
-        if ptr <= 0 {
-            return Err(format!("host passed a non-positive buffer pointer ({ptr})"));
-        }
-        // SAFETY: the pointer is one this module's own `alloc` returned
-        // for at least `len` bytes, into which the host wrote exactly
-        // `len` bytes before calling `execute`; the allocation is never
-        // freed during the call.
-        Ok(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, size) })
-    }
-
     let outcome = (|| {
-        let source_bytes = guest_slice(source_ptr, source_len)?;
-        let args_bytes = guest_slice(args_ptr, args_len)?;
+        let source_size = guest_range(source_ptr, source_len)?;
+        let args_size = guest_range(args_ptr, args_len)?;
+        // SAFETY: ranges validated above; the pointed-to bytes are this
+        // function's documented precondition, and the slices do not
+        // outlive the call.
+        let source_bytes: &[u8] = if source_size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(source_ptr as usize as *const u8, source_size) }
+        };
+        let args_bytes: &[u8] = if args_size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(args_ptr as usize as *const u8, args_size) }
+        };
         let source = std::str::from_utf8(source_bytes)
             .map_err(|e| format!("script source is not UTF-8: {e}"))?;
         dispatch(source, args_bytes, table)
@@ -151,7 +173,10 @@ macro_rules! entrypoints {
             args_len: i32,
         ) -> i32 {
             const TABLE: &[(&str, $crate::EntryFn)] = &[$(($name, $func)),+];
-            $crate::__execute_impl(source_ptr, source_len, args_ptr, args_len, TABLE)
+            // SAFETY: the caller is the kernel's `script` step, which
+            // wrote both buffers through this module's `alloc` — the
+            // exact precondition `__execute_impl` documents.
+            unsafe { $crate::__execute_impl(source_ptr, source_len, args_ptr, args_len, TABLE) }
         }
     };
 }
@@ -202,5 +227,22 @@ mod tests {
     fn dispatch_rejects_malformed_args() {
         let err = dispatch("greet", b"not json", TABLE).expect_err("bad args fail");
         assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn guest_range_accepts_what_the_host_protocol_produces() {
+        assert_eq!(guest_range(32, 20), Ok(20));
+        assert_eq!(guest_range(0, 0), Ok(0), "empty buffer, pointer unused");
+        assert_eq!(guest_range(-1, 0), Ok(0), "empty buffer, pointer ignored");
+    }
+
+    #[test]
+    fn guest_range_refuses_protocol_violations() {
+        let err = guest_range(32, -1).expect_err("negative length");
+        assert!(err.contains("negative buffer length"), "{err}");
+        let err = guest_range(0, 4).expect_err("null pointer with bytes");
+        assert!(err.contains("non-positive buffer pointer"), "{err}");
+        let err = guest_range(-8, 4).expect_err("negative pointer with bytes");
+        assert!(err.contains("non-positive buffer pointer"), "{err}");
     }
 }

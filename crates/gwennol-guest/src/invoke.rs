@@ -31,24 +31,34 @@ impl Target<'_> {
 }
 
 /// Drain the single-slot result-or-error stash the invoke imports fill.
-fn drain_call_stash() -> Option<Vec<u8>> {
+///
+/// `Ok(None)` is an empty stash; `Err(code)` is a read that failed
+/// after the stash was already taken (the host clears the slot even on
+/// its error path), so the payload is unrecoverable — the two must not
+/// be conflated, because on a successful invoke an empty or unreadable
+/// stash is a host/guest ABI violation, never a real result.
+fn drain_call_stash() -> Result<Option<Vec<u8>>, i32> {
     let size = sys::host_call_result_size();
     if size <= 0 {
-        return None;
+        return Ok(None);
     }
     let mut buf = vec![0u8; size as usize];
     let copied = sys::host_call_result_read(&mut buf);
     if copied < 0 {
-        return None;
+        return Err(copied);
     }
     buf.truncate(copied as usize);
-    Some(buf)
+    Ok(Some(buf))
 }
 
 fn stashed_error(what: &str, status: i32) -> String {
     match drain_call_stash() {
-        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        None => format!("{what} failed with status {status} and no error message"),
+        Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(None) => format!("{what} failed with status {status} and no error message"),
+        Err(code) => format!(
+            "{what} failed with status {status}, and reading the error message \
+             failed too (code {code})"
+        ),
     }
 }
 
@@ -62,8 +72,23 @@ pub fn invoke(target: Target<'_>, action: &str, input: &Value) -> Result<Value, 
         serde_json::to_vec(input).map_err(|e| format!("invoke input failed to serialize: {e}"))?;
     let status = sys::host_invoke(&target.spec(), action.as_bytes(), &input_json);
     if status == 1 {
-        let bytes = drain_call_stash().unwrap_or_else(|| b"null".to_vec());
-        serde_json::from_slice(&bytes).map_err(|e| format!("invoke result is not valid JSON: {e}"))
+        // A successful invoke always stashes at least the four bytes of
+        // `null`, so an empty or unreadable stash here is the ABI
+        // misbehaving — fabricating a `null` result from it would hand
+        // the caller plausible data with no trace of the failure.
+        match drain_call_stash() {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("invoke result is not valid JSON: {e}")),
+            Ok(None) => Err(
+                "io.invoke reported success but the host's result stash was empty — \
+                 host/guest ABI mismatch"
+                    .to_string(),
+            ),
+            Err(code) => Err(format!(
+                "io.invoke reported success but its result could not be read \
+                 (code {code}) — host/guest ABI mismatch"
+            )),
+        }
     } else {
         Err(stashed_error("io.invoke", status))
     }
