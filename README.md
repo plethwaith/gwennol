@@ -41,6 +41,18 @@ The 0.0.0 release on crates.io is a name reservation.
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.
 
+## Building and testing
+
+```sh
+rustup target add wasm32-unknown-unknown   # once — the tests compile the
+                                           # example guest plugin from source
+cargo test --workspace
+```
+
+Everything else is stock `cargo`. The wasm target is the one extra
+prerequisite; without it the substrate tests fail with a message naming
+this command.
+
 ## Layout
 
 ```
