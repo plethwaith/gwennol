@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/gwennol-core", "crates/gwennol-cli"]
+members = [
+    "crates/gwennol-core",
+    "crates/gwennol-cli",
+    "crates/gwennol-guest",
+    "crates/sse-guest",
+]
 
 [workspace.package]
 version = "0.1.0-dev"
