@@ -88,6 +88,19 @@ pub struct HostConfig {
     pub workspace_root: PathBuf,
     /// Environment policy for `host_process.run`.
     pub process_env: ProcessEnv,
+    /// Plugin names allowed to supply the implementation behind a step
+    /// type they do not define — concretely, the wasm module behind a
+    /// `(script, <language>)` slot (see `docs/SUBSTRATE.md`).
+    ///
+    /// This is the embedder half of Gwead's two-key authorization: the
+    /// manifest declares `provide:step_type:script:<language>`, and the
+    /// kernel additionally requires the plugin's name here, because
+    /// supplying a runtime means every script step of that language —
+    /// whoever's manifest it appears in — executes inside that plugin's
+    /// code. Listing a name is therefore a trust statement about code,
+    /// not a routing choice. [`crate::boot`] passes the empty list;
+    /// registering a guest-backed plugin requires [`crate::boot_with`].
+    pub trusted_step_type_providers: Vec<String>,
 }
 
 static HOST: OnceLock<HostConfig> = OnceLock::new();

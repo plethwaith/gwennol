@@ -1,0 +1,22 @@
+# The guest-side half of the plugin substrate: everything in this crate
+# runs *inside* a Gwead script-runtime wasm module, never in the host
+# process. gwennol-core must never depend on it.
+#
+# Not yet published: the crate is consumed by path from the bundled guest
+# crates in this workspace. Publishing becomes worthwhile when plugins
+# are installable from outside the binary (see docs/ROADMAP.md, "Beyond
+# the MVP").
+[package]
+name = "gwennol-guest"
+description = "Guest-side helper for writing Gwennol plugins in Rust: safe wrappers over the Gwead script-runtime wasm ABI."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json.workspace = true

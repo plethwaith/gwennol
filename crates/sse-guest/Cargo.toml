@@ -1,0 +1,26 @@
+# The milestone-3 example guest: Rust compiled to wasm32-unknown-unknown,
+# occupying the script-runtime slot for the `sse-guest` plugin (see
+# docs/SUBSTRATE.md). Built for wasm by the integration tests via
+#   cargo build -p sse-guest --target wasm32-unknown-unknown --release
+# and compiled for the host target only so lints, docs, and the parser's
+# unit tests cover it.
+[package]
+name = "sse-guest"
+description = "Example Gwennol guest plugin: parses a server-sent-events body and relays it as contract NDJSON."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+# cdylib is the wasm module; rlib keeps `cargo test` able to link the
+# unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gwennol-guest = { path = "../gwennol-guest" }
+serde_json.workspace = true

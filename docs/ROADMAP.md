@@ -145,6 +145,21 @@ written, and it must be settled before a provider exists.
   that long-running slot.
 - **Not in scope:** the Anthropic provider itself; installing plugins from
   outside the binary.
+- **Settled: Rust guests, not a bundled interpreter** — decision record
+  in [docs/SUBSTRATE.md](SUBSTRATE.md). The script-runtime slot's
+  contract nowhere requires interpreting: a plugin's guest logic is
+  ordinary Rust compiled to `wasm32-unknown-unknown`
+  (`crates/gwennol-guest` is the helper), registered as the plugin's
+  own runtime under its own name, with the step's `source` string
+  selecting an entry point. An interpreter would have been the same
+  binding work *plus* an interpreter, with the plugin logic itself
+  demoted to untyped strings in JSON; it remains available later as
+  just another plugin, through the same trust gate and slot, when
+  third-party authoring warrants it. Supplying a runtime is double-
+  keyed — the manifest's `provide:` grant and the embedder's
+  `trusted_step_type_providers` list at boot — and the example
+  (`crates/sse-guest`) runs the constraint's exact composition end to
+  end in CI, built from source by the test suite.
 
 ### 4. Provider and tools
 
@@ -173,6 +188,12 @@ written, and it must be settled before a provider exists.
 - **Done when:** a multi-turn conversation with tool calls runs against a
   stubbed provider; a failing tool is reported *to the model* rather than
   ending the turn; cancelling mid-stream tears the turn down cleanly.
+- **Owed to milestone 3:** the loop harness is the first place a
+  consumer-hangs-up turn becomes observable end to end (a step outcome
+  the test can see), so it owes the pin on the example guest's
+  reader-gone wind-down — the relay treating a closed output as a
+  graceful stop, not a failed step — which milestone 3 could verify
+  only by inspection.
 - **Not in scope:** any frontend beyond a test `Operator`.
 
 ### 6. Non-interactive CLI

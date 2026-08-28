@@ -11,6 +11,12 @@ authors.workspace = true
 readme = "README.md"
 keywords = ["agent", "llm", "wasm", "gwead"]
 categories = ["development-tools"]
+# The integration suites cannot run from a published tarball — they use
+# path-only dev-dependencies (stripped by `cargo package`) and shell
+# out to build workspace crates — and shipping them would leave the
+# package with test files that no longer compile. `cargo package`'s
+# verify step builds only the lib, so nothing else would catch that.
+exclude = ["tests/"]
 
 [dependencies]
 gwead.workspace = true
@@ -29,6 +35,15 @@ nix.workspace = true
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true
+# Guest wasm modules travel inline in plugin manifests as base64; the
+# substrate tests encode the compiled example guest with it.
+base64 = "0.22"
+# The substrate tests pin gwennol-guest's re-declared STREAM_* codes
+# against gwead's, and build the example guest's manifest from the
+# names sse-guest itself exports. Path-only dev-dependencies, stripped
+# by `cargo package`.
+gwennol-guest = { path = "../gwennol-guest" }
+sse-guest = { path = "../sse-guest" }
 # The same JSON Schema validator Gwead uses for its meta-schemas; here it
 # pins fixture payloads to the SPI contract schemas, which the kernel
 # deliberately never does at dispatch.

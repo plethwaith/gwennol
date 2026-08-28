@@ -798,17 +798,27 @@ name = "gwennol-core"
 version = "0.1.0-dev"
 dependencies = [
  "async-trait",
+ "base64",
  "boon",
  "gwead",
+ "gwennol-guest",
  "nix",
  "reqwest",
  "serde",
  "serde_json",
+ "sse-guest",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "gwennol-guest"
+version = "0.1.0-dev"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -1812,6 +1822,14 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sse-guest"
+version = "0.1.0-dev"
+dependencies = [
+ "gwennol-guest",
+ "serde_json",
 ]
 
 [[package]]
