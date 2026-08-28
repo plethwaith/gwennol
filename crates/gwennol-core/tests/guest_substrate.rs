@@ -539,9 +539,15 @@ async fn an_oversized_error_body_is_truncated_with_a_marker() {
         !message.contains("TAIL_SENTINEL"),
         "nothing past what the relay reads leaks through: {message}"
     );
+    // The exact ceiling: prefix + the 4 KiB excerpt cap + the marker.
+    // Byte-based, and valid because the fixture body is ASCII —
+    // `from_utf8_lossy` can expand a *binary* body up to 3× (each bad
+    // byte becomes a 3-byte U+FFFD), so a non-ASCII fixture would need
+    // this bound rethought, not just raised.
+    let ceiling = "vendor answered HTTP 429: ".len() + 4096 + " …(truncated)".len();
     assert!(
-        message.len() < 4096 + 64,
-        "the message stays near the cap ({} bytes)",
+        message.len() <= ceiling,
+        "the message stays within the cap's ceiling ({} > {ceiling} bytes)",
         message.len()
     );
 }

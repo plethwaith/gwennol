@@ -27,10 +27,9 @@ source lives under `crates/` (the milestone-3 example is
 `crates/sse-guest`, which gwennol-core's integration suite compiles
 and injects into its manifest at test time). When milestone 4 bundles
 guest-backed plugins *here*, it owes the build-time equivalent: a
-packaging step
-that fills the JSON file's `wasmModules` slot from the compiled
-artifact — the file stays the plugin, and no compiled blob is ever
-committed.
+packaging step that fills the JSON file's `wasmModules` slot from the
+compiled artifact — the file stays the plugin, and no compiled blob
+is ever committed.
 
 The host step types these use are *not* here: they are native code in
 `gwennol-core`, published by the `host_fs`, `host_process` and

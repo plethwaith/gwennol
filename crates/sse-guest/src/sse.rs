@@ -11,6 +11,11 @@
 //! - `event:` names the event type (default `message`), `data:` lines
 //!   accumulate and join with `\n`, one leading space after the colon
 //!   is stripped;
+//! - **empty `data:` values before the first non-empty one buffer
+//!   nothing** — a deliberate departure from the WHATWG algorithm,
+//!   which would buffer a separator for each (and so would dispatch an
+//!   all-empty event where this parser drops it, the way it drops
+//!   keepalives). Interior and trailing empty values join byte-exactly;
 //! - `:` comment lines and unknown fields (`id`, `retry`) are ignored.
 //!
 //! Chunk boundaries carry no meaning: bytes may arrive split anywhere,
@@ -42,7 +47,8 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// is on the buffer's **actual bytes** (`\n` separators included), not
 /// on a payload tally that a parallel structure could outgrow — the
 /// accounting cannot diverge from the memory, so the parser's whole
-/// buffering is bounded by these two caps plus one bounded field name.
+/// buffering is bounded by these two caps plus the `event:` field's
+/// value, itself bounded by the line cap.
 pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Incremental parser state. Feed it chunks as they arrive; it returns
@@ -59,8 +65,9 @@ pub struct SseParser {
     /// memory the event holds — no per-line container overhead to
     /// escape [`MAX_EVENT_BYTES`], and empty `data:` values buffer at
     /// most their separator. (An event whose values were all empty
-    /// leaves the buffer empty and is not dispatched, which is the
-    /// format's own empty-data-buffer rule.)
+    /// leaves the buffer empty and is not dispatched — this parser's
+    /// deliberate stricter reading, not the WHATWG algorithm's, which
+    /// would buffer a separator per empty value; see the module docs.)
     data: String,
     /// Set once [`Self::feed`] has returned an error; every later call
     /// fails too, making "the parser is spent" a property the type
@@ -121,7 +128,8 @@ impl SseParser {
             let data = std::mem::take(&mut self.data);
             let event_type = self.event_type.take();
             // An event with an empty data buffer is not dispatched —
-            // that's the format's rule, and it is what makes a lone
+            // the parser's deliberate stricter reading (the module docs
+            // own the departure from WHATWG), and what makes a lone
             // keepalive comment plus blank line invisible.
             if data.is_empty() {
                 return Ok(None);
@@ -333,7 +341,7 @@ mod tests {
         );
 
         // And an event whose values were ALL empty is not dispatched —
-        // the format's empty-data-buffer rule.
+        // the parser's deliberate stricter-than-WHATWG reading.
         let mut q = SseParser::new();
         assert!(q.feed(b"data:\ndata:\n\n").unwrap().is_empty());
     }

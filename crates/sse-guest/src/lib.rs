@@ -116,9 +116,14 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         .ok_or("the fetch step recorded no HTTP status")?;
     if !(200..300).contains(&status) {
         let reason = read_capped(&upstream, ERROR_BODY_CAP);
+        let message = if reason.is_empty() {
+            format!("vendor answered HTTP {status}")
+        } else {
+            format!("vendor answered HTTP {status}: {reason}")
+        };
         let event = json!({
             "type": "error",
-            "message": format!("vendor answered HTTP {status}: {reason}"),
+            "message": message,
             // Timeouts, rate limits and server-side failures are worth
             // repeating unchanged; the other 4xx will fail again.
             "retryable": matches!(status, 408 | 429) || (500..=599).contains(&status),
