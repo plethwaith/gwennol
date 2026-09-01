@@ -1,8 +1,8 @@
 {
   "formatVersion": 1,
   "name": "host_fs",
-  "version": "0.1.0",
-  "description": "Gwennol filesystem step types. Native code; every step asks the operator before acting. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_fs.* grant.",
+  "version": "0.2.0",
+  "description": "Gwennol filesystem step types. Native code; every step asks the operator before acting. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_fs.* grant. Answers the model can act on — no such file, that is a directory, permission denied — are results with an `outcome` naming them, not step errors; step errors are reserved for the operator's denial, the kernel's refusal, cancellation, and I/O failures nobody can act on.",
   "stepTypeDefs": [
     {
       "name": "host_fs.read",
@@ -16,13 +16,27 @@
         }
       },
       "outputSchema": {
-        "type": "object",
-        "required": ["content", "truncated", "size"],
-        "properties": {
-          "content": { "type": "string", "description": "File contents, lossily decoded as UTF-8." },
-          "truncated": { "type": "boolean" },
-          "size": { "type": "integer", "description": "Full size of the file in bytes." }
-        }
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["outcome", "content", "truncated", "size"],
+            "properties": {
+              "outcome": { "const": "ok" },
+              "content": { "type": "string", "description": "File contents, lossily decoded as UTF-8." },
+              "truncated": { "type": "boolean" },
+              "size": { "type": "integer", "description": "Full size of the file in bytes." }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["outcome", "message"],
+            "description": "The filesystem's answer, for the model to act on. Approved like a read: the operator saw the probed path first.",
+            "properties": {
+              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied"] },
+              "message": { "type": "string", "description": "One line naming the outcome and the path, fit to hand the model verbatim." }
+            }
+          }
+        ]
       }
     },
     {
@@ -38,9 +52,25 @@
         }
       },
       "outputSchema": {
-        "type": "object",
-        "required": ["bytes_written"],
-        "properties": { "bytes_written": { "type": "integer" } }
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["outcome", "bytes_written"],
+            "properties": {
+              "outcome": { "const": "ok" },
+              "bytes_written": { "type": "integer" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["outcome", "message"],
+            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, or permission denied. Nothing was written.",
+            "properties": {
+              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied"] },
+              "message": { "type": "string" }
+            }
+          }
+        ]
       }
     },
     {
@@ -55,23 +85,37 @@
         }
       },
       "outputSchema": {
-        "type": "object",
-        "required": ["entries", "truncated"],
-        "properties": {
-          "truncated": { "type": "boolean" },
-          "entries": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": ["name", "kind"],
-              "properties": {
-                "name": { "type": "string" },
-                "kind": { "enum": ["file", "dir", "symlink", "unknown"] },
-                "size": { "type": ["integer", "null"] }
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["outcome", "entries", "truncated"],
+            "properties": {
+              "outcome": { "const": "ok" },
+              "truncated": { "type": "boolean" },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "kind"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "enum": ["file", "dir", "symlink", "unknown"] },
+                    "size": { "type": ["integer", "null"] }
+                  }
+                }
               }
             }
+          },
+          {
+            "type": "object",
+            "required": ["outcome", "message"],
+            "description": "There is no directory to list: the path is missing, or names something that is not a directory, or may not be read.",
+            "properties": {
+              "outcome": { "enum": ["not_found", "not_a_directory", "permission_denied"] },
+              "message": { "type": "string" }
+            }
           }
-        }
+        ]
       }
     }
   ],

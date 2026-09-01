@@ -134,6 +134,11 @@ fn fixture_plugins() -> Vec<Value> {
             ]),
         ),
         plugin(
+            "plain_writer",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}"}}]),
+        ),
+        plugin(
             "lister",
             &["step_type:host_fs.list"],
             json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": "{{$input.max}}"}}]),
@@ -183,6 +188,11 @@ fn fixture_plugins() -> Vec<Value> {
         ),
         plugin(
             "denied",
+            &["step_type:host_fs.read"],
+            json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}"}}]),
+        ),
+        plugin(
+            "denied_prober",
             &["step_type:host_fs.read"],
             json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}"}}]),
         ),
@@ -602,6 +612,192 @@ async fn fs_list_caps_entries_and_reports_the_cut() {
         .collect();
     assert_eq!(names, ["a", "b", "c", "d", "e"]);
     assert_eq!(out["l"]["truncated"], false);
+}
+
+// ------------------------------------------------ fs: outcomes as data
+
+/// The filesystem's answers the model must react to arrive as results
+/// with an `outcome`, never as step errors — the errors-as-data rule a
+/// declarative tool depends on (docs/SPI.md). The happy path says so
+/// too, so a tool can branch on one field.
+#[tokio::test]
+async fn fs_steps_name_their_outcome_on_success() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("named.txt"), "x").unwrap();
+    let out = run("reader", json!({"path": "named.txt", "max_bytes": 10}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["outcome"], "ok");
+    let out = run(
+        "writer",
+        json!({"path": "named-out/w.txt", "content": "y", "dir": "named-out"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["w"]["outcome"], "ok");
+    assert_eq!(out["l"]["outcome"], "ok");
+}
+
+/// A read of a missing file is a `not_found` result — and the operator
+/// was asked first, about the path canonical up to its deepest existing
+/// ancestor, so a plugin cannot learn what exists without every probe
+/// crossing the approval surface.
+#[tokio::test]
+async fn fs_read_reports_a_miss_as_data_after_asking() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("exists")).unwrap();
+    let out = run(
+        "reader",
+        json!({"path": "exists/missing/file.txt", "max_bytes": 10}),
+    )
+    .await
+    .expect("a miss is not a step error");
+    assert_eq!(out["r"]["outcome"], "not_found");
+    let message = out["r"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("no such file") && message.contains("file.txt"),
+        "{message}"
+    );
+    assert!(out["r"].get("content").is_none(), "no fabricated content");
+    assert!(
+        f.requests_for("reader").contains(&Access::ReadFile(
+            f.workspace.join("exists/missing/file.txt")
+        )),
+        "the probe never reached the operator: {:?}",
+        f.requests_for("reader")
+    );
+}
+
+/// The remaining answers: a directory where a file was wanted, a path
+/// through a file, and a file the agent's user may not read. Each is
+/// data with the outcome named; none is a step error.
+#[tokio::test]
+async fn fs_read_reports_directories_and_bad_components_as_data() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("a-dir")).unwrap();
+    let out = run("reader", json!({"path": "a-dir", "max_bytes": 10}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["outcome"], "is_directory");
+    assert!(
+        f.requests_for("reader")
+            .contains(&Access::ReadFile(f.workspace.join("a-dir"))),
+        "asked before answering"
+    );
+
+    std::fs::write(f.workspace.join("a-file"), "x").unwrap();
+    let out = run(
+        "reader",
+        json!({"path": "a-file/below.txt", "max_bytes": 10}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["r"]["outcome"], "not_a_directory");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_read_reports_permission_denied_as_data() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let path = f.workspace.join("locked.txt");
+    std::fs::write(&path, "x").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        eprintln!("skipping: this user (root?) reads a mode-000 file anyway");
+        return;
+    }
+    let out = run("reader", json!({"path": "locked.txt", "max_bytes": 10}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["outcome"], "permission_denied");
+    assert!(
+        f.requests_for("reader").contains(&Access::ReadFile(path)),
+        "asked before answering"
+    );
+}
+
+/// A write whose parent is missing (and `create_dirs` unset), or whose
+/// destination is a directory, is the destination's answer: data, with
+/// nothing written and no temporary left behind.
+#[tokio::test]
+async fn fs_write_reports_a_missing_parent_and_a_directory_in_the_way_as_data() {
+    let f = fixture();
+    let out = run(
+        "plain_writer",
+        json!({"path": "no-parent/w.txt", "content": "z"}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "not_found");
+    assert!(
+        !f.workspace.join("no-parent").exists(),
+        "nothing was created"
+    );
+    assert!(
+        f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(f.workspace.join("no-parent/w.txt"))),
+        "asked before answering"
+    );
+
+    // In its own directory: the leftover scan must not see a sibling
+    // test's in-flight temporary in the shared workspace root.
+    std::fs::create_dir_all(f.workspace.join("blocked/in-the-way")).unwrap();
+    let out = run(
+        "plain_writer",
+        json!({"path": "blocked/in-the-way", "content": "z"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["w"]["outcome"], "is_directory");
+    assert!(
+        f.workspace.join("blocked/in-the-way").is_dir(),
+        "left alone"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("blocked"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+/// A listing of a missing directory, or of a file, is data too — and the
+/// missing one is approved as a probe like a read miss.
+#[tokio::test]
+async fn fs_list_reports_missing_and_non_directories_as_data() {
+    let f = fixture();
+    let out = run("lister", json!({"dir": "no-such-dir", "max": 10}))
+        .await
+        .expect("not a step error");
+    assert_eq!(out["l"]["outcome"], "not_found");
+    assert!(
+        f.requests_for("lister")
+            .contains(&Access::ListDir(f.workspace.join("no-such-dir"))),
+        "asked before answering"
+    );
+
+    std::fs::write(f.workspace.join("listed-file"), "x").unwrap();
+    let out = run("lister", json!({"dir": "listed-file", "max": 10}))
+        .await
+        .unwrap();
+    assert_eq!(out["l"]["outcome"], "not_a_directory");
+}
+
+/// The line between data and error: the operator's denial of a probe is
+/// still a step error, even when the file does not exist — a denied
+/// miss must not become "not found".
+#[tokio::test]
+async fn a_denied_probe_of_a_missing_file_is_an_error_not_a_miss() {
+    let f = fixture();
+    let err = run("denied_prober", json!({"path": "never-there.txt"}))
+        .await
+        .expect_err("denial is a step error");
+    assert!(err.to_string().contains("operator denied"), "{err}");
+    assert!(
+        f.requests_for("denied_prober")
+            .contains(&Access::ReadFile(f.workspace.join("never-there.txt")))
+    );
 }
 
 // ---------------------------------------------------------------- process

@@ -14,12 +14,16 @@ use std::path::PathBuf;
 pub enum Access {
     /// Read the contents of a file. The path is canonical — symlinks
     /// resolved — and the host has verified it names the file it will
-    /// actually read.
+    /// actually read. When nothing readable is there, the probe is still
+    /// approved before the plugin learns so: the path is then canonical
+    /// up to its deepest existing ancestor, the rest spelled as given.
     ReadFile(PathBuf),
     /// Create or overwrite a file. The path is canonical up to its deepest
     /// existing ancestor; a symlink destination is refused before asking.
     WriteFile(PathBuf),
-    /// List a directory, named by its canonical path.
+    /// List a directory, named by its canonical path — or, for a probe
+    /// of a directory that is not there, canonical up to its deepest
+    /// existing ancestor like [`Access::WriteFile`].
     ListDir(PathBuf),
     /// Spawn a process.
     Spawn {
