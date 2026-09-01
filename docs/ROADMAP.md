@@ -179,6 +179,31 @@ written, and it must be settled before a provider exists.
   provider owes the buffered-path error taxonomy `docs/SPI.md` defers to
   here.
 - **Not in scope:** the loop; any frontend.
+- **Settled: outcomes are data.** Every `host_fs` step reports the
+  answers a model can act on — `not_found`, `is_directory`,
+  `not_a_directory`, `permission_denied` — as a result whose `outcome`
+  names them, with a one-line `message`; a miss is still approved first,
+  under the path canonical to its deepest existing ancestor. The four
+  tools are declarative — one host step and a branch on its outcome —
+  and a test pins that no tool uses `try` and that each manifest's
+  grants equal the host steps its steps use.
+- **Settled: truncation is data too.** A tool reports `truncated: true`
+  (`TOOL` 0.2.0) and never composes a marker; `spi::tool::render_content`
+  appends the one shared marker before the model sees the result.
+- **Settled: the buffered failure taxonomy** is the `LLM_CHAT` 0.2.0
+  `{"error": Failure}` form — the vendor answered and said no, with
+  `retryable` filled from its answer. What the provider cannot classify
+  without reading error text stays a step error, uniformly fatal.
+- **Settled: bundling.** A guest-backed manifest commits its module as
+  `{"path": "crates/<name>"}`, a form the kernel refuses; `cargo xtask
+  bundle` compiles the crate and fills the slot, the integration suite
+  bundles through the same code, and no blob is ever committed.
+- **Provider notes.** `provider-anthropic` sends `thinking: {"type":
+  "disabled"}` unless `.thinking` says otherwise, because the
+  contract carries no thinking blocks to replay (a known exclusion); a
+  turn with thinking enabled keeps its text and tool calls and drops the
+  rest. `pause_turn`, unknown stop reasons and missing usage counters
+  are failures, never guesses.
 
 ### 5. Agent loop
 
@@ -225,7 +250,9 @@ Not scheduled, but known, and listed so they are not mistaken for oversights:
 - Conversation persistence and resume, and context-window management — a
   coding session outlives a single turn.
 - Distribution: `cargo install gwennol` has to carry the bundled manifests
-  and any guest modules inside the binary.
+  and any guest modules inside the binary — `target/bundle/`, the output
+  of `cargo xtask bundle`, is the input to that, and today only the
+  integration suite consumes it.
 - Installing plugins from outside the binary. This is where the sandboxing
   thesis pays off, and where questions that are moot for bundled plugins stop
   being moot: which plugins may claim a `(script, <language>)` slot, and

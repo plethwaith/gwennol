@@ -95,7 +95,7 @@ wasm-only.
     "step_type:host_http.post",             // plus whatever it reaches
     "network:egress:127.0.0.1"
   ],
-  "wasmModules": { "guest": { "base64": "…" } },
+  "wasmModules": { "guest": { "base64": "…" } },   // a bundled plugin commits {"path": "crates/<name>"} here; see Building
   "stepTypeImpls": [
     { "stepType": "script", "matches": "sse-guest", "wasmModule": "guest" }
   ],
@@ -167,14 +167,19 @@ rustup target add wasm32-unknown-unknown   # once
 cargo build -p sse-guest --target wasm32-unknown-unknown --release
 ```
 
-No compiled module is committed. The integration suite runs the build
-itself (same `cargo`, separate `--target-dir` so the outer test run's
-lock and the guest build's lock never meet) and injects the bytes into
-the manifest at test time; CI compiles the guest from source on every
-run. When milestone 4 bundles real guest-backed plugins under
-[`plugins/`](../plugins/), the same injection moves into the build:
-the JSON file in the repo stays the plugin, and the packaging step
-fills its `wasmModules` slot from the compiled artifact.
+No compiled module is committed. The build-time half is the bundler,
+[`crates/xtask`](../crates/xtask), run as `cargo xtask bundle`: a
+bundled manifest under [`plugins/`](../plugins/) names its module as
+`{"path": "crates/<name>"}` — a form the kernel refuses, so the
+committed file is honestly not registrable — and the bundler compiles
+that crate (same `cargo`, separate `--target-dir target/wasm-guest` so
+an outer `cargo test`'s lock and the guest build's lock never meet)
+and replaces the slot with the inline `base64` form, writing the result
+under `target/bundle/`. The JSON file in the repository stays the
+plugin. The integration suites build through the same library function
+— `guest_substrate.rs` for this example, `bundled_plugins.rs` for the
+bundled plugins — and CI runs the command as a user would, so the
+guests compile from source on every run.
 
 ## ABI coupling
 

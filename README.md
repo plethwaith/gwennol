@@ -33,9 +33,12 @@ manifests.
 
 **Pre-alpha.** The native host step types (milestone 1), the
 `LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md)),
-and the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
-[docs/SUBSTRATE.md](docs/SUBSTRATE.md)) exist and are exercised by
-integration tests against a real kernel; nothing user-facing runs yet.
+the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
+[docs/SUBSTRATE.md](docs/SUBSTRATE.md)), and the bundled plugins
+(milestone 4 — the Anthropic provider and the `read`, `write`, `grep`
+and `bash` tools, [plugins/](plugins/)) exist and are exercised by
+integration tests against a real kernel and a stubbed Messages API;
+nothing user-facing runs yet — the agent loop is milestone 5.
 The 0.0.0 release on crates.io is a name reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
@@ -45,13 +48,17 @@ naming rules, and the seven milestones to a usable harness.
 
 ```sh
 rustup target add wasm32-unknown-unknown   # once — the tests compile the
-                                           # example guest plugin from source
+                                           # guest plugins from source
 cargo test --workspace
+cargo xtask bundle                         # registrable manifests with their
+                                           # guest modules filled, under target/bundle/
 ```
 
 Everything else is stock `cargo`. The wasm target is the one extra
-prerequisite; without it the substrate tests fail with a message naming
-this command.
+prerequisite; without it the guest builds fail with a message naming
+this command. No compiled module is ever committed: a guest-backed
+manifest under `plugins/` names the crate that builds it, and the
+bundler fills the slot ([plugins/README.md](plugins/README.md)).
 
 ## Layout
 
@@ -60,7 +67,9 @@ crates/gwennol-core/   host library: kernel config, native host steps, loop, Ope
 crates/gwennol-cli/    first frontend (non-interactive CLI)
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
-plugins/               bundled SPI + plugin manifests
+crates/provider-anthropic/  the bundled model provider's guest code
+crates/xtask/          `cargo xtask bundle`: compile guests, fill manifests
+plugins/               bundled SPI contracts, provider and tool manifests
 docs/                  roadmap and design notes
 ```
 
