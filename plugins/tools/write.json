@@ -1,0 +1,55 @@
+{
+  "formatVersion": 1,
+  "name": "tool-write",
+  "version": "0.1.0",
+  "description": "The `write` tool: one host_fs.write, its outcome branched on as data. Reaches nothing else.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_fs.write"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "write",
+        "description": "Create or replace a file with the given text, creating missing parent directories. The write is atomic: the file is never observable half-written. Refuses to write through a symlink.",
+        "parameters": {
+          "type": "object",
+          "required": ["path", "content"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "description": "File path, absolute or relative to the workspace root." },
+            "content": { "type": "string", "description": "The whole new content of the file." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "write",
+          "type": "host_fs.write",
+          "params": { "path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true }
+        },
+        {
+          "id": "answer",
+          "type": "ifs",
+          "params": { "ifs": [
+            {
+              "test": "$steps.write.result.outcome == 'ok'",
+              "then": [
+                { "id": "ok", "type": "return", "params": { "value": {
+                  "content": "wrote {{$steps.write.result.bytes_written}} bytes to {{$input.path}}",
+                  "is_error": false
+                } } }
+              ]
+            },
+            {
+              "then": [
+                { "id": "miss", "type": "return", "params": { "value": {
+                  "content": "{{$steps.write.result.message}}",
+                  "is_error": true
+                } } }
+              ]
+            }
+          ] }
+        }
+      ]
+    }
+  }
+}

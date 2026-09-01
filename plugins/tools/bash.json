@@ -1,0 +1,45 @@
+{
+  "formatVersion": 1,
+  "name": "tool-bash",
+  "version": "0.1.0",
+  "description": "The `bash` tool: one host_process.run of `bash -c`, exit status and output returned as data. Reaches nothing else — and the operator sees the command as argv, not as a shell string buried in a payload.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_process.run"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "bash",
+        "description": "Run a command with bash -c in the workspace and return its exit status, stdout and stderr. Not interactive: nothing is fed to stdin. Each of stdout and stderr is cut at 262144 bytes and the result marked as truncated when either was. A nonzero exit status marks the result as an error.",
+        "parameters": {
+          "type": "object",
+          "required": ["command"],
+          "additionalProperties": false,
+          "properties": {
+            "command": { "type": "string", "description": "The command line, as bash would read it." },
+            "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "description": "Wall-clock limit (default 120000). On expiry the process group is killed and the call fails." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "run",
+          "type": "host_process.run",
+          "params": {
+            "argv": ["bash", "-c", "{{$input.command}}"],
+            "timeout_ms": "{{$input.timeout_ms ?? 120000}}",
+            "max_output_bytes": 262144
+          }
+        },
+        {
+          "id": "answer",
+          "type": "return",
+          "params": { "value": {
+            "content": "exit status: {{$steps.run.result.status ?? 'killed by signal'}}\n\nstdout:\n{{$steps.run.result.stdout}}\nstderr:\n{{$steps.run.result.stderr}}",
+            "is_error": "{{$steps.run.result.status != 0}}",
+            "truncated": "{{$steps.run.result.stdout_truncated || $steps.run.result.stderr_truncated}}"
+          } }
+        }
+      ]
+    }
+  }
+}
