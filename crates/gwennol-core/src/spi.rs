@@ -33,6 +33,30 @@ pub mod tool {
     /// The contract document, as shipped. Canonical file:
     /// `plugins/spi/tool.json`; see [`super::llm_chat::DEFINITION`].
     pub const DEFINITION: &str = include_str!("../resources/spi/tool.json");
+
+    /// The one line appended to a truncated result's `content` before
+    /// the model sees it — the shared truncation convention of
+    /// `docs/SPI.md`. Tools report `truncated: true` as data and never
+    /// compose this themselves; [`render_content`] is where it lands.
+    pub const TRUNCATED_MARKER: &str = "[output truncated]";
+
+    /// A `call` result's `content` as the model should see it: verbatim,
+    /// plus [`TRUNCATED_MARKER`] on its own final line when the tool
+    /// reported a cut. The one implementation of the convention — the
+    /// milestone-5 loop renders through here, and so do the tests that
+    /// pin the bundled tools to it.
+    pub fn render_content(content: &str, truncated: bool) -> String {
+        if !truncated {
+            return content.to_string();
+        }
+        let mut rendered = String::with_capacity(content.len() + TRUNCATED_MARKER.len() + 1);
+        rendered.push_str(content);
+        if !content.is_empty() && !content.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered.push_str(TRUNCATED_MARKER);
+        rendered
+    }
 }
 
 /// Every bundled contract as `(role, definition)`, in registration order.
@@ -119,6 +143,23 @@ pub fn harvest_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_truncation_marker_lands_on_its_own_final_line() {
+        use tool::{TRUNCATED_MARKER, render_content};
+        assert_eq!(render_content("whole", false), "whole");
+        assert_eq!(
+            render_content("cut", true),
+            format!("cut\n{TRUNCATED_MARKER}")
+        );
+        // A prefix that already ends a line is not given a blank one.
+        assert_eq!(
+            render_content("cut\n", true),
+            format!("cut\n{TRUNCATED_MARKER}")
+        );
+        // Nothing kept at all still tells the model why.
+        assert_eq!(render_content("", true), TRUNCATED_MARKER);
+    }
 
     /// The name of a contract's canonical file under `plugins/spi/`,
     /// by convention: the role, lowercased.

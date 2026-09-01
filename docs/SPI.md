@@ -102,14 +102,27 @@ alike — and open beyond its two required fields: a provider may add its
 own counters (cache reads, say), and consumers must tolerate and may
 ignore them.
 
-A buffered turn that fails — the request never succeeded, there is no
-message — is an ordinary step error. A structured taxonomy for those
-failures (which are retryable, which are misconfiguration) is deliberately
-deferred to milestone 4, when a real provider exists to inform it; until
-it lands, the loop must treat provider step errors as uniformly fatal to
-the turn and **must not** infer meaning from error-message text. The
-streamed path does not wait for that taxonomy: its `error` event already
-carries `retryable`, because a stream failure leaves no other channel.
+### Failure, buffered — settled
+
+Settled in milestone 4, with a real provider to inform it. The buffered
+form has a third shape, `{"error": {"message", "retryable"?, "kind"?}}`
+— the same three fields the stream's `error` event carries — for a
+turn the vendor answered and refused: a non-2xx status, or an error
+document in place of a message. The provider fills `retryable` from
+what it knows of its own API (rate limits, overload and transient
+server errors are worth repeating unchanged; authentication,
+malformed-request and not-found answers will fail again) and `kind`
+with the vendor's own class identifier. Consumers branch on
+`retryable` and nothing else: `kind` and `message` are informational.
+
+What stays a step error is exactly what the provider could not classify
+without reading error text: the transport failed before any answer
+arrived, the operator denied the egress, the kernel refused the step. A
+step error from a provider is uniformly fatal to the turn — the loop
+must not retry it, and **must not** infer meaning from its message.
+That is the same line the `TOOL` contract draws below: an outcome the
+caller should react to arrives as data, or it is an error nobody should
+parse.
 
 ### Response, streamed
 
@@ -175,10 +188,27 @@ wrapped `host_fs.read` in `try` could separate "file not found" from "the
 operator said no" only by matching English error text, and a denial that
 slipped the match would become `is_error: true`, exactly the masquerade
 forbidden above. The rule is therefore: **an outcome the model should
-react to must arrive as data, not as an error** — `host_process.run`
-already returns a nonzero exit status as data, and milestone 4 extends
-the host steps where needed (a `host_fs.read` miss, say) rather than
-letting any tool match on error strings.
+react to must arrive as data, not as an error**. Settled in milestone 4
+at the host-step layer: every `host_fs` step reports the answers a model
+can act on — `not_found`, `is_directory`, `not_a_directory`,
+`permission_denied` — as a result whose `outcome` names them, with a
+one-line `message` fit to hand over verbatim, and `host_process.run`
+already returned a nonzero exit status as data. A bundled tool branches
+on `outcome` and never wraps a host step in `try`; the string path is
+left to the failures it is for.
+
+### Truncation — settled
+
+A tool that cut its output says so as data: `truncated: true` on the
+result, with `content` the prefix it kept. The tool never appends a
+marker itself — composing one declaratively would mean a branch per
+truncatable field, and four tools would grow four spellings. The caller
+renders the one shared marker, `gwennol_core::spi::tool::TRUNCATED_MARKER`,
+onto the end of `content` before the model sees it —
+`spi::tool::render_content` is the single implementation — so the model
+learns "this is a prefix" in one fixed form whichever tool produced it.
+A tool composed of several capped steps reports `truncated` when any of
+them was cut.
 
 ### How a tool's schema reaches the model — settled
 
@@ -289,6 +319,5 @@ milestones 3–7.
   wire.
 - **Non-text tool results.** `content` is a UTF-8 string. Binary output
   is the tool's problem (lossy conversion, or refusing); image results
-  are a later block-type change. A shared convention for signalling
-  truncation inside `content` is milestone 4's to write, so its four
-  tools agree.
+  are a later block-type change. Truncation is signalled as data
+  (`truncated`, above), never inside `content`.

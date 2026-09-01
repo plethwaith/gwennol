@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "name": "TOOL",
   "displayName": "Model-callable tool",
-  "version": "0.1.0",
-  "description": "A tool the model can call. One required action, `call`: the model's arguments in, one uniform result out. The tool's name, description and argument schema are NOT declared here — they live in the `tool` block on the implementing plugin's `call` action, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the action name and the result shape.",
+  "version": "0.2.0",
+  "description": "A tool the model can call. One required action, `call`: the model's arguments in, one uniform result out. The tool's name, description and argument schema are NOT declared here — they live in the `tool` block on the implementing plugin's `call` action, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the action name and the result shape — including how a tool says its output was cut (`truncated`, rendered into `content` for the model by the caller, never by the tool).",
   "actions": {
     "call": {
       "description": "Execute the tool once with model-supplied arguments.",
@@ -24,6 +24,11 @@
             "type": "boolean",
             "default": false,
             "description": "True when `content` describes a failure the model should react to (file not found, command failed). Infrastructure failures are step errors, not `is_error` results."
+          },
+          "truncated": {
+            "type": "boolean",
+            "default": false,
+            "description": "True when `content` is a prefix of what the tool would otherwise have returned — a capped file read, capped process output. Data, not prose: the tool never appends a marker to `content` itself. The caller renders the one shared marker (`gwennol_core::spi::tool::TRUNCATED_MARKER`) before the model sees the result, so every tool signals a cut the same way and no tool has to compose it declaratively."
           }
         }
       }
