@@ -121,9 +121,9 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         let event = json!({
             "type": "error",
             "message": message,
-            // Timeouts, rate limits and server-side failures are worth
-            // repeating unchanged; the other 4xx will fail again.
-            "retryable": matches!(status, 408 | 429) || (500..=599).contains(&status),
+            // The shared classifier: this fixture and the real provider
+            // must answer alike, since the loop's retry policy keys on it.
+            "retryable": gwennol_guest::retryable_http_status(status),
         });
         let _ = emit(&output, &event)?; // reader-gone changes nothing here
         upstream.close();

@@ -68,11 +68,15 @@ const ERROR_BODY_CAP: usize = 4096;
 /// `chat` — the plain action's entry point.
 fn chat(args: Args) -> Result<Value, String> {
     let request = wire::build_request(args.raw(), args.config())?;
+    // The endpoint is computed here (trailing slashes and proxy path
+    // prefixes normalised) and handed to the fetching action as input;
+    // which host it may reach is the manifest's egress grant, not this.
+    let url = wire::messages_url(args.config())?;
     if request.stream {
         let stream = invoke_streaming(
             Target::Plugin(PLUGIN_NAME),
             STREAM_ACTION,
-            &json!({ "request": request.body }),
+            &json!({ "url": url, "request": request.body }),
         )?;
         // The handle was minted in this invocation's stream table, so it
         // is exactly what the contract's streamed output form carries.
@@ -81,7 +85,7 @@ fn chat(args: Args) -> Result<Value, String> {
     let answer = invoke(
         Target::Plugin(PLUGIN_NAME),
         FETCH_ACTION,
-        &json!({ "request": request.body }),
+        &json!({ "url": url, "request": request.body }),
     )?;
     let status = answer
         .get("status")

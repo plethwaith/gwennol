@@ -181,7 +181,8 @@ written, and it must be settled before a provider exists.
 - **Not in scope:** the loop; any frontend.
 - **Settled: outcomes are data.** Every `host_fs` step reports the
   answers a model can act on — `not_found`, `is_directory`,
-  `not_a_directory`, `permission_denied` — as a result whose `outcome`
+  `not_a_directory`, `permission_denied`, a write's `is_symlink` — as a
+  result whose `outcome`
   names them, with a one-line `message`; a miss is still approved first,
   under the path canonical to its deepest existing ancestor. The four
   tools are declarative — one host step and a branch on its outcome —
@@ -198,12 +199,16 @@ written, and it must be settled before a provider exists.
   `{"path": "crates/<name>"}`, a form the kernel refuses; `cargo xtask
   bundle` compiles the crate and fills the slot, the integration suite
   bundles through the same code, and no blob is ever committed.
-- **Provider notes.** `provider-anthropic` sends `thinking: {"type":
-  "disabled"}` unless `.thinking` says otherwise, because the
-  contract carries no thinking blocks to replay (a known exclusion); a
-  turn with thinking enabled keeps its text and tool calls and drops the
-  rest. `pause_turn`, unknown stop reasons and missing usage counters
-  are failures, never guesses.
+- **Provider notes.** `provider-anthropic` sends no `thinking` field
+  unless `$config.thinking` supplies one: absence is the setting every
+  current model accepts, where an explicit `disabled` is refused by the
+  models that cannot turn thinking off. The contract carries no thinking
+  blocks (a known exclusion), so a turn that produced them keeps its
+  text and tool calls and drops the rest — and whether the vendor
+  accepts the replayed history without them is what the live smoke test
+  must establish before the loop relies on tool use; if it refuses, the
+  exclusion is what to reopen. `pause_turn`, unknown stop reasons and
+  missing usage counters are failures, never guesses.
 
 ### 5. Agent loop
 

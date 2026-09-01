@@ -31,10 +31,17 @@
 //! other way: unknown SSE event types, delta types and content-block
 //! types are documented as safe to ignore, and are. Thinking blocks are
 //! the one known kind ignored on purpose: the contract carries no block
-//! for them (a known exclusion), so a deployment that enables thinking
-//! through `$config.thinking` gets its text and tool calls and nothing
-//! else — and must expect the vendor to refuse a later tool-use turn
-//! whose replayed history lacks them.
+//! for them (a known exclusion), so a turn that produced them keeps its
+//! text and tool calls and nothing else. The request sends no
+//! `thinking` field unless `$config.thinking` supplies one — absence is
+//! the setting every current model accepts, where an explicit
+//! `disabled` is refused by the models that cannot turn thinking off —
+//! which means thinking is *on* by the vendor's default on current
+//! models, and a later tool-use turn replays a history without the
+//! blocks the vendor produced. Whether the vendor accepts that history
+//! is exactly what the live smoke test the roadmap calls for must
+//! establish; if it refuses, the contract's exclusion is the thing to
+//! reopen, not this default.
 
 use std::collections::HashMap;
 
@@ -68,16 +75,41 @@ pub struct Request {
     pub stream: bool,
 }
 
+/// The API origin used when `$config.base_url` is absent.
+pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// The Messages API endpoint for a `$config`: `base_url` (default
+/// [`DEFAULT_BASE_URL`]), trailing slashes dropped, plus
+/// `/v1/messages`. Built here rather than templated in the manifest so
+/// a `base_url` with a trailing slash — or a path prefix, for a proxy —
+/// does not yield `//v1/messages`; the host the request reaches is
+/// still pinned by the manifest's `network:egress` grant, not by this.
+pub fn messages_url(config: &Value) -> Result<String, String> {
+    let base = match config.get("base_url") {
+        None | Some(Value::Null) => DEFAULT_BASE_URL,
+        Some(Value::String(s)) => s.as_str(),
+        Some(other) => return Err(format!("config.base_url must be a string, got {other}")),
+    };
+    let base = base.trim_end_matches('/');
+    if !(base.starts_with("https://") || base.starts_with("http://")) {
+        return Err(format!(
+            "config.base_url must be an http(s) origin, got {base:?}"
+        ));
+    }
+    Ok(format!("{base}/v1/messages"))
+}
+
 /// Build the Messages API request for one `chat` input.
 ///
 /// `input` is the step's resolution context (the `chat` input fields
 /// flattened at its root); `config` is the plugin's `$config`. Config
 /// keys: `model`, `max_tokens`, `thinking` (a Messages API `thinking`
-/// object, default `{"type": "disabled"}` because the contract cannot
-/// replay thinking blocks), and `extra` — an object shallow-merged into
-/// the request for any key the provider did not itself set, the
-/// contract's sanctioned place for sampling knobs and vendor features
-/// it deliberately does not carry.
+/// object, sent verbatim; absent means the field is not sent and the
+/// model's own default applies — see the module docs for what that
+/// costs the contract), and `extra` — an object shallow-merged into the
+/// request for any key the provider did not itself set, the contract's
+/// sanctioned place for sampling knobs and vendor features it
+/// deliberately does not carry.
 pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     let messages = match input.get("messages") {
         Some(Value::Array(m)) if !m.is_empty() => Value::Array(m.clone()),
@@ -115,17 +147,21 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
             _ => return Err(format!("max_tokens must be a positive integer, got {v}")),
         },
     };
-    let thinking = match config.get("thinking") {
-        None | Some(Value::Null) => json!({ "type": "disabled" }),
-        Some(v @ Value::Object(_)) => v.clone(),
-        Some(other) => return Err(format!("config.thinking must be an object, got {other}")),
-    };
-
     let mut body = Map::new();
     body.insert("model".into(), Value::String(model));
     body.insert("max_tokens".into(), json!(max_tokens));
     body.insert("stream".into(), Value::Bool(stream));
-    body.insert("thinking".into(), thinking);
+    // `thinking` is sent only when config says: the field's absence is
+    // the one setting every current model accepts (adaptive where it
+    // is on by default, off where it is off), whereas an explicit
+    // `disabled` is a 400 on the models that cannot turn it off.
+    match config.get("thinking") {
+        None | Some(Value::Null) => {}
+        Some(v @ Value::Object(_)) => {
+            body.insert("thinking".into(), v.clone());
+        }
+        Some(other) => return Err(format!("config.thinking must be an object, got {other}")),
+    }
     body.insert("messages".into(), messages);
     if let Some(system) = input.get("system") {
         match system {
@@ -217,12 +253,7 @@ impl Failure {
     }
 }
 
-/// Whether an HTTP status is worth repeating unchanged: timeouts,
-/// contention, rate limits and server-side failures are; every other
-/// client error will fail again.
-fn retryable_status(status: i64) -> bool {
-    matches!(status, 408 | 409 | 429) || (500..=599).contains(&status)
-}
+use gwennol_guest::retryable_http_status as retryable_status;
 
 /// Whether a Messages API `error.type` is worth repeating unchanged,
 /// where the documented types say; `None` for one this crate does not
@@ -693,7 +724,10 @@ mod tests {
         assert_eq!(r.body["model"], DEFAULT_MODEL);
         assert_eq!(r.body["max_tokens"], DEFAULT_MAX_TOKENS_STREAMED);
         assert_eq!(r.body["stream"], true);
-        assert_eq!(r.body["thinking"], json!({"type": "disabled"}));
+        assert!(
+            r.body.get("thinking").is_none(),
+            "no thinking field unless config says: absent is what every model accepts"
+        );
         assert_eq!(r.body["system"], "be brief");
         assert_eq!(r.body["messages"], input(true)["messages"]);
         assert_eq!(r.body["tools"], input(true)["tools"]);
@@ -731,6 +765,26 @@ mod tests {
         with_max["max_tokens"] = json!(7);
         let r = build_request(&with_max, &config).unwrap();
         assert_eq!(r.body["max_tokens"], 7);
+    }
+
+    #[test]
+    fn the_endpoint_tolerates_trailing_slashes_and_path_prefixes() {
+        assert_eq!(
+            messages_url(&json!({})).unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url(&json!({"base_url": "https://api.anthropic.com/"})).unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url(&json!({"base_url": "http://127.0.0.1:8080/proxy//"})).unwrap(),
+            "http://127.0.0.1:8080/proxy/v1/messages"
+        );
+        let err = messages_url(&json!({"base_url": "api.anthropic.com"})).unwrap_err();
+        assert!(err.contains("http(s)"), "{err}");
+        let err = messages_url(&json!({"base_url": 7})).unwrap_err();
+        assert!(err.contains("config.base_url"), "{err}");
     }
 
     #[test]

@@ -13,9 +13,9 @@
   "configSchema": {
     "userFields": [
       { "key": "model", "type": "string", "required": false, "defaultValue": "claude-opus-5", "description": "Messages API model id." },
-      { "key": "base_url", "type": "string", "required": false, "defaultValue": "https://api.anthropic.com", "description": "API origin. Any host other than api.anthropic.com also needs its own network:egress grant on this manifest." },
+      { "key": "base_url", "type": "string", "required": false, "defaultValue": "https://api.anthropic.com", "description": "API origin, optionally with a path prefix for a proxy; trailing slashes are dropped. Any host other than api.anthropic.com also needs its own network:egress grant on this manifest." },
       { "key": "max_tokens", "type": "integer", "required": false, "description": "Default max_tokens when the chat input names none: 16384 buffered, 65536 streamed." },
-      { "key": "thinking", "type": "object", "required": false, "description": "A Messages API `thinking` object, sent verbatim. Default {\"type\": \"disabled\"}: the LLM_CHAT contract carries no thinking blocks, so a turn with thinking enabled loses them and the vendor may refuse the next tool-use turn." },
+      { "key": "thinking", "type": "object", "required": false, "description": "A Messages API `thinking` object, sent verbatim. Absent by default: no `thinking` field is sent and the model's own default applies (on, for current models). The LLM_CHAT contract carries no thinking blocks, so a turn that produced them keeps only its text and tool calls; an explicit {\"type\": \"disabled\"} is refused by models that cannot turn thinking off." },
       { "key": "extra", "type": "object", "required": false, "description": "Shallow-merged into the request body for keys the provider did not set itself — sampling knobs, betas-by-body, and other vendor features the contract deliberately leaves to config." },
       { "key": "timeout_ms", "type": "integer", "required": false, "defaultValue": 600000, "description": "Buffered turn: budget for the whole response (clamped by the host to 1 hour)." },
       { "key": "idle_timeout_ms", "type": "integer", "required": false, "defaultValue": 120000, "description": "Streamed turn: longest gap allowed between chunks." }
@@ -35,13 +35,13 @@
       ]
     },
     "fetch_turn": {
-      "description": "A buffered Messages API request. Input: {request}. Output: {status, body, truncated} for the guest to translate.",
+      "description": "A buffered Messages API request. Input: {url, request}, both built by the guest — the URL from $config.base_url with trailing slashes dropped; which host it may reach is the network:egress grant above, not the input. Output: {status, body, truncated} for the guest to translate.",
       "steps": [
         {
           "id": "fetch",
           "type": "host_http.post",
           "params": {
-            "url": "{{$config.base_url ?? 'https://api.anthropic.com'}}/v1/messages",
+            "url": "{{$input.url}}",
             "headers": {
               "x-api-key": "{{$secrets.api_key}}",
               "anthropic-version": "2023-06-01",
@@ -64,14 +64,14 @@
       ]
     },
     "stream_turn": {
-      "description": "A streamed Messages API request relayed as contract NDJSON. Input: {request}. The relay's output is the stream handle chat returns.",
+      "description": "A streamed Messages API request relayed as contract NDJSON. Input: {url, request}, as for fetch_turn. The relay's output is the stream handle chat returns.",
       "dataflow": true,
       "steps": [
         {
           "id": "fetch",
           "type": "host_http.post",
           "params": {
-            "url": "{{$config.base_url ?? 'https://api.anthropic.com'}}/v1/messages",
+            "url": "{{$input.url}}",
             "headers": {
               "x-api-key": "{{$secrets.api_key}}",
               "anthropic-version": "2023-06-01",

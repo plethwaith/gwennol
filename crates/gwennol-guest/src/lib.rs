@@ -114,6 +114,16 @@ pub fn log(level: Level, message: &str) {
     sys::host_log(level.code(), message.as_bytes());
 }
 
+/// Whether an HTTP status is worth repeating unchanged — the one
+/// answer every guest that fills the contract's `retryable` from a
+/// status gives, so two guests cannot disagree about a 409. Timeouts
+/// (408), contention (409), rate limits (429) and server-side failures
+/// (5xx) are worth a retry; every other client error will fail again.
+/// The same set the vendor SDKs retry on.
+pub fn retryable_http_status(status: i64) -> bool {
+    matches!(status, 408 | 409 | 429) || (500..=599).contains(&status)
+}
+
 /// Whether the parent step's cancellation token has fired.
 ///
 /// Long-running loops should poll this between chunks and wind down
