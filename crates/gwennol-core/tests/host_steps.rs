@@ -524,29 +524,100 @@ async fn fs_read_shows_the_operator_where_a_symlink_really_leads() {
     );
 }
 
+/// A symlink destination is never written through or replaced — and
+/// since the model can act on that, it is an `is_symlink` outcome, not
+/// a step error. The probe is approved first, under the link's own name
+/// (its parent canonical): the operator sees what was asked for, never
+/// a write to the target that will not happen.
 #[cfg(unix)]
 #[tokio::test]
-async fn fs_write_refuses_a_symlink_destination() {
+async fn fs_write_reports_a_symlink_destination_as_data_after_asking() {
     let f = fixture();
-    let outside = tempfile::tempdir().unwrap().keep();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
     std::fs::write(outside.join("target.txt"), "untouched").unwrap();
     std::os::unix::fs::symlink(outside.join("target.txt"), f.workspace.join("sly.txt")).unwrap();
-    let err = run(
-        "writer",
-        json!({"path": "sly.txt", "content": "overwritten", "dir": "."}),
+    let out = run(
+        "plain_writer",
+        json!({"path": "sly.txt", "content": "overwritten"}),
     )
     .await
-    .unwrap_err();
-    assert!(err.to_string().contains("symlink"), "{err}");
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "is_symlink");
+    assert!(out["w"]["message"].as_str().unwrap().contains("symlink"));
     assert_eq!(
         std::fs::read_to_string(outside.join("target.txt")).unwrap(),
         "untouched",
         "the write escaped through the link"
     );
     assert!(
-        !f.requests_for("writer")
-            .contains(&Access::WriteFile(f.workspace.join("sly.txt"))),
-        "the operator was asked about a write the host must refuse itself"
+        std::fs::symlink_metadata(f.workspace.join("sly.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced"
+    );
+    let asked = f.requests_for("plain_writer");
+    assert!(
+        asked.contains(&Access::WriteFile(f.workspace.join("sly.txt"))),
+        "the probe was not approved under the link's own name: {asked:?}"
+    );
+    assert!(
+        !asked.contains(&Access::WriteFile(outside.join("target.txt"))),
+        "the operator was shown a write to the target that will not happen: {asked:?}"
+    );
+}
+
+/// With `create_dirs`, a parent that exists as a regular file is "not a
+/// directory" — `create_dir_all` reports it as AlreadyExists, which is
+/// not an outcome by itself, so the step has to say what it means.
+#[tokio::test]
+async fn fs_write_reports_a_file_where_a_parent_directory_is_needed_as_data() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("blocking-file"), "x").unwrap();
+    let out = run(
+        "writer",
+        json!({"path": "blocking-file/below.txt", "content": "z", "dir": "."}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "not_a_directory");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("blocking-file")).unwrap(),
+        "x"
+    );
+}
+
+/// An ancestor the agent's user may not search: the open already said
+/// permission denied, and the probe's canonicalisation must not turn
+/// that back into a step error on the way to the operator.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_read_reports_an_unsearchable_ancestor_as_permission_denied() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let dir = f.workspace.join("sealed");
+    std::fs::create_dir_all(dir.join("inner")).unwrap();
+    std::fs::write(dir.join("inner/file.txt"), "x").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(dir.join("inner/file.txt")).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: this user (root?) searches a mode-000 directory anyway");
+        return;
+    }
+    let out = run(
+        "reader",
+        json!({"path": "sealed/inner/file.txt", "max_bytes": 10}),
+    )
+    .await;
+    // Restore before asserting so a failure does not leave an
+    // unremovable tempdir behind.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = out.expect("not a step error");
+    assert_eq!(out["r"]["outcome"], "permission_denied");
+    assert!(
+        f.requests_for("reader")
+            .contains(&Access::ReadFile(dir.join("inner/file.txt"))),
+        "asked before answering, with the unsearchable part spelled as given"
     );
 }
 

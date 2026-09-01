@@ -19,7 +19,9 @@ pub enum Access {
     /// up to its deepest existing ancestor, the rest spelled as given.
     ReadFile(PathBuf),
     /// Create or overwrite a file. The path is canonical up to its deepest
-    /// existing ancestor; a symlink destination is refused before asking.
+    /// existing ancestor. A symlink destination is never written; the
+    /// probe is still approved, under the link's own name with its parent
+    /// canonical, before the plugin learns the path is a link.
     WriteFile(PathBuf),
     /// List a directory, named by its canonical path — or, for a probe
     /// of a directory that is not there, canonical up to its deepest

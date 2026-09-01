@@ -191,8 +191,9 @@ forbidden above. The rule is therefore: **an outcome the model should
 react to must arrive as data, not as an error**. Settled in milestone 4
 at the host-step layer: every `host_fs` step reports the answers a model
 can act on — `not_found`, `is_directory`, `not_a_directory`,
-`permission_denied` — as a result whose `outcome` names them, with a
-one-line `message` fit to hand over verbatim, and `host_process.run`
+`permission_denied`, and for a write `is_symlink` — as a result whose
+`outcome` names them, with a one-line `message` fit to hand over
+verbatim, and `host_process.run`
 already returned a nonzero exit status as data. A bundled tool branches
 on `outcome` and never wraps a host step in `try`; the string path is
 left to the failures it is for.

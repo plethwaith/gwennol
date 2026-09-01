@@ -64,9 +64,9 @@
           {
             "type": "object",
             "required": ["outcome", "message"],
-            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, or permission denied. Nothing was written.",
+            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, permission denied, or a symlink (never written through or replaced). Nothing was written.",
             "properties": {
-              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied"] },
+              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied", "is_symlink"] },
               "message": { "type": "string" }
             }
           }

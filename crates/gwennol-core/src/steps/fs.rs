@@ -60,6 +60,10 @@ pub enum Outcome {
     NotADirectory,
     /// The agent's user may not do this.
     PermissionDenied,
+    /// A write destination is a symlink, which the host refuses to
+    /// write through or replace (the approved path would not name where
+    /// the bytes land, and the rename would destroy the link).
+    IsSymlink,
 }
 
 impl Outcome {
@@ -82,6 +86,7 @@ impl Outcome {
             Outcome::IsDirectory => "is_directory",
             Outcome::NotADirectory => "not_a_directory",
             Outcome::PermissionDenied => "permission_denied",
+            Outcome::IsSymlink => "is_symlink",
         }
     }
 
@@ -94,6 +99,9 @@ impl Outcome {
             Outcome::IsDirectory => format!("is a directory: {path}"),
             Outcome::NotADirectory => format!("not a directory: {path}"),
             Outcome::PermissionDenied => format!("permission denied: {path}"),
+            Outcome::IsSymlink => {
+                format!("is a symlink, which the host will not write through or replace: {path}")
+            }
         };
         json!({"outcome": self.name(), "message": message}).into()
     }
@@ -177,8 +185,8 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                 let Some(outcome) = Outcome::classify(&e) else {
                     return Err(StepError::Failed(format!("read {}: {e}", path.display())));
                 };
-                let probed = canonicalize_missing(&path)
-                    .await
+                let probed = or_cancelled(&cancel, canonicalize_missing(&path))
+                    .await?
                     .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
                 let ask = approval(&*ex, Access::ReadFile(probed));
                 approve(ask).await.map_err(StepError::Failed)?;
@@ -250,13 +258,18 @@ async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
                 }
                 return Ok(canonical);
             }
-            // A component that exists but is not a directory ends the
-            // walk the same way a missing one does: what lies below it
-            // cannot be canonicalised, only spelled.
+            // A component that exists but is not a directory, or one
+            // the agent's user may not search, ends the walk the same
+            // way a missing one does: what lies below it cannot be
+            // canonicalised, only spelled — and the step is about to
+            // report the outcome as data, so the approval must not be
+            // the thing that turns it back into an error.
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
                 ) =>
             {
                 rest.push(
@@ -337,12 +350,14 @@ async fn fill_temp(
 
 /// `host_fs.write`: `{path, content, create_dirs?}` → `{outcome: "ok",
 /// bytes_written}`, or `{outcome, message}` when the destination cannot
-/// take the file (a missing parent without `create_dirs`, a directory in
-/// the way, permission denied).
+/// take the file (a missing parent without `create_dirs`, a directory or
+/// a non-directory in the way, permission denied, a symlink).
 ///
-/// A symlink destination is refused before the operator is asked, and the
-/// approved path is canonical up to its deepest existing ancestor — so the
-/// operator judges where the bytes will actually land, not an alias.
+/// A symlink destination is never written through or replaced — the
+/// outcome is `is_symlink`, approved as a probe under the link's own
+/// name — and otherwise the approved path is canonical up to its deepest
+/// existing ancestor, so the operator judges where the bytes will
+/// actually land, not an alias.
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
@@ -361,16 +376,27 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         };
         let create_dirs = bool_param(&p, "create_dirs", false)?;
         let cancel = ex.cancel_token();
-        // A symlink destination is refused outright: writing through it
+        // A symlink destination is never written: writing through it
         // would land the bytes somewhere the approved path does not name,
-        // and the rename would otherwise silently destroy the link.
+        // and the rename would otherwise silently destroy the link. The
+        // model can act on that (write to the target, or elsewhere), so
+        // it is an outcome, not an error — approved first, like every
+        // probe, under the link's own name with its parent canonical:
+        // resolving the link would show the operator a write to the
+        // target that is precisely what will not happen.
         if let Ok(m) = tokio::fs::symlink_metadata(&path).await
             && m.file_type().is_symlink()
         {
-            return Err(StepError::Failed(format!(
-                "{} is a symlink; refusing to write through or replace it",
-                path.display()
-            )));
+            let parent = path.parent().unwrap_or(&path);
+            let mut probed = or_cancelled(&cancel, canonicalize_missing(parent))
+                .await?
+                .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
+            if let Some(name) = path.file_name() {
+                probed.push(name);
+            }
+            let ask = approval(&*ex, Access::WriteFile(probed));
+            approve(ask).await.map_err(StepError::Failed)?;
+            return Ok(Outcome::IsSymlink.result(&path));
         }
         let canonical = or_cancelled(&cancel, canonicalize_missing(&path))
             .await?
@@ -381,6 +407,13 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
             && let Some(parent) = canonical.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
+            // `create_dir_all` reports a parent that exists as a
+            // non-directory as AlreadyExists, which is not itself an
+            // outcome — but the answer is "not a directory", and the
+            // model can act on it.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(Outcome::NotADirectory.result(parent));
+            }
             return outcome_or_error("mkdir", parent, e);
         }
         // Whether this replaces an existing file decides both the
@@ -463,8 +496,8 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                 let Some(outcome) = Outcome::classify(&e) else {
                     return Err(StepError::Failed(format!("list {}: {e}", path.display())));
                 };
-                let probed = canonicalize_missing(&path)
-                    .await
+                let probed = or_cancelled(&cancel, canonicalize_missing(&path))
+                    .await?
                     .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
                 let ask = approval(&*ex, Access::ListDir(probed));
                 approve(ask).await.map_err(StepError::Failed)?;
