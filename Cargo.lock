@@ -1341,6 +1341,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "provider-anthropic"
+version = "0.1.0-dev"
+dependencies = [
+ "gwennol-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "pulley-interpreter"
 version = "47.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
