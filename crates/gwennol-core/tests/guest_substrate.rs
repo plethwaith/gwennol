@@ -20,7 +20,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gwead::kernel::streams::StreamRegistry;
@@ -39,48 +39,18 @@ use common::{Permissive, assert_conforms, contracts, drain_stream_events};
 // ----------------------------------------------- building the guest
 
 /// Compile the example guest to wasm and return the module bytes,
-/// base64-encoded for the manifest. Built once per test process.
+/// base64-encoded for the manifest. Built once per test process,
+/// through the same bundler `cargo xtask bundle` and the bundled-plugin
+/// suite use — the example is held to the build path real plugins get.
 fn guest_wasm_base64() -> &'static str {
     static WASM: OnceLock<String> = OnceLock::new();
     WASM.get_or_init(|| {
         use base64::Engine as _;
-        let workspace = workspace_root();
-        // A separate target dir: the outer `cargo test` holds the lock
-        // on `target/`, and this dir has its own.
-        let target_dir = workspace.join("target/wasm-guest");
-        let output = std::process::Command::new(env!("CARGO"))
-            .current_dir(&workspace)
-            .args([
-                "build",
-                "-p",
-                PLUGIN,
-                "--target",
-                "wasm32-unknown-unknown",
-                "--release",
-                "--locked",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .output()
-            .expect("cargo is runnable");
-        assert!(
-            output.status.success(),
-            "building the example guest failed (is the target installed? \
-             `rustup target add wasm32-unknown-unknown`):\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let artifact = target_dir.join("wasm32-unknown-unknown/release/sse_guest.wasm");
-        let bytes = std::fs::read(&artifact)
-            .unwrap_or_else(|e| panic!("guest artifact missing at {}: {e}", artifact.display()));
+        let crate_dir = Path::new("crates").join(PLUGIN);
+        let bytes = xtask::build_guest(&xtask::workspace_root(), &crate_dir)
+            .unwrap_or_else(|e| panic!("building the example guest failed: {e}"));
         base64::engine::general_purpose::STANDARD.encode(bytes)
     })
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root resolves")
 }
 
 // ----------------------------------------------------- the manifest

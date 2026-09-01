@@ -6,6 +6,7 @@ members = [
     "crates/gwennol-guest",
     "crates/sse-guest",
     "crates/provider-anthropic",
+    "crates/xtask",
 ]
 
 [workspace.package]

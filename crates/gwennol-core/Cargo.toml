@@ -44,6 +44,12 @@ base64 = "0.22"
 # by `cargo package`.
 gwennol-guest = { path = "../gwennol-guest" }
 sse-guest = { path = "../sse-guest" }
+# The bundled plugins suite builds the committed manifests through the
+# same bundler `cargo xtask bundle` runs, and pins the provider manifest
+# to the names its guest crate exports. Path-only, stripped by
+# `cargo package`.
+xtask = { path = "../xtask" }
+provider-anthropic = { path = "../provider-anthropic" }
 # The same JSON Schema validator Gwead uses for its meta-schemas; here it
 # pins fixture payloads to the SPI contract schemas, which the kernel
 # deliberately never does at dispatch.

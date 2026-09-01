@@ -33,6 +33,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
+      # The documented bundling command, as a user would run it: the
+      # committed manifests plus compiled guests, into target/bundle.
+      - run: cargo xtask bundle
       # A publishable gwennol-core: catches an include_str! (or anything
       # else) reaching outside the crate directory, which builds from the
       # repo but not from the packaged tarball.

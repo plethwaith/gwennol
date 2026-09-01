@@ -803,6 +803,7 @@ dependencies = [
  "gwead",
  "gwennol-guest",
  "nix",
+ "provider-anthropic",
  "reqwest",
  "serde",
  "serde_json",
@@ -812,6 +813,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "xtask",
 ]
 
 [[package]]
@@ -3025,6 +3027,15 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "xtask"
+version = "0.1.0-dev"
+dependencies = [
+ "base64",
+ "serde_json",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "yoke"
