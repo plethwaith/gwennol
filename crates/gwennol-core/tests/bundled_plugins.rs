@@ -290,7 +290,8 @@ fn stub() -> &'static Stub {
         }));
         common::serve(listener, move |mut socket| {
             let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-            let Some((path, headers, body)) = read_request(&mut socket) else {
+            let Some((path, headers, body)) = common::read_http_request_with_headers(&mut socket)
+            else {
                 return;
             };
             let parsed: Value = gwead::serde_json::from_slice(&body)
@@ -343,49 +344,6 @@ fn stub() -> &'static Stub {
         });
         stub
     })
-}
-
-/// Read one request: path, headers (lowercased names), body.
-fn read_request(socket: &mut std::net::TcpStream) -> Option<(String, Value, Vec<u8>)> {
-    use std::io::Read as _;
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = socket.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        raw.extend_from_slice(&buf[..n]);
-    };
-    let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
-    let path = head.split_whitespace().nth(1)?.to_string();
-    let mut headers = gwead::serde_json::Map::new();
-    for line in head.lines().skip(1) {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(
-                name.trim().to_ascii_lowercase(),
-                Value::String(value.trim().to_string()),
-            );
-        }
-    }
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(Value::as_str)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let mut body = raw[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = socket.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        body.extend_from_slice(&buf[..n]);
-    }
-    body.truncate(content_length);
-    Some((path, Value::Object(headers), body))
 }
 
 fn respond(socket: &mut std::net::TcpStream, status: &str, content_type: &str, body: &str) {
@@ -494,11 +452,17 @@ fn every_tool_manifest_declares_exactly_the_host_steps_it_uses() {
             if let Some(t) = step["type"].as_str() {
                 into.insert(t.to_string());
             }
+            // Every nesting Gwead's own walker descends: ifs branches,
+            // try/catch/finally bodies, loop bodies, parallel branches
+            // (each an array of steps).
             for branch in step["params"]["ifs"].as_array().into_iter().flatten() {
                 step_types(&branch["then"], into);
             }
             for key in ["try", "catch", "finally", "steps"] {
                 step_types(&step["params"][key], into);
+            }
+            for branch in step["params"]["branches"].as_array().into_iter().flatten() {
+                step_types(branch, into);
             }
         }
     }
@@ -588,12 +552,35 @@ async fn the_provider_streams_a_turn() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["max_tokens"], 200);
     assert_eq!(body["system"], "You are terse.");
-    assert_eq!(body["thinking"], json!({"type": "disabled"}));
     assert_eq!(body["tools"], f.tools(), "harvested tools, verbatim");
     assert_eq!(
         body["messages"][0]["content"][0]["text"],
         "What does hello.txt say?"
     );
+    assert!(
+        body.get("thinking").is_none(),
+        "no thinking field unless config supplies one"
+    );
+}
+
+/// A `base_url` with a trailing slash still reaches `/v1/messages`,
+/// not `//v1/messages`: the guest builds the endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trailing_slash_on_base_url_does_not_double_the_path() {
+    let f = fixture();
+    let out = f
+        .buffered("/slashed/", opening_input(json!([]), false))
+        .await;
+    assert_eq!(out["stop_reason"], "tool_use");
+    let paths: Vec<String> = {
+        let requests = f.stub.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(p, _, _)| p.starts_with("/slashed"))
+            .map(|(p, _, _)| p.clone())
+            .collect()
+    };
+    assert_eq!(paths, vec!["/slashed/v1/messages".to_string()]);
 }
 
 /// The buffered form: the same turn as a message.
@@ -826,6 +813,72 @@ async fn the_grep_tool_distinguishes_no_matches_from_failure() {
             .as_str()
             .unwrap()
             .starts_with("grep failed (exit status 2)")
+    );
+}
+
+/// grep exits 2 for any file it could not read even when lines were
+/// selected: the matches it did find are the answer, with the files it
+/// could not read noted — not a failure that discards them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_grep_tool_keeps_matches_when_some_files_are_unreadable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let dir = f.workspace.join("mixed");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("open.txt"), "needle here\n").unwrap();
+    std::fs::write(dir.join("locked.txt"), "needle too\n").unwrap();
+    std::fs::set_permissions(
+        dir.join("locked.txt"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    if std::fs::read(dir.join("locked.txt")).is_ok() {
+        eprintln!("skipping: this user (root?) reads a mode-000 file anyway");
+        return;
+    }
+    let out = f
+        .call_tool("grep", json!({"pattern": "needle", "path": "mixed"}))
+        .await;
+    assert_eq!(out["is_error"], false, "{out}");
+    let content = out["content"].as_str().unwrap();
+    assert!(
+        content.contains("mixed/open.txt:1:needle here"),
+        "{content}"
+    );
+    assert!(
+        content.contains("[grep could not read everything]"),
+        "{content}"
+    );
+    assert!(
+        content.contains("locked.txt"),
+        "names the unreadable file: {content}"
+    );
+}
+
+/// `write` onto a symlink is the model's error to see, not a fatal
+/// step error: the host's refusal arrives as data.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_write_tool_reports_a_symlink_destination() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("real-target.txt"), "keep").unwrap();
+    std::os::unix::fs::symlink(
+        f.workspace.join("real-target.txt"),
+        f.workspace.join("alias.txt"),
+    )
+    .unwrap();
+    let out = f
+        .call_tool("write", json!({"path": "alias.txt", "content": "x"}))
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(
+        out["content"].as_str().unwrap().contains("symlink"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("real-target.txt")).unwrap(),
+        "keep"
     );
 }
 

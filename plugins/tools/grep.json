@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "name": "tool-grep",
   "version": "0.1.0",
-  "description": "The `grep` tool: one host_process.run of the system grep, its exit status branched on as data (1 is \"no matches\", not an error). Reaches nothing else.",
+  "description": "The `grep` tool: one host_process.run of the system grep, its exit status branched on as data (1 is \"no matches\", not an error; 2 with matches on stdout is matches plus the files it could not read, since grep exits 2 for any unreadable file even when lines were selected). Reaches nothing else.",
   "roles": ["TOOL"],
   "permissions": ["step_type:host_process.run"],
   "actions": {
@@ -41,6 +41,16 @@
                   "content": "{{$steps.run.result.stdout}}",
                   "is_error": false,
                   "truncated": "{{$steps.run.result.stdout_truncated}}"
+                } } }
+              ]
+            },
+            {
+              "test": "$steps.run.result.status == 2 && $steps.run.result.stdout != ''",
+              "then": [
+                { "id": "partial", "type": "return", "params": { "value": {
+                  "content": "{{$steps.run.result.stdout}}\n[grep could not read everything]\n{{$steps.run.result.stderr}}",
+                  "is_error": false,
+                  "truncated": "{{$steps.run.result.stdout_truncated || $steps.run.result.stderr_truncated}}"
                 } } }
               ]
             },

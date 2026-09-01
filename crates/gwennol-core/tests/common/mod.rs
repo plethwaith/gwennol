@@ -140,6 +140,13 @@ where
 /// swallow. Callers that fear a wedged client should set a read
 /// timeout on the socket first.
 pub fn read_http_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    let (path, _, body) = read_http_request_with_headers(socket)?;
+    Some((path, body))
+}
+
+/// [`read_http_request`], also returning the headers as a JSON object
+/// keyed by lowercased name — for a stub that pins what a plugin sent.
+pub fn read_http_request_with_headers(socket: &mut TcpStream) -> Option<(String, Value, Vec<u8>)> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
     let header_end = loop {
@@ -154,14 +161,19 @@ pub fn read_http_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     };
     let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
     let path = head.split_whitespace().nth(1)?.to_string();
-    let content_length: usize = head
-        .lines()
-        .find_map(|l| {
-            let (name, value) = l.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().ok())?
-        })
+    let mut headers = gwead::serde_json::Map::new();
+    for line in head.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(
+                name.trim().to_ascii_lowercase(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+    }
+    let content_length: usize = headers
+        .get("content-length")
+        .and_then(Value::as_str)
+        .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut body = raw[header_end..].to_vec();
     while body.len() < content_length {
@@ -172,7 +184,7 @@ pub fn read_http_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
         body.extend_from_slice(&buf[..n]);
     }
     body.truncate(content_length);
-    Some((path, body))
+    Some((path, Value::Object(headers), body))
 }
 
 // --------------------------------------------------- stream draining
