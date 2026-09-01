@@ -36,7 +36,10 @@
 //!   allowlist, and prior steps' results.
 //! - [`Stream`] — byte-stream I/O on Gwead stream handles, including
 //!   the pre-provisioned output of a `long_running` step in a
-//!   `dataflow: true` action ([`Stream::output`]).
+//!   `dataflow: true` action ([`Stream::output`]), with NDJSON line
+//!   framing ([`Stream::write_json_line`]) for contract events.
+//! - [`sse`] — an incremental server-sent-events parser, for the
+//!   provider-shaped guests that relay a vendor stream.
 //! - [`invoke`]/[`invoke_streaming`] — dispatch back into the kernel,
 //!   into another action of the same plugin (always permitted) or into
 //!   another plugin or role (gated by the manifest's `invoke:*` grants).
@@ -66,13 +69,14 @@
 mod args;
 mod entry;
 mod invoke;
+pub mod sse;
 mod stream;
 pub mod sys;
 
 pub use args::Args;
 pub use entry::{__alloc_impl, __execute_impl, EntryFn, dispatch};
 pub use invoke::{Target, invoke, invoke_streaming};
-pub use stream::{Stream, StreamError};
+pub use stream::{Delivery, Stream, StreamError};
 
 /// Severity for [`log`], mapped onto the host's `tracing` levels.
 ///
