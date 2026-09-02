@@ -65,6 +65,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
+use gwennol_core::steps::fs::deepest_canonical;
 use gwennol_core::{Access, ApprovalRequest, Decision};
 
 /// What a rule matches against.
@@ -180,14 +181,25 @@ pub enum RuleError {
         /// The rule.
         text: String,
     },
-    /// An `http` pattern without a method in front, or with one that
+    /// An `http` pattern without a method in front, or shaped so it
     /// could never match: the subject is `METHOD URL` with the method
-    /// in upper case, one space between.
+    /// in upper case, one space between, and no space in a URL.
     #[error(
         "rule {text:?}: http needs a method first, as http:POST <url-glob> (or http:* <url-glob>); \
-         methods are upper-case, one space before the URL"
+         methods are upper-case, exactly one space before the URL, and a URL has no spaces"
     )]
     HttpMethod {
+        /// The rule.
+        text: String,
+    },
+    /// A `..` after a glob component. The host folds `..` before it
+    /// asks, so no path it submits contains one, and a pattern that
+    /// keeps one past the point where folding is possible matches
+    /// nothing.
+    #[error(
+        "rule {text:?}: .. after a glob component can never match — the host folds .. before asking"
+    )]
+    DotDotAfterGlob {
         /// The rule.
         text: String,
     },
@@ -258,7 +270,8 @@ impl Rule {
                         .build()
                         .map_err(glob_err)
                 };
-                let rooted = root_pattern(pattern, root);
+                let rooted = root_pattern(pattern, root, kind)
+                    .ok_or_else(|| RuleError::DotDotAfterGlob { text: text.clone() })?;
                 set.add(path_glob(&rooted)?);
                 // `dir/**` is everything under `dir`; the rule also
                 // admits `dir` itself, which is what a listing of the
@@ -313,7 +326,7 @@ impl Rule {
             Access::Spawn { argv, cwd, stdin } => {
                 // Neither is expressible in a spawn rule, so neither
                 // is admitted by one.
-                if stdin.is_some() || cwd != root {
+                if stdin.is_some() || !is_workspace(cwd, root) {
                     return false;
                 }
                 self.matcher.is_match(argv.join(" "))
@@ -335,7 +348,16 @@ fn has_method_prefix(pattern: &str) -> bool {
     };
     let method_ok =
         method == "*" || (!method.is_empty() && method.bytes().all(|b| b.is_ascii_uppercase()));
-    method_ok && !url.is_empty() && !url.starts_with(' ')
+    // A URL has no spaces, so one here — a trailing space from a
+    // quoted flag, say — would only ever admit nothing.
+    method_ok && !url.is_empty() && !url.contains(' ')
+}
+
+/// Whether `cwd` is the workspace root, spelled canonically before
+/// comparing: the root is canonical, and a plugin may name the same
+/// directory through a link.
+fn is_workspace(cwd: &Path, root: &Path) -> bool {
+    deepest_canonical(cwd).as_deref().unwrap_or(cwd) == root
 }
 
 /// A glob over a whole subject line, `*` crossing everything.
@@ -368,11 +390,20 @@ fn is_glob_component(component: &str) -> bool {
 
 /// A path pattern as the host would spell the paths it matches: rooted
 /// at the workspace when relative, and with its literal prefix — every
-/// leading component that is a plain name — canonicalised when that
-/// prefix exists, since the host shows canonical paths and `/tmp` on
-/// some systems is a link to somewhere else. The prefix is then
-/// escaped, so a `[` or `*` in a directory name is not glob syntax.
-fn root_pattern(pattern: &str, root: &Path) -> String {
+/// leading component that is a plain name — spelled by the host's own
+/// walk ([`deepest_canonical`]): the deepest existing ancestor
+/// canonical, the rest as written. `..` folds lexically before the
+/// walk, as the host's path resolution folds it before asking; one
+/// that arrives after a glob component cannot fold and is refused
+/// (`None`), since no path the host submits contains one. The prefix
+/// is then escaped, so a `[` or `*` in a directory name is not glob
+/// syntax.
+///
+/// One exception mirrors the host's: a `write` pattern that is fully
+/// literal and names a symlink is spelled with its parent canonical and
+/// the link's own name, because that is how the host approves a write
+/// to a symlink — which it then refuses to write through.
+fn root_pattern(pattern: &str, root: &Path, kind: Kind) -> Option<String> {
     let mut literal = if Path::new(pattern).is_absolute() {
         PathBuf::from("/")
     } else {
@@ -385,6 +416,9 @@ fn root_pattern(pattern: &str, root: &Path) -> String {
             continue;
         }
         if in_glob || is_glob_component(component) {
+            if component == ".." {
+                return None;
+            }
             in_glob = true;
             rest.push(component);
         } else if component == ".." {
@@ -393,11 +427,15 @@ fn root_pattern(pattern: &str, root: &Path) -> String {
             literal.push(component);
         }
     }
-    // The host's own walk: the deepest existing ancestor canonical,
-    // the rest as spelled — so a pattern naming a file or directory
-    // that does not exist yet still spells the path the host will
-    // submit for it.
-    let literal = gwennol_core::steps::fs::deepest_canonical(&literal).unwrap_or(literal);
+    let literal = if kind == Kind::Write && rest.is_empty() && is_symlink(&literal) {
+        let mut parent = walk(literal.parent().unwrap_or(&literal));
+        if let Some(name) = literal.file_name() {
+            parent.push(name);
+        }
+        parent
+    } else {
+        walk(&literal)
+    };
     let mut out = globset::escape(&literal.to_string_lossy());
     for component in rest {
         if !out.ends_with('/') {
@@ -405,7 +443,24 @@ fn root_pattern(pattern: &str, root: &Path) -> String {
         }
         out.push_str(component);
     }
-    out
+    Some(out)
+}
+
+/// The host's walk, falling back to the spelling given — and saying so,
+/// since an error the walk does not step past (a symlink loop, say)
+/// means the pattern may not spell what the host will.
+fn walk(path: &Path) -> PathBuf {
+    match deepest_canonical(path) {
+        Ok(spelled) => spelled,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "pattern prefix could not be resolved; used as written");
+            path.to_path_buf()
+        }
+    }
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// The policy: every rule, in order, for one workspace.
@@ -482,7 +537,9 @@ impl Policy {
     fn unjudgeable(&self, access: &Access) -> Option<Unjudgeable> {
         match access {
             Access::Spawn { stdin: Some(_), .. } => Some(Unjudgeable::SpawnWithStdin),
-            Access::Spawn { cwd, .. } if cwd != &self.root => Some(Unjudgeable::SpawnElsewhere),
+            Access::Spawn { cwd, .. } if !is_workspace(cwd, &self.root) => {
+                Some(Unjudgeable::SpawnElsewhere)
+            }
             _ if Kind::of(access).is_none() => Some(Unjudgeable::UnknownKind),
             _ => None,
         }
@@ -492,6 +549,8 @@ impl Policy {
 impl fmt::Display for Unjudgeable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            // Not pinned: `Access` is non-exhaustive, and until a sixth
+            // variant exists no test can construct the case.
             Self::UnknownKind => "an access of a kind no rule can name",
             Self::SpawnWithStdin => "a spawn with stdin, which no spawn rule can judge",
             Self::SpawnElsewhere => {
@@ -756,6 +815,82 @@ mod tests {
     }
 
     #[test]
+    fn dot_dot_folds_lexically_not_physically() {
+        // A link whose target sits under another parent tells the two
+        // apart: lexically `link/..` is the workspace, physically it
+        // would be `other/`. The host folds before it asks.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("other/target")).unwrap();
+        std::os::unix::fs::symlink(root.join("other/target"), root.join("link")).unwrap();
+        let p =
+            Policy::compile(vec![flag(Decision::Allow, "read:link/../x/*.txt")], &root).unwrap();
+        let lexical = request("tool-read", Access::ReadFile(root.join("x/a.txt")));
+        assert_eq!(p.judge(&lexical).decision, Decision::Allow);
+        let physical = request("tool-read", Access::ReadFile(root.join("other/x/a.txt")));
+        assert_eq!(p.judge(&physical).decision, Decision::Deny);
+        // Past a glob component nothing can fold, and no path the host
+        // submits keeps a `..`: refused rather than dead.
+        let err = Rule::compile(
+            flag(Decision::Allow, "read:src/*/../notes.txt"),
+            Path::new("/ws"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(".. after a glob component"), "{err}");
+    }
+
+    #[test]
+    fn a_literal_write_rule_naming_a_symlink_spells_it_as_the_host_does() {
+        // The host approves a write to a symlink under the link's own
+        // name with its parent canonical — and then refuses to write
+        // through it. A pattern resolving the link to its target would
+        // deny that approval for a write that never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/target.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real/target.txt"), root.join("lnk")).unwrap();
+        let p = Policy::compile(
+            vec![
+                flag(Decision::Allow, "write:lnk"),
+                // A read of the same link is judged at the target,
+                // which is where the host reads from.
+                flag(Decision::Allow, "read:lnk"),
+            ],
+            &root,
+        )
+        .unwrap();
+        let as_link = request("tool-write", Access::WriteFile(root.join("lnk")));
+        assert_eq!(p.judge(&as_link).decision, Decision::Allow);
+        let as_target = request(
+            "tool-write",
+            Access::WriteFile(root.join("real/target.txt")),
+        );
+        assert_eq!(p.judge(&as_target).decision, Decision::Deny);
+        let read_target = request("tool-read", Access::ReadFile(root.join("real/target.txt")));
+        assert_eq!(p.judge(&read_target).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn a_spawn_cwd_that_aliases_the_workspace_is_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let p = Policy::compile(vec![flag(Decision::Allow, "spawn:*")], &root).unwrap();
+        let via_alias = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: alias,
+                stdin: None,
+            },
+        );
+        assert_eq!(p.judge(&via_alias).decision, Decision::Allow);
+    }
+
+    #[test]
     fn glob_syntax_in_the_workspace_path_is_literal() {
         let root = Path::new("/ws[1]/*star");
         let p = Policy::compile(vec![flag(Decision::Allow, "read:**")], root).unwrap();
@@ -878,6 +1013,7 @@ mod tests {
             "http:https://api.anthropic.com/*",
             "http:post https://api.anthropic.com/*",
             "http:POST  https://api.anthropic.com/*",
+            "http:POST https://api.anthropic.com/* ",
             "http:POST ",
             "http: https://x/*",
         ] {

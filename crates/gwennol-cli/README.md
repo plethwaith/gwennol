@@ -81,7 +81,13 @@ alone. The host judges canonical paths, so a pattern's literal prefix
 the host spells a path: its deepest existing ancestor canonical, the
 rest as written. `write:/tmp/**` means what `/tmp` resolves to (on
 macOS, `/private/tmp`), and `write:link/new/**` the link's target
-plus `new`, whether or not `new` exists yet.
+plus `new`, whether or not `new` exists yet. One exception mirrors the
+host's: a fully literal `write:` rule naming a symlink means the link
+itself, because the host approves a write to a symlink under the
+link's own name and then refuses to write through it. `..` folds
+before any of this, as the host folds it; a `..` after a glob
+component, like a space inside an `http` URL, could never match and
+is refused rather than left dead.
 
 For `spawn` and `http` the pattern matches the whole subject and `*`
 matches anything — including everything after it. **An argv rule

@@ -118,6 +118,28 @@ struct Run {
     stderr: String,
 }
 
+/// The binary with stderr merged into stdout, through a shell, so the
+/// order between the two streams is observable: both are flushed per
+/// line or per round, and one pipe keeps the sequence.
+fn merged(cmd: &mut Command) -> Command {
+    let mut sh = Command::new("sh");
+    sh.arg("-c")
+        .arg("exec \"$0\" \"$@\" 2>&1")
+        .arg(cmd.get_program());
+    sh.args(cmd.get_args());
+    sh.env_clear();
+    for (k, v) in cmd.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))) {
+        sh.env(k, v);
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        sh.current_dir(dir);
+    }
+    sh.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sh
+}
+
 fn run(cmd: &mut Command) -> Run {
     let out = cmd.output().expect("gwennol runs");
     let run = Run {
@@ -223,6 +245,8 @@ fn handle(stub: &Stub, mut socket: TcpStream) {
         {
             stream(&mut socket, OVERLOADED_MIDSTREAM_SSE);
         }
+        // The model speaks, asks for a tool, and ends in a refusal.
+        "/refusal" => stream(&mut socket, REFUSAL_SSE),
         _ => match tool_result_in(&parsed) {
             Some((content, is_error)) => {
                 let text = if is_error {
@@ -317,6 +341,39 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
 event: error
 data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+/// A round with text and a tool call that the model then ends in a
+/// refusal: the loop stores it with the call answered as not run and
+/// never dispatches it, so the frontend hears `ToolFailed` with no
+/// `ToolCall` before it.
+const REFUSAL_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_r","type":"message","role":"assistant","content":[],"model":"claude-fixture","stop_reason":null,"usage":{"input_tokens":12,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I would rather not."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_r1","name":"read","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"hello.txt\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"output_tokens":9}}
 
 event: message_stop
 data: {"type":"message_stop"}
@@ -508,6 +565,56 @@ fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
         r.stdout,
         "Let me read it.\nIt says: hello from the workspace\n"
     );
+
+    // A failed turn keeps its own status: without a key the vendor
+    // refuses, and the unwritable transcript is reported after that
+    // without turning the 1 into a 2.
+    let r = run(f
+        .gwennol()
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub()])
+        .args(["--transcript", "/nonexistent/dir/t.json"])
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(1), "{:?}", r.status);
+    let failed_turn = r
+        .stderr
+        .find("gwennol: turn failed: ")
+        .expect("outcome line");
+    let failed_write = r
+        .stderr
+        .find("gwennol: transcript /nonexistent/dir/t.json: ")
+        .expect("transcript failure line");
+    assert!(failed_turn < failed_write, "{}", r.stderr);
+}
+
+#[test]
+fn a_round_the_model_ends_in_a_refusal_still_reaches_stdout_first() {
+    let f = fixture();
+    let config = f.config("refusal", "/refusal", "");
+    let r = run(&mut merged(
+        f.gwennol()
+            .env(KEY_VAR, API_KEY)
+            .arg("--config")
+            .arg(&config)
+            .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+            .arg("What does hello.txt say?"),
+    ));
+    assert!(r.status.success(), "{:?}", r.status);
+    // The call was never dispatched — no `->` line — and the round it
+    // belongs to is in the transcript, so its text is owed to stdout
+    // before the call's failure is reported.
+    assert!(!r.stdout.contains("gwennol: -> read"), "{}", r.stdout);
+    let text = r
+        .stdout
+        .find("I would rather not.\n")
+        .expect("the round's text");
+    let failed = r
+        .stdout
+        .find("gwennol: !! read toolu_r1: ")
+        .expect("the undispatched call's failure");
+    assert!(text < failed, "{}", r.stdout);
+    assert!(r.stdout.contains("gwennol: done (Refusal)"), "{}", r.stdout);
 }
 
 #[test]
@@ -702,6 +809,9 @@ fn ctrl_c_cancels_the_turn() {
         .arg("--config")
         .arg(&config)
         .args(["--allow", &f.allow_stub()])
+        // A cancelled turn keeps 130 even when the transcript cannot
+        // be written afterwards.
+        .args(["--transcript", "/nonexistent/dir/t.json"])
         .arg("Say hi.")
         .spawn()
         .unwrap();
@@ -732,7 +842,11 @@ fn ctrl_c_cancels_the_turn() {
     eprintln!("--- stderr ---\n{stderr}\n---");
     assert_eq!(status.code(), Some(130), "{status:?}");
     assert!(stderr.contains("gwennol: interrupted; cancelling the turn"));
-    assert!(stderr.contains("gwennol: cancelled"));
+    let cancelled = stderr.find("gwennol: cancelled").expect("outcome line");
+    let failed_write = stderr
+        .find("gwennol: transcript /nonexistent/dir/t.json: ")
+        .expect("transcript failure line");
+    assert!(cancelled < failed_write, "{stderr}");
 }
 
 #[test]
