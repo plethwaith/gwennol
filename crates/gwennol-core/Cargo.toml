@@ -28,6 +28,11 @@ tracing.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 url.workspace = true
+# The same JSON Schema validator Gwead uses for its meta-schemas. The
+# agent loop checks model-emitted tool arguments against each tool's
+# declared schema before dispatching — the one payload validation the
+# SPI contracts assign to the caller, since the kernel does none.
+boon = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
@@ -50,7 +55,6 @@ sse-guest = { path = "../sse-guest" }
 # `cargo package`.
 xtask = { path = "../xtask" }
 provider-anthropic = { path = "../provider-anthropic" }
-# The same JSON Schema validator Gwead uses for its meta-schemas; here it
-# pins fixture payloads to the SPI contract schemas, which the kernel
-# deliberately never does at dispatch.
+# The integration suites pin fixture payloads to the SPI contract
+# schemas with the same validator the loop uses on tool arguments.
 boon = "0.6"

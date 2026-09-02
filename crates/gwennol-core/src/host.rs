@@ -112,6 +112,11 @@ pub fn install(config: HostConfig) -> Result<(), HostConfig> {
     HOST.set(config)
 }
 
+/// The installed host state, if [`crate::boot`] has run.
+pub(crate) fn installed() -> Option<&'static HostConfig> {
+    HOST.get()
+}
+
 /// The installed host state.
 ///
 /// # Panics
