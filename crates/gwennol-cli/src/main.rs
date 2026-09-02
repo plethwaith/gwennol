@@ -27,7 +27,7 @@ use std::sync::Arc;
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use gwennol_core::gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    Decision, HostConfig, ProcessEnv, Session, SessionConfig, TurnError, host, spi,
+    Decision, HostConfig, ProcessEnv, Session, SessionConfig, TurnError, host, resolve_provider,
 };
 use serde_json::Value;
 
@@ -103,7 +103,9 @@ struct Cli {
     #[arg(long, value_name = "PLUGIN")]
     provider: Option<String>,
 
-    /// The provider's model: sets `model` in its $config.
+    /// The provider's model: sets `model` in its $config, by the
+    /// convention that a provider's config names its model so (the
+    /// bundled one does; a provider that does not ignores the key).
     #[arg(long, value_name = "ID")]
     model: Option<String>,
 
@@ -356,24 +358,10 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
         }
     }
     if let Some(model) = &cli.model {
-        // --model needs to know which plugin's config to set; that is
-        // the session's provider, resolved the way the loop will.
-        let name = match &provider {
-            Some(name) => name.clone(),
-            None => {
-                let mut candidates = kernel.role_candidates(None, spi::llm_chat::ROLE);
-                candidates.sort();
-                match candidates.as_slice() {
-                    [one] => one.clone(),
-                    [] => return Err(Fatal("--model: no LLM_CHAT provider is loaded".into())),
-                    many => {
-                        return Err(Fatal(format!(
-                            "--model: several providers are loaded ({many:?}); name one with --provider"
-                        )));
-                    }
-                }
-            }
-        };
+        // --model needs to know which plugin's config to set: the
+        // session's provider, resolved by the loop's own rule.
+        let name = resolve_provider(&kernel, provider.as_deref())
+            .map_err(|e| Fatal(format!("--model: {e}")))?;
         plugin_configs
             .entry(name)
             .or_insert_with(|| Value::Object(Default::default()))["model"] =
@@ -411,10 +399,7 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
         });
     }
     let outcome = session.turn(&task, &cancel).await;
-    if let Some(path) = &cli.transcript {
-        write_transcript(path, session.transcript())?;
-    }
-    Ok(match outcome {
+    let code = match outcome {
         Ok(outcome) => {
             eprintln!(
                 "gwennol: done ({:?}): {} round{}, {} tokens in, {} out",
@@ -434,7 +419,14 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
             eprintln!("gwennol: turn failed: {e}");
             ExitCode::from(EXIT_TURN_FAILED)
         }
-    })
+    };
+    // After the outcome is reported, so a transcript that cannot be
+    // written never hides how the turn went; it is still a failure of
+    // what was asked for.
+    if let Some(path) = &cli.transcript {
+        write_transcript(path, session.transcript())?;
+    }
+    Ok(code)
 }
 
 /// The config file: the one named, which must exist, else the default

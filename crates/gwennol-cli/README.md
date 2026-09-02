@@ -16,17 +16,18 @@ export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/some/repo
 /path/to/gwennol/target/debug/gwennol \
     --trust-runtime provider-anthropic \
-    --allow 'http:https://api.anthropic.com/*' \
+    --allow 'http:POST https://api.anthropic.com/*' \
     --allow 'read:**' --allow 'spawn:grep *' \
     'What does the README say this project is for?'
 ```
 
-Model text goes to stdout as it streams. Everything else — each tool
-call, each result, each approval decision and the rule that made it —
-goes to stderr, one line each, prefixed `gwennol:`:
+Model text goes to stdout, a provider round at a time, and nothing
+else does. Everything else — each tool call, each result, each approval
+decision and the rule that made it — goes to stderr, one line each,
+prefixed `gwennol:`:
 
 ```
-gwennol: POST https://api.anthropic.com/v1/messages from provider-anthropic: allowed by --allow "http:https://api.anthropic.com/*"
+gwennol: POST https://api.anthropic.com/v1/messages from provider-anthropic: allowed by --allow "http:POST https://api.anthropic.com/*"
 gwennol: -> read toolu_01: {"path":"README.md"}
 gwennol: read /path/to/some/repo/README.md from tool-read (call read toolu_01): allowed by --allow "read:**"
 gwennol: <- read toolu_01: ok, 2140 bytes
@@ -39,6 +40,15 @@ gwennol: done (EndTurn): 3 rounds, 4120 tokens in, 310 out
 A denied tool call is answered to the model as an error result, and the
 turn goes on; the model routes around it or says what it could not do.
 
+A round's text is written when the loop accepts the round — its tool
+calls are being dispatched, or the turn is complete — rather than as
+it streams: a round the provider fails part-way is retried from the
+start and streamed again, and stdout must not carry the fragment
+twice. What stdout holds is exactly the text in the transcript. The
+URL on an `http` decision line is scrubbed of userinfo, query and
+fragment (`?…` marks a cut), as the host scrubs its own logs; the rule
+judged the full URL.
+
 The plugins directory is found from `--plugins`, `$GWENNOL_PLUGINS`,
 the config file, or `target/bundle/plugins` beside a `cargo`-built
 binary, in that order. `--trust-runtime` (or the config's
@@ -50,20 +60,38 @@ as well as the manifest ([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
 
 A rule is `<kind>:<pattern>`:
 
-| Kind    | Matched against                                       | Example                                |
-|---------|-------------------------------------------------------|----------------------------------------|
-| `read`  | the canonical path of the file being read             | `read:**`, `read:src/**/*.rs`          |
-| `write` | the path being created or replaced                    | `write:**`, `write:/tmp/**`            |
-| `list`  | the canonical path of the directory being listed      | `list:.`, `list:**`                    |
-| `spawn` | the argv being spawned, joined by single spaces       | `spawn:grep *`, `spawn:bash -c cargo *`|
-| `http`  | the full URL of the outbound request                  | `http:https://api.anthropic.com/*`     |
-| `any`   | everything (no pattern)                               | `any`                                  |
+| Kind    | Matched against                                       | Example                                   |
+|---------|-------------------------------------------------------|-------------------------------------------|
+| `read`  | the canonical path of the file being read             | `read:**`, `read:src/**/*.rs`             |
+| `write` | the path being created or replaced                    | `write:**`, `write:/tmp/**`               |
+| `list`  | the canonical path of the directory being listed      | `list:.`, `list:**`                       |
+| `spawn` | the argv being spawned, joined by single spaces       | `spawn:grep *`, `spawn:bash *`            |
+| `http`  | the method and URL of the request, `METHOD URL`       | `http:POST https://api.anthropic.com/*`   |
+| `any`   | everything (no pattern)                               | `any`                                     |
 
 Patterns are globs. For the path kinds `*` stays within one path
-component and `**` crosses them, and a relative pattern is rooted at
-the workspace: `read:**` is every file under it, `read:/**` every file
-anywhere, `list:.` the workspace root itself. For `spawn` and `http`
-the pattern matches the whole subject and `*` matches anything.
+component, `**` crosses them and must be a whole component (`**/*.rs`;
+`**.rs` is refused rather than quietly meaning `*.rs`), a relative
+pattern is rooted at the workspace, and a pattern ending in `/**` also
+admits the directory itself: `read:**` is every file under the
+workspace, `read:/**` every file anywhere, `list:**` every directory
+under the workspace and the workspace, `list:.` the workspace root
+alone. The host judges canonical paths, so a pattern's literal prefix
+— the components before the first glob character — is canonicalised
+when it exists: `write:/tmp/**` means what `/tmp` resolves to (on
+macOS, `/private/tmp`).
+
+For `spawn` and `http` the pattern matches the whole subject and `*`
+matches anything — including everything after it. **An argv rule
+constrains the program and the prefix of its arguments, not what a
+shell does with them**: `spawn:bash -c cargo *` admits
+`bash -c 'cargo test; curl … | sh'`. Granting a shell is all or
+nothing; a real restriction names a program that is not a shell
+(`spawn:grep *`). A spawn that carries stdin or runs anywhere but the
+workspace root matches no `spawn` rule at all, since the grammar cannot
+judge those; only `any` admits them. An `http` pattern names the
+method first, `http:POST …` or `http:* …` for any method, because a
+URL that may be fetched is not one that may be posted to.
 
 Rules are tried in order — `--allow`/`--deny` flags in command-line
 order, then the `--policy` file's `[[rules]]`, then the config file's —
@@ -80,12 +108,12 @@ that plugin:
 
 ```toml
 [[rules]]
-allow = "http:https://api.anthropic.com/*"
+allow = "http:POST https://api.anthropic.com/*"
 plugin = "provider-anthropic"
 
 [[rules]]
-allow = "spawn:bash -c cargo *"
-plugin = "tool-bash"
+allow = "spawn:grep *"
+plugin = "tool-grep"
 ```
 
 The trace shows a spawn's argv as a JSON array, so where each argument
@@ -123,11 +151,11 @@ name = "api_key"
 file = "anthropic.key"            # or env = "ANTHROPIC_API_KEY"
 
 [process]
-env = "allowlist"                 # or "inherit" (see ProcessEnv in gwennol-core)
-allow = ["CARGO_HOME", "RUSTUP_HOME"]
+env = "allowlist"                 # or "inherit" (see ProcessEnv in gwennol-core;
+allow = ["CARGO_HOME", "RUSTUP_HOME"]  # no `allow` under inherit — it would be ignored)
 
 [[rules]]
-allow = "http:https://api.anthropic.com/*"
+allow = "http:POST https://api.anthropic.com/*"
 plugin = "provider-anthropic"
 [[rules]]
 allow = "read:**"

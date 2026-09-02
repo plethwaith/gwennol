@@ -21,6 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The trace scrubs URLs the way the host does, through the same
+# function, and needs the parsed form to hand it.
+url.workspace = true
 # Ctrl-C is the one interactive thing a headless run answers to: it
 # cancels the turn through the loop's token.
 tokio = { workspace = true, features = ["signal"] }

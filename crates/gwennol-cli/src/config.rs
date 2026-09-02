@@ -179,6 +179,13 @@ pub enum ConfigError {
         /// One-based position.
         index: usize,
     },
+    /// `[process] env = "inherit"` with an `allow` list, which would be
+    /// silently ignored: inheriting passes everything.
+    #[error("{path}: [process] allow has no effect under env = \"inherit\"; remove one")]
+    InheritWithAllow {
+        /// The file.
+        path: PathBuf,
+    },
 }
 
 /// A file that was read, remembering where from.
@@ -256,6 +263,9 @@ impl Loaded<Config> {
         // refused at startup rather than when it is first needed.
         loaded.rules()?;
         loaded.secrets()?;
+        if loaded.value.process.env == EnvMode::Inherit && !loaded.value.process.allow.is_empty() {
+            return Err(ConfigError::InheritWithAllow { path: loaded.path });
+        }
         Ok(loaded)
     }
 
@@ -355,7 +365,6 @@ name = "api_key"
 file = "anthropic.key"
 
 [process]
-env = "inherit"
 allow = ["CARGO_HOME"]
 
 [[rules]]
@@ -377,7 +386,7 @@ deny = "write:.git/**"
         assert_eq!(c.session.max_rounds, Some(16));
         let provider = &c.plugin_config["provider-anthropic"];
         assert_eq!(provider["model"].as_str(), Some("claude-fixture"));
-        assert_eq!(c.process.env, EnvMode::Inherit);
+        assert_eq!(c.process.env, EnvMode::Allowlist);
         assert_eq!(c.process.allow, ["CARGO_HOME"]);
 
         let secrets = loaded.secrets().unwrap();
@@ -432,6 +441,25 @@ deny = "write:.git/**"
         );
         let err = Loaded::<Config>::read(&neither).unwrap_err().to_string();
         assert!(err.contains("secrets entry 1: exactly one of"), "{err}");
+
+        // Inheriting the environment passes everything, so an allow
+        // list beside it is a contradiction, not a no-op.
+        let inherit = write(
+            dir.path(),
+            "inherit.toml",
+            "[process]\nenv = 'inherit'\nallow = ['X']\n",
+        );
+        let err = Loaded::<Config>::read(&inherit).unwrap_err().to_string();
+        assert!(err.contains("allow has no effect"), "{err}");
+        let inherit = write(
+            dir.path(),
+            "inherit-ok.toml",
+            "[process]\nenv = 'inherit'\n",
+        );
+        assert_eq!(
+            Loaded::<Config>::read(&inherit).unwrap().value.process.env,
+            EnvMode::Inherit
+        );
 
         // A policy file holds rules and nothing else.
         let policy = write(dir.path(), "policy.toml", "[session]\nprovider = 'x'\n");

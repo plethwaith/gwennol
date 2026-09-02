@@ -1,11 +1,20 @@
 //! The headless [`Operator`]: policy answers approvals, sources answer
 //! secrets, events go to the terminal, and there is no input.
 //!
-//! Model text streams to stdout as it arrives and nothing else goes
-//! there, so a run's answer can be piped. Everything else — each tool
-//! call and its result, and every approval decision with the rule
-//! behind it — goes to stderr, one line each, prefixed `gwennol:` so it
-//! is told apart from whatever a spawned command prints.
+//! Model text goes to stdout, a provider round at a time, and nothing
+//! else goes there, so a run's answer can be piped. A round is held
+//! until the loop has accepted it — the tool calls it made are being
+//! dispatched, or the turn is complete — because a round the provider
+//! failed part-way is retried from the start and its text streamed
+//! again: written as it arrived, stdout would carry the fragment
+//! twice. What stdout holds is therefore exactly the text in the
+//! transcript. Everything else — each tool call and its result, and
+//! every approval decision with the rule behind it — goes to stderr,
+//! one line each, prefixed `gwennol:` so it is told apart from
+//! whatever a spawned command prints. The URL in an HTTP decision is
+//! scrubbed the way the host scrubs its own logs: the rule judged the
+//! full URL, but a query string can carry a key and a trace is a
+//! record.
 
 use std::fmt;
 use std::io::Write;
@@ -29,6 +38,9 @@ pub struct Headless {
     workspace: PathBuf,
     /// `-v` count: at 1 and above, tool results are shown whole.
     verbosity: u8,
+    /// Text of the provider round in progress, written to stdout once
+    /// the loop accepts the round.
+    pending: Mutex<String>,
     /// Whether the last byte written to stdout was not a newline, so a
     /// completed turn can end its line.
     line_open: Mutex<bool>,
@@ -43,6 +55,7 @@ impl Headless {
             secrets,
             workspace,
             verbosity,
+            pending: Mutex::new(String::new()),
             line_open: Mutex::new(false),
         }
     }
@@ -56,7 +69,9 @@ impl Headless {
         eprintln!("gwennol: {line}");
     }
 
-    fn text(&self, text: &str) {
+    /// Write the round's text, now that the loop has accepted it.
+    fn flush_round(&self) {
+        let text = std::mem::take(&mut *self.pending.lock().unwrap());
         if text.is_empty() {
             return;
         }
@@ -66,6 +81,12 @@ impl Headless {
         let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
         *self.line_open.lock().unwrap() = !text.ends_with('\n');
+    }
+
+    /// Drop the round's text: the provider failed it and will stream
+    /// it again.
+    fn discard_round(&self) {
+        self.pending.lock().unwrap().clear();
     }
 
     fn end_line(&self) {
@@ -105,7 +126,19 @@ impl fmt::Display for ShowAccess<'_> {
                 }
                 Ok(())
             }
-            Access::Http { method, url } => write!(f, "{method} {url}"),
+            Access::Http { method, url } => match url::Url::parse(url) {
+                Ok(mut u) => {
+                    let had_query = u.query().is_some() || u.fragment().is_some();
+                    gwennol_core::steps::http::scrub(&mut u);
+                    write!(f, "{method} {u}")?;
+                    if had_query {
+                        // Say that something was cut, without saying what.
+                        f.write_str("?…")?;
+                    }
+                    Ok(())
+                }
+                Err(_) => write!(f, "{method} request (unparseable URL)"),
+            },
             _ => f.write_str("an access this frontend does not know"),
         }
     }
@@ -184,8 +217,9 @@ impl Operator for Headless {
 
     fn emit(&self, event: Event) {
         match event {
-            Event::Text(text) => self.text(&text),
+            Event::Text(text) => self.pending.lock().unwrap().push_str(&text),
             Event::ToolCall(call) => {
+                self.flush_round();
                 self.end_line();
                 self.note(format_args!(
                     "-> {}: {}",
@@ -220,15 +254,19 @@ impl Operator for Headless {
                 max_attempts,
                 failure,
             } => {
-                self.end_line();
+                self.discard_round();
                 self.note(format_args!(
                     "provider failure, retrying ({attempt}/{max_attempts}): {failure}"
                 ));
             }
-            Event::TurnComplete => self.end_line(),
+            Event::TurnComplete => {
+                self.flush_round();
+                self.end_line();
+            }
             // The event set is non-exhaustive; something this frontend
-            // does not know how to show is not lost silently.
-            other => tracing::info!(?other, "event"),
+            // does not know how to show is said at the default level
+            // rather than lost.
+            other => tracing::warn!(?other, "event this frontend cannot show"),
         }
     }
 
@@ -292,5 +330,13 @@ mod tests {
             }),
             "POST https://api.anthropic.com/v1/messages"
         );
+        // Userinfo and the query string can carry a credential: the
+        // rule judged them, the trace does not repeat them.
+        let shown = show(&Access::Http {
+            method: "GET".into(),
+            url: "https://user:hunter2@x.example/p?key=sk-secret#frag".into(),
+        });
+        assert_eq!(shown, "GET https://x.example/p?…");
+        assert!(!shown.contains("hunter2") && !shown.contains("sk-secret"));
     }
 }

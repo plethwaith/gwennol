@@ -38,15 +38,20 @@ impl Plugin {
             .unwrap_or_else(|| self.path.display().to_string())
     }
 
-    /// The secret names the manifest declares in `usesSecrets`.
+    /// The secret names the manifest declares in `usesSecrets`, in
+    /// either form Gwead accepts: a bare `"name"` or an object with a
+    /// `key` (and `overridable`, which does not matter here).
     pub fn uses_secrets(&self) -> Vec<String> {
         self.manifest
             .get("usesSecrets")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
+            .filter_map(|entry| match entry {
+                Value::String(name) => Some(name.clone()),
+                Value::Object(decl) => decl.get("key").and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
             .collect()
     }
 }
@@ -134,10 +139,12 @@ fn beside_binary() -> Option<PathBuf> {
     Some(exe.parent()?.parent()?.join("bundle").join("plugins"))
 }
 
-/// Read every `*.json` under `dir`, recursively, in path order — the
-/// order `cargo xtask bundle` wrote them, which puts `providers/`
-/// before `tools/`. A `spi/` subdirectory is skipped: contracts are
-/// not plugins, and the host has already registered its own.
+/// Read every `*.json` one group deep under `dir` — `<dir>/<group>/
+/// <name>.json`, the layout `cargo xtask bundle` writes and the same
+/// walk it does — in path order, which puts `providers/` before
+/// `tools/`. The `spi/` group is skipped: contracts are not plugins,
+/// and the host has already registered its own. A file at the top
+/// level or deeper than a group is not a manifest to either.
 pub fn load(dir: &Path) -> Result<Vec<Plugin>, PluginsError> {
     let mut paths = Vec::new();
     collect(dir, &mut paths)?;
@@ -159,20 +166,24 @@ pub fn load(dir: &Path) -> Result<Vec<Plugin>, PluginsError> {
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), PluginsError> {
-    let io = |source| PluginsError::Io {
-        path: dir.to_path_buf(),
+    let io = |path: &Path, source| PluginsError::Io {
+        path: path.to_path_buf(),
         source,
     };
-    for entry in std::fs::read_dir(dir).map_err(io)? {
-        let path = entry.map_err(io)?.path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == CONTRACTS_SUBDIR) {
-                tracing::debug!(dir = %path.display(), "skipping contracts directory");
-                continue;
+    for group in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
+        let group = group.map_err(|e| io(dir, e))?.path();
+        if !group.is_dir() {
+            continue;
+        }
+        if group.file_name().is_some_and(|n| n == CONTRACTS_SUBDIR) {
+            tracing::debug!(dir = %group.display(), "skipping contracts directory");
+            continue;
+        }
+        for entry in std::fs::read_dir(&group).map_err(|e| io(&group, e))? {
+            let path = entry.map_err(|e| io(&group, e))?.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "json") {
+                out.push(path);
             }
-            collect(&path, out)?;
-        } else if path.extension().is_some_and(|x| x == "json") {
-            out.push(path);
         }
     }
     Ok(())
@@ -190,10 +201,14 @@ mod tests {
             ("tools/read.json", r#"{"name": "tool-read"}"#),
             (
                 "providers/anthropic.json",
-                r#"{"name": "provider-anthropic", "usesSecrets": ["api_key"]}"#,
+                r#"{"name": "provider-anthropic", "usesSecrets": ["api_key", {"key": "org_id", "overridable": true}]}"#,
             ),
             ("spi/tool.json", r#"{"role": "TOOL"}"#),
             ("providers/README.md", "not a manifest"),
+            // Neither at the top level nor below a group is a
+            // manifest: the bundler's walk is one group deep.
+            ("stray.json", r#"{"name": "stray"}"#),
+            ("tools/nested/deep.json", r#"{"name": "deep"}"#),
         ] {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -202,14 +217,15 @@ mod tests {
         let plugins = load(root).unwrap();
         let names: Vec<_> = plugins.iter().map(Plugin::name).collect();
         assert_eq!(names, ["provider-anthropic", "tool-read"]);
-        assert_eq!(plugins[0].uses_secrets(), ["api_key"]);
+        assert_eq!(plugins[0].uses_secrets(), ["api_key", "org_id"]);
         assert!(plugins[1].uses_secrets().is_empty());
     }
 
     #[test]
     fn a_manifest_that_is_not_json_names_its_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("bad.json"), "{").unwrap();
+        std::fs::create_dir(dir.path().join("tools")).unwrap();
+        std::fs::write(dir.path().join("tools/bad.json"), "{").unwrap();
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("bad.json: not JSON"), "{err}");
     }

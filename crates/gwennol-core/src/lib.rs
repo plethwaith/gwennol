@@ -61,7 +61,7 @@ pub mod steps;
 
 pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
-    Usage,
+    Usage, resolve_provider,
 };
 pub use gwead;
 pub use host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv};

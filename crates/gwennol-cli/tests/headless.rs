@@ -92,7 +92,7 @@ impl Fixture {
 
     /// The rule that lets the provider reach the stub.
     fn allow_stub(&self) -> String {
-        format!("http:http://{}/*", self.stub.addr)
+        format!("http:POST http://{}/*", self.stub.addr)
     }
 
     /// The binary, in the workspace, with an empty environment apart
@@ -211,6 +211,18 @@ fn handle(stub: &Stub, mut socket: TcpStream) {
             let mut sink = [0u8; 1];
             let _ = socket.read(&mut sink);
         }
+        // The first request on this route fails part-way through a
+        // round the vendor marks retryable; the rest go normally.
+        "/flaky"
+            if stub
+                .requests()
+                .iter()
+                .filter(|(p, _, _)| p.starts_with("/flaky/"))
+                .count()
+                == 1 =>
+        {
+            stream(&mut socket, OVERLOADED_MIDSTREAM_SSE);
+        }
         _ => match tool_result_in(&parsed) {
             Some((content, is_error)) => {
                 let text = if is_error {
@@ -286,6 +298,25 @@ data: {"type":"content_block_stop","index":2}
 
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":17}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+/// A round that starts speaking and is then cut off by an overload —
+/// text the loop will have shown before it retries.
+const OVERLOADED_MIDSTREAM_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_0","type":"message","role":"assistant","content":[],"model":"claude-fixture","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"so far"}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 
 event: message_stop
 data: {"type":"message_stop"}
@@ -393,7 +424,7 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
 
     // Every decision, with the rule that made it.
     r.stderr_has(&format!(
-        "gwennol: POST http://{}/traced/v1/messages from {PROVIDER}: allowed by --allow \"http:http://{}/*\"",
+        "gwennol: POST http://{}/traced/v1/messages from {PROVIDER}: allowed by --allow \"http:POST http://{}/*\"",
         f.stub.addr, f.stub.addr
     ));
     r.stderr_has(&format!(
@@ -447,6 +478,29 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
     assert_eq!(saved[1]["content"][0]["type"], "opaque");
     assert_eq!(saved[1]["content"][0]["data"], thinking_block());
     assert_eq!(saved[3]["role"], "assistant");
+}
+
+#[test]
+fn a_retried_round_is_not_written_twice() {
+    let f = fixture();
+    let config = f.config("flaky", "/flaky", "");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .arg("What does hello.txt say?"));
+    assert!(r.status.success(), "{:?}", r.status);
+    r.stderr_has("gwennol: provider failure, retrying (2/3): ");
+    // The failed round's text was shown to the operator, then the
+    // round was retried from the start: stdout carries the accepted
+    // rounds only, and nothing twice.
+    assert_eq!(
+        r.stdout,
+        "Let me read it.\nIt says: hello from the workspace\n"
+    );
+    assert!(!r.stdout.contains("so far"), "{}", r.stdout);
 }
 
 #[test]

@@ -319,8 +319,10 @@ prompt exists to paper over it.
 - **Not in scope:** the TUI.
 - **Settled: rules, in order, and nothing by default.** A rule is
   `<kind>:<glob>` over what the operator would have been shown — the
-  canonical path, the space-joined argv, the full URL — and the same
-  text on a flag or in a file. Rules are tried in the order given
+  canonical path, the space-joined argv, the method and URL — and the
+  same text on a flag or in a file. What the grammar cannot judge (a
+  spawn's stdin or working directory, an access of a kind the frontend
+  does not know) no rule admits but `any`. Rules are tried in the order given
   (flags, then the policy file, then the config file) and the first
   match decides; a request nothing matches is denied, and the trace
   says so. Every decision is one stderr line naming the access, the

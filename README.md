@@ -72,7 +72,7 @@ export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/a/repository
 /path/to/gwennol/target/debug/gwennol \
     --trust-runtime provider-anthropic \
-    --allow 'http:https://api.anthropic.com/*' --allow 'read:**' \
+    --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**' \
     'What is this repository for?'
 ```
 
