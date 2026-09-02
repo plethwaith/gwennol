@@ -481,6 +481,36 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
 }
 
 #[test]
+fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
+    let f = fixture();
+    let config = f.config("transcript", "", "");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .args(["--transcript", "/nonexistent/dir/t.json"])
+        .arg("What does hello.txt say?"));
+    // The turn completed and said so first; the write failed after,
+    // and a completed turn with no transcript is exit 2.
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    let done = r
+        .stderr
+        .find("gwennol: done (EndTurn)")
+        .expect("outcome line");
+    let failed = r
+        .stderr
+        .find("gwennol: transcript /nonexistent/dir/t.json: ")
+        .expect("transcript failure line");
+    assert!(done < failed, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "Let me read it.\nIt says: hello from the workspace\n"
+    );
+}
+
+#[test]
 fn a_retried_round_is_not_written_twice() {
     let f = fixture();
     let config = f.config("flaky", "/flaky", "");

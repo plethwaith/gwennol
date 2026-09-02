@@ -77,9 +77,11 @@ admits the directory itself: `read:**` is every file under the
 workspace, `read:/**` every file anywhere, `list:**` every directory
 under the workspace and the workspace, `list:.` the workspace root
 alone. The host judges canonical paths, so a pattern's literal prefix
-— the components before the first glob character — is canonicalised
-when it exists: `write:/tmp/**` means what `/tmp` resolves to (on
-macOS, `/private/tmp`).
+— the components before the first glob character — is spelled the way
+the host spells a path: its deepest existing ancestor canonical, the
+rest as written. `write:/tmp/**` means what `/tmp` resolves to (on
+macOS, `/private/tmp`), and `write:link/new/**` the link's target
+plus `new`, whether or not `new` exists yet.
 
 For `spawn` and `http` the pattern matches the whole subject and `*`
 matches anything — including everything after it. **An argv rule
@@ -89,9 +91,11 @@ shell does with them**: `spawn:bash -c cargo *` admits
 nothing; a real restriction names a program that is not a shell
 (`spawn:grep *`). A spawn that carries stdin or runs anywhere but the
 workspace root matches no `spawn` rule at all, since the grammar cannot
-judge those; only `any` admits them. An `http` pattern names the
-method first, `http:POST …` or `http:* …` for any method, because a
-URL that may be fetched is not one that may be posted to.
+judge those; only `any` admits them, and the trace says so. An `http`
+pattern names the method first — `http:POST …`, upper-case, one space,
+or `http:* …` for any method — because a URL that may be fetched is
+not one that may be posted to; a method that could never match is
+refused rather than admitting nothing.
 
 Rules are tried in order — `--allow`/`--deny` flags in command-line
 order, then the `--policy` file's `[[rules]]`, then the config file's —
@@ -152,7 +156,7 @@ file = "anthropic.key"            # or env = "ANTHROPIC_API_KEY"
 
 [process]
 env = "allowlist"                 # or "inherit" (see ProcessEnv in gwennol-core;
-allow = ["CARGO_HOME", "RUSTUP_HOME"]  # no `allow` under inherit — it would be ignored)
+allow = ["CARGO_HOME", "RUSTUP_HOME"]  # `allow` beside inherit is a startup error)
 
 [[rules]]
 allow = "http:POST https://api.anthropic.com/*"
@@ -199,7 +203,9 @@ Ctrl-C exits at once.
 
 `--transcript FILE` writes the conversation as the provider saw it —
 contract messages, thinking carried as `opaque` blocks — at the end,
-after a failure too.
+after a failure too. The outcome line comes first; a transcript that
+cannot be written is reported after it and makes a completed turn
+exit 2, while a failed or cancelled turn keeps its own status.
 
 ## What it does not do
 

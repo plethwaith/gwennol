@@ -30,8 +30,11 @@
 //! anywhere, `list:**` every directory under the workspace *and* the
 //! workspace, `list:.` the workspace root alone. The host judges
 //! canonical paths, so the literal prefix of a pattern — every
-//! component before the first glob character — is canonicalised when
-//! it exists: `write:/tmp/**` means what `/tmp` resolves to.
+//! component before the first glob character — is spelled the way the
+//! host spells a path: its deepest existing ancestor canonical, the
+//! rest as written. `write:/tmp/**` means what `/tmp` resolves to, and
+//! `write:link/new/**` means the link's target plus `new`, whether or
+//! not `new` exists yet.
 //!
 //! For `spawn` and `http` the pattern matches the whole subject and `*`
 //! matches anything, so it swallows what follows: `spawn:bash -c cargo
@@ -177,18 +180,20 @@ pub enum RuleError {
         /// The rule.
         text: String,
     },
-    /// An `http` pattern without a method: `http:<url>` would silently
-    /// match nothing, since the subject starts with the method.
+    /// An `http` pattern without a method in front, or with one that
+    /// could never match: the subject is `METHOD URL` with the method
+    /// in upper case, one space between.
     #[error(
-        "rule {text:?}: http needs a method first, as http:POST <url-glob> (or http:* <url-glob>)"
+        "rule {text:?}: http needs a method first, as http:POST <url-glob> (or http:* <url-glob>); \
+         methods are upper-case, one space before the URL"
     )]
-    HttpWithoutMethod {
+    HttpMethod {
         /// The rule.
         text: String,
     },
     /// A `**` glued to other characters, which the glob engine would
     /// quietly read as a single `*`.
-    #[error("rule {text:?}: ** must be a whole path component (write **/*.rs, not **.rs)")]
+    #[error("rule {text:?}: ** must be a whole path component (as in **/*.rs, not **.rs)")]
     GluedDoubleStar {
         /// The rule.
         text: String,
@@ -264,8 +269,8 @@ impl Rule {
                 }
             }
             (Kind::Http, Some(pattern)) => {
-                if !pattern.contains(' ') {
-                    return Err(RuleError::HttpWithoutMethod { text });
+                if !has_method_prefix(pattern) {
+                    return Err(RuleError::HttpMethod { text });
                 }
                 set.add(subject_glob(pattern).map_err(glob_err)?);
             }
@@ -317,6 +322,20 @@ impl Rule {
             _ => false,
         }
     }
+}
+
+/// Whether an `http` pattern starts with a method token that can match
+/// a subject: `*`, or upper-case ASCII letters, then exactly one space
+/// and something after it. A lower-case or oddly spaced method would
+/// compile and then admit nothing, the silent failure the method rule
+/// exists to refuse.
+fn has_method_prefix(pattern: &str) -> bool {
+    let Some((method, url)) = pattern.split_once(' ') else {
+        return false;
+    };
+    let method_ok =
+        method == "*" || (!method.is_empty() && method.bytes().all(|b| b.is_ascii_uppercase()));
+    method_ok && !url.is_empty() && !url.starts_with(' ')
 }
 
 /// A glob over a whole subject line, `*` crossing everything.
@@ -374,7 +393,11 @@ fn root_pattern(pattern: &str, root: &Path) -> String {
             literal.push(component);
         }
     }
-    let literal = literal.canonicalize().unwrap_or(literal);
+    // The host's own walk: the deepest existing ancestor canonical,
+    // the rest as spelled — so a pattern naming a file or directory
+    // that does not exist yet still spells the path the host will
+    // submit for it.
+    let literal = gwennol_core::steps::fs::deepest_canonical(&literal).unwrap_or(literal);
     let mut out = globset::escape(&literal.to_string_lossy());
     for component in rest {
         if !out.ends_with('/') {
@@ -392,6 +415,18 @@ pub struct Policy {
     root: PathBuf,
 }
 
+/// Why the default denial applied, when there is more to say than
+/// that no rule matched: the request was one no rule *could* match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unjudgeable {
+    /// An access of a kind this frontend does not know.
+    UnknownKind,
+    /// A spawn carrying stdin.
+    SpawnWithStdin,
+    /// A spawn outside the workspace root.
+    SpawnElsewhere,
+}
+
 /// A judgement on one request: the decision and the rule behind it.
 #[derive(Debug, Clone)]
 pub struct Judgement<'a> {
@@ -399,6 +434,9 @@ pub struct Judgement<'a> {
     pub decision: Decision,
     /// The rule that decided, or `None` for the default denial.
     pub rule: Option<&'a Rule>,
+    /// With `rule` `None`: why no rule short of `any` could have
+    /// matched, when that is the case.
+    pub unjudgeable: Option<Unjudgeable>,
 }
 
 impl Policy {
@@ -430,12 +468,36 @@ impl Policy {
             Some(rule) => Judgement {
                 decision: rule.spec.decision,
                 rule: Some(rule),
+                unjudgeable: None,
             },
             None => Judgement {
                 decision: Decision::Deny,
                 rule: None,
+                unjudgeable: self.unjudgeable(&request.access),
             },
         }
+    }
+
+    /// What, if anything, kept every rule but `any` from applying.
+    fn unjudgeable(&self, access: &Access) -> Option<Unjudgeable> {
+        match access {
+            Access::Spawn { stdin: Some(_), .. } => Some(Unjudgeable::SpawnWithStdin),
+            Access::Spawn { cwd, .. } if cwd != &self.root => Some(Unjudgeable::SpawnElsewhere),
+            _ if Kind::of(access).is_none() => Some(Unjudgeable::UnknownKind),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Unjudgeable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownKind => "an access of a kind no rule can name",
+            Self::SpawnWithStdin => "a spawn with stdin, which no spawn rule can judge",
+            Self::SpawnElsewhere => {
+                "a spawn outside the workspace root, which no spawn rule can judge"
+            }
+        })
     }
 }
 
@@ -475,7 +537,10 @@ impl fmt::Display for Judgement<'_> {
         match (self.decision, self.rule) {
             (Decision::Allow, Some(rule)) => write!(f, "allowed by {}", rule.spec),
             (Decision::Deny, Some(rule)) => write!(f, "denied by {}", rule.spec),
-            (_, None) => f.write_str("denied: no rule matched"),
+            (_, None) => match self.unjudgeable {
+                Some(why) => write!(f, "denied: no rule matched ({why}; only `any` admits it)"),
+                None => f.write_str("denied: no rule matched"),
+            },
         }
     }
 }
@@ -659,6 +724,38 @@ mod tests {
     }
 
     #[test]
+    fn the_prefix_walks_back_to_the_deepest_existing_ancestor() {
+        // The host approves a write under the deepest existing
+        // ancestor canonical plus the rest as spelled; a pattern through
+        // a symlink to a directory that does not exist yet must spell
+        // the same path — canonicalising all or nothing would fall
+        // back to the raw link and deny it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let p = Policy::compile(
+            vec![
+                flag(Decision::Allow, "write:link/newdir/**"),
+                // Fully literal, leaf not there yet.
+                flag(Decision::Allow, "write:link/out.txt"),
+                // `..` folds lexically before the walk, as the host's
+                // own path resolution does.
+                flag(Decision::Allow, "read:real/../link/a/*.txt"),
+            ],
+            &root,
+        )
+        .unwrap();
+        let real = |rest: &str| root.join("real").join(rest);
+        let deep = request("tool-write", Access::WriteFile(real("newdir/a/b.txt")));
+        assert_eq!(p.judge(&deep).decision, Decision::Allow);
+        let leaf = request("tool-write", Access::WriteFile(real("out.txt")));
+        assert_eq!(p.judge(&leaf).decision, Decision::Allow);
+        let dotted = request("tool-read", Access::ReadFile(real("a/x.txt")));
+        assert_eq!(p.judge(&dotted).decision, Decision::Allow);
+    }
+
+    #[test]
     fn glob_syntax_in_the_workspace_path_is_literal() {
         let root = Path::new("/ws[1]/*star");
         let p = Policy::compile(vec![flag(Decision::Allow, "read:**")], root).unwrap();
@@ -716,7 +813,12 @@ mod tests {
                 stdin: Some("rm -rf /\n".into()),
             },
         );
-        assert_eq!(p.judge(&with_stdin).decision, Decision::Deny);
+        let j = p.judge(&with_stdin);
+        assert_eq!(j.decision, Decision::Deny);
+        assert_eq!(
+            j.to_string(),
+            "denied: no rule matched (a spawn with stdin, which no spawn rule can judge; only `any` admits it)"
+        );
         let elsewhere = request(
             "tool-bash",
             Access::Spawn {
@@ -725,7 +827,9 @@ mod tests {
                 stdin: None,
             },
         );
-        assert_eq!(p.judge(&elsewhere).decision, Decision::Deny);
+        let j = p.judge(&elsewhere);
+        assert_eq!(j.decision, Decision::Deny);
+        assert!(j.to_string().contains("outside the workspace root"), "{j}");
         // Only `any` reaches them.
         let p = policy(vec![flag(Decision::Allow, "any")]);
         assert_eq!(p.judge(&with_stdin).decision, Decision::Allow);
@@ -768,14 +872,20 @@ mod tests {
                 .decision,
             Decision::Allow
         );
-        // A pattern with no method would match nothing, silently.
-        let err = Rule::compile(
-            flag(Decision::Allow, "http:https://api.anthropic.com/*"),
-            Path::new("/ws"),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("http needs a method first"), "{err}");
+        // A pattern with no method, a lower-case one, or an odd space
+        // would match nothing, silently: each is refused instead.
+        for bad in [
+            "http:https://api.anthropic.com/*",
+            "http:post https://api.anthropic.com/*",
+            "http:POST  https://api.anthropic.com/*",
+            "http:POST ",
+            "http: https://x/*",
+        ] {
+            let err = Rule::compile(flag(Decision::Allow, bad), Path::new("/ws"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("http needs a method first"), "{bad}: {err}");
+        }
     }
 
     #[test]

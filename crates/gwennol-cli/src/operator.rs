@@ -128,12 +128,16 @@ impl fmt::Display for ShowAccess<'_> {
             }
             Access::Http { method, url } => match url::Url::parse(url) {
                 Ok(mut u) => {
+                    let had_userinfo = !u.username().is_empty() || u.password().is_some();
                     let had_query = u.query().is_some() || u.fragment().is_some();
                     gwennol_core::steps::http::scrub(&mut u);
                     write!(f, "{method} {u}")?;
+                    // Say that something was cut, without saying what.
                     if had_query {
-                        // Say that something was cut, without saying what.
                         f.write_str("?…")?;
+                    }
+                    if had_userinfo {
+                        f.write_str(" (credentials in the URL cut)")?;
                     }
                     Ok(())
                 }
@@ -247,6 +251,13 @@ impl Operator for Headless {
                 }
             }
             Event::ToolFailed { call, error } => {
+                // A call the loop never dispatched — cut off by a
+                // cancellation, or made in a round the model ended in
+                // a refusal — arrives with no ToolCall before it, and
+                // the round it belongs to is in the transcript: its
+                // text is owed to stdout, and before this line.
+                self.flush_round();
+                self.end_line();
                 self.note(format_args!("!! {}: {error}", ShowCall(&call)));
             }
             Event::Retry {
@@ -336,7 +347,11 @@ mod tests {
             method: "GET".into(),
             url: "https://user:hunter2@x.example/p?key=sk-secret#frag".into(),
         });
-        assert_eq!(shown, "GET https://x.example/p?…");
+        assert_eq!(
+            shown,
+            "GET https://x.example/p?… (credentials in the URL cut)"
+        );
         assert!(!shown.contains("hunter2") && !shown.contains("sk-secret"));
+        assert!(!shown.contains("user"));
     }
 }

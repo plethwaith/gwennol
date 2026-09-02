@@ -104,8 +104,9 @@ struct Cli {
     provider: Option<String>,
 
     /// The provider's model: sets `model` in its $config, by the
-    /// convention that a provider's config names its model so (the
-    /// bundled one does; a provider that does not ignores the key).
+    /// convention that a provider's config names its model so. The
+    /// bundled provider does; another provider's schema decides what
+    /// the key means to it.
     #[arg(long, value_name = "ID")]
     model: Option<String>,
 
@@ -421,10 +422,17 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
         }
     };
     // After the outcome is reported, so a transcript that cannot be
-    // written never hides how the turn went; it is still a failure of
-    // what was asked for.
-    if let Some(path) = &cli.transcript {
-        write_transcript(path, session.transcript())?;
+    // written never hides how the turn went. It is still a failure of
+    // what was asked for — but the turn's own failure or cancellation
+    // is the more important fact, and a wrapper keying on that status
+    // must keep seeing it.
+    if let Some(path) = &cli.transcript
+        && let Err(Fatal(message)) = write_transcript(path, session.transcript())
+    {
+        eprintln!("gwennol: {message}");
+        if code == ExitCode::SUCCESS {
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
     }
     Ok(code)
 }

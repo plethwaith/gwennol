@@ -368,7 +368,7 @@ file = "anthropic.key"
 allow = ["CARGO_HOME"]
 
 [[rules]]
-allow = "http:https://api.anthropic.com/*"
+allow = "http:POST https://api.anthropic.com/*"
 plugin = "provider-anthropic"
 
 [[rules]]

@@ -247,12 +247,15 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
 /// canonicalised — a symlinked directory resolves to where it really
 /// leads — and the not-yet-existing remainder is appended as spelled.
 /// This is the path a write approval names, and the path a miss is
-/// approved under.
-async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
+/// approved under; a frontend that judges those paths by pattern must
+/// spell its patterns the same way, which is why this is public and
+/// synchronous — the one walk, for the host and for whoever needs to
+/// agree with it by construction.
+pub fn deepest_canonical(path: &Path) -> std::io::Result<PathBuf> {
     let mut existing = path;
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        match tokio::fs::canonicalize(existing).await {
+        match std::fs::canonicalize(existing) {
             Ok(mut canonical) => {
                 for component in rest.iter().rev() {
                     canonical.push(component);
@@ -286,6 +289,16 @@ async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// [`deepest_canonical`] off the runtime's blocking pool — the same
+/// place `tokio::fs::canonicalize` would have done each probe, in one
+/// hop instead of one per component.
+async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || deepest_canonical(&path))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Create an exclusive (`create_new`) temporary sibling of `dest`, named
