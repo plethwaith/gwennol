@@ -34,7 +34,7 @@
 //! vendor requires a tool-use turn replayed with its thinking intact,
 //! so they travel as the contract's `opaque` block (`LLM_CHAT` 0.3.0),
 //! carried by the consumer, unwrapped back into the vendor block by
-//! [`replay_messages`] on the next request. The request sends no
+//! `replay_messages` on the next request. The request sends no
 //! `thinking` field unless `$config.thinking` (or `$config.extra`)
 //! supplies one — absence is the setting every current model accepts,
 //! where an explicit `disabled` is refused by the models that cannot
