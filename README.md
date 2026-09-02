@@ -36,11 +36,14 @@ manifests.
 the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
 [docs/SUBSTRATE.md](docs/SUBSTRATE.md)), the bundled plugins
 (milestone 4 — the Anthropic provider and the `read`, `write`, `grep`
-and `bash` tools, [plugins/](plugins/)) and the agent loop (milestone 5
-— `gwennol_core::agent::Session`) exist and are exercised by
-integration tests against a real kernel and a stubbed Messages API;
-nothing user-facing runs yet — the non-interactive CLI is milestone 6.
-The 0.0.0 release on crates.io is a name reservation.
+and `bash` tools, [plugins/](plugins/)), the agent loop (milestone 5
+— `gwennol_core::agent::Session`) and the non-interactive CLI
+(milestone 6 — `gwennol`, every approval decided by a rule and traced
+to it, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
+exercised by integration tests against a real kernel and a stubbed
+Messages API. Nothing is packaged yet: the CLI runs from a checkout
+with `cargo xtask bundle` beside it. The interactive TUI is milestone
+7. The 0.0.0 release on crates.io is a name reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.
@@ -61,11 +64,29 @@ this command. No compiled module is ever committed: a guest-backed
 manifest under `plugins/` names the crate that builds it, and the
 bundler fills the slot ([plugins/README.md](plugins/README.md)).
 
+## Running
+
+```sh
+cargo build -p gwennol-cli
+export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
+cd /path/to/a/repository
+/path/to/gwennol/target/debug/gwennol \
+    --trust-runtime provider-anthropic \
+    --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**' \
+    'What is this repository for?'
+```
+
+Nothing is approved by prompt: every reach outside the sandbox is
+judged by the `--allow`/`--deny` rules and a config file, and traced
+on stderr with the rule that decided it. The rule grammar, the config
+file, where secrets come from and the exit statuses are in
+[crates/gwennol-cli/README.md](crates/gwennol-cli/README.md).
+
 ## Layout
 
 ```
 crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
-crates/gwennol-cli/    first frontend (non-interactive CLI)
+crates/gwennol-cli/    the `gwennol` binary: non-interactive frontend, rules instead of prompts
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
 crates/provider-anthropic/  the bundled model provider's guest code

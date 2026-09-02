@@ -357,6 +357,32 @@ impl Default for SessionConfig {
     }
 }
 
+/// The `LLM_CHAT` plugin a session would talk to: `named` when it is
+/// a registered fulfiller, else the only fulfiller there is. The one
+/// implementation of the rule [`SessionConfig::provider`] states —
+/// [`Session::new`] applies it, and a frontend that needs the name
+/// before the session exists (to set that plugin's `$config`, say)
+/// asks here rather than re-deriving it.
+pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, SessionError> {
+    let mut candidates = kernel.role_candidates(None, spi::llm_chat::ROLE);
+    match named {
+        Some(named) => {
+            if !candidates.iter().any(|c| c == named) {
+                return Err(SessionError::NoSuchProvider(named.to_string()));
+            }
+            Ok(named.to_string())
+        }
+        None => match candidates.len() {
+            0 => Err(SessionError::NoProvider),
+            1 => Ok(candidates.remove(0)),
+            _ => {
+                candidates.sort();
+                Err(SessionError::AmbiguousProvider(candidates))
+            }
+        },
+    }
+}
+
 /// One conversation: a provider, the tools, and the transcript so far.
 pub struct Session {
     kernel: Arc<Kernel>,
@@ -402,23 +428,7 @@ impl Session {
             .ok_or(SessionError::NotBooted)?
             .operator
             .clone();
-        let mut candidates = kernel.role_candidates(None, spi::llm_chat::ROLE);
-        let provider = match &config.provider {
-            Some(named) => {
-                if !candidates.iter().any(|c| c == named) {
-                    return Err(SessionError::NoSuchProvider(named.clone()));
-                }
-                named.clone()
-            }
-            None => match candidates.len() {
-                0 => return Err(SessionError::NoProvider),
-                1 => candidates.remove(0),
-                _ => {
-                    candidates.sort();
-                    return Err(SessionError::AmbiguousProvider(candidates));
-                }
-            },
-        };
+        let provider = resolve_provider(&kernel, config.provider.as_deref())?;
         let tools = ToolTable::harvest(&kernel)?;
         Ok(Self {
             kernel,

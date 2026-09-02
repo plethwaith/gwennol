@@ -1,6 +1,6 @@
 [package]
 name = "gwennol-cli"
-description = "Gwennol command-line frontend."
+description = "Gwennol command-line frontend: the non-interactive Operator."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,4 +16,27 @@ path = "src/main.rs"
 
 [dependencies]
 gwennol-core = { path = "../gwennol-core" }
-tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The trace scrubs URLs the way the host does, through the same
+# function, and needs the parsed form to hand it.
+url.workspace = true
+# Ctrl-C is the one interactive thing a headless run answers to: it
+# cancels the turn through the loop's token.
+tokio = { workspace = true, features = ["signal"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+# Rule patterns are globs over paths, argv and URLs.
+globset = "0.4"
+toml = "0.9"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The headless suite bundles the committed plugins through the same
+# code `cargo xtask bundle` runs and drives the built binary against a
+# stub Messages API. Path-only.
+xtask = { path = "../xtask" }
+provider-anthropic = { path = "../provider-anthropic" }
+tempfile = "3"

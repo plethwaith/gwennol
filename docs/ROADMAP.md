@@ -317,6 +317,39 @@ prompt exists to paper over it.
 - **Done when:** a real task runs headlessly with every approval decision
   traceable to a flag or a policy rule, and no interactive prompt exists.
 - **Not in scope:** the TUI.
+- **Settled: rules, in order, and nothing by default.** A rule is
+  `<kind>:<glob>` over what the operator would have been shown — the
+  canonical path, the space-joined argv, the method and URL — and the
+  same text on a flag or in a file. What the grammar cannot judge (a
+  spawn's stdin or working directory, an access of a kind the frontend
+  does not know) no rule admits but `any`. Rules are tried in the order given
+  (flags, then the policy file, then the config file) and the first
+  match decides; a request nothing matches is denied, and the trace
+  says so. Every decision is one stderr line naming the access, the
+  plugin, the tool call behind it and the rule — or the absence of
+  one — so a headless run is reviewable after the fact in the terms a
+  prompt would have used. A denial reaches the model as an error
+  result, not the user as a re-prompt: that is the milestone-5 rule
+  seen from the frontend.
+- **Settled: secrets come from a named source.** A `--secret` flag, a
+  `[[secrets]]` entry, or the convention variable
+  `GWENNOL_SECRET_<PLUGIN>_<NAME>`; read when asked for, never
+  logged, never invented. A declared secret with no source is warned
+  about at startup, and its absence is then the vendor's refusal to
+  report, not the frontend's guess.
+- **Settled: policy lives outside the workspace.** The default config
+  location is the user's config directory, not the repository being
+  edited; a policy the agent could rewrite with an allowed `write`
+  would govern the next run. A file inside the workspace is used only
+  when named on the command line.
+- **Settled: the trust list is the frontend's statement.** Which
+  plugins may supply a script runtime is a flag or a config entry
+  with no default — the embedder half of Gwead's two-key rule stays
+  a choice someone made, even for the bundled provider.
+- **Owed to milestone 1:** the directory-handle (`openat`-family)
+  write that closes the parent-swap race the milestone-1 approval
+  tolerated under interactive review. It is a `gwennol-core` change,
+  not a frontend one, and follows as its own change.
 
 ### 7. TUI
 

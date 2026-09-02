@@ -161,8 +161,11 @@ fn guarded_body(
 
 /// Strip everything from a URL that can carry a credential — userinfo,
 /// query, fragment — leaving scheme, host and path. Every URL headed for
-/// a plugin-visible string or a log goes through here.
-pub(crate) fn scrub(u: &mut Url) {
+/// a plugin-visible string or a log goes through here, and a frontend
+/// writing its own log of an [`Access::Http`](crate::Access) should
+/// use it too: the operator judges the full URL, but a trace is a
+/// record, and a key in a query string does not belong in one.
+pub fn scrub(u: &mut Url) {
     let _ = u.set_username("");
     let _ = u.set_password(None);
     u.set_query(None);
