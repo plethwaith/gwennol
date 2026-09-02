@@ -228,7 +228,9 @@ fn describe(access: &Access) -> String {
 
 /// Ask the operator. A denial is a plain step failure; a withdrawal is
 /// the structured cancellation every host step reports
-/// ([`crate::steps::CANCELLED_CODE`]).
+/// ([`crate::steps::CANCELLED_CODE`]), marked as withdrawn at the
+/// approval ([`crate::steps::CANCELLED_AT_APPROVAL`]) since nothing
+/// was done.
 ///
 /// The question is withdrawn when the invocation is cancelled: a turn
 /// the operator cancelled must not stay parked on a prompt the operator
@@ -244,7 +246,7 @@ pub async fn approve(ask: Ask) -> Result<(), StepError> {
     let plugin = request.plugin.clone();
     let decision = tokio::select! {
         biased;
-        () = cancel.cancelled() => return Err(crate::steps::cancelled()),
+        () = cancel.cancelled() => return Err(crate::steps::withdrawn()),
         decision = host().operator.approve(request) => decision,
     };
     match decision {

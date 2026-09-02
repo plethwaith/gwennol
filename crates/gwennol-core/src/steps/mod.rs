@@ -52,12 +52,30 @@ pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
 /// reading error text or guessing from a token's state.
 pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 
-/// The structured error a cancelled host step returns.
+/// The `params.phase` value on a cancellation that withdrew the step's
+/// approval: the operator never answered, so nothing was done. Every
+/// other cancellation lands somewhere in the work, where the step
+/// cannot say how far it got.
+pub const CANCELLED_AT_APPROVAL: &str = "approval";
+
+/// The structured error a cancelled host step returns from inside its
+/// work.
 pub(crate) fn cancelled() -> StepError {
+    cancelled_with(Value::Null)
+}
+
+/// The structured error a host step returns when its approval was
+/// withdrawn: [`CANCELLED_CODE`] with `params.phase` set to
+/// [`CANCELLED_AT_APPROVAL`].
+pub(crate) fn withdrawn() -> StepError {
+    cancelled_with(gwead::serde_json::json!({"phase": CANCELLED_AT_APPROVAL}))
+}
+
+fn cancelled_with(params: Value) -> StepError {
     StepError::Thrown(PluginErrorPayload {
         code: CANCELLED_CODE.to_string(),
         message: "cancelled".to_string(),
-        params: Value::Null,
+        params,
     })
 }
 
