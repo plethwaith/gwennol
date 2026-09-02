@@ -191,10 +191,11 @@ written, and it must be settled before a provider exists.
 - **Settled: truncation is data too.** A tool reports `truncated: true`
   (`TOOL` 0.2.0) and never composes a marker; `spi::tool::render_content`
   appends the one shared marker before the model sees the result.
-- **Settled: the buffered failure taxonomy** is the `LLM_CHAT` 0.2.0 (now 0.3.0)
-  `{"error": Failure}` form — the vendor answered and said no, with
-  `retryable` filled from its answer. What the provider cannot classify
-  without reading error text stays a step error, uniformly fatal.
+- **Settled: the buffered failure taxonomy** is the `{"error": Failure}`
+  buffered form (`LLM_CHAT` since 0.2.0) — the vendor answered and said
+  no, with `retryable` filled from its answer. What the provider cannot
+  classify without reading error text stays a step error, uniformly
+  fatal.
 - **Settled: bundling.** A guest-backed manifest commits its module as
   `{"path": "crates/<name>"}`, a form the kernel refuses; `cargo xtask
   bundle` compiles the crate and fills the slot, the integration suite

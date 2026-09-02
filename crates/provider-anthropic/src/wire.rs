@@ -8,11 +8,12 @@
 //! - **request**: [`build_request`] turns the contract's `chat` input
 //!   plus the plugin's `$config` into a Messages API request body. The
 //!   contract's block shapes were chosen to be the vendor's, so `tools`
-//!   pass through verbatim and `messages` nearly so — the one rewrite
-//!   is unwrapping this provider's `opaque` blocks back into the vendor
-//!   blocks they carry; what else needs code is the defaults and the
-//!   knobs the contract deliberately leaves to config (`docs/SPI.md`,
-//!   "Known exclusions").
+//!   pass through verbatim and `messages` nearly so — the rewrite is
+//!   confined to `opaque` blocks: this provider's are unwrapped back
+//!   into the vendor blocks they carry, another provider's are dropped
+//!   with a note. What else needs code is the defaults and the knobs
+//!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
+//!   exclusions").
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
 //!   `Failure` the contract's buffered failed form (since 0.2.0)
@@ -36,10 +37,10 @@
 //! loses something the model produced; an unknown event or delta type
 //! is dropped silently, since a delta kind can recur on every fragment
 //! of a turn and a note per fragment would be noise. Thinking blocks
-//! are neither: the
-//! vendor requires a tool-use turn replayed with its thinking intact,
-//! so they travel as the contract's `opaque` block (`LLM_CHAT` 0.3.0),
-//! carried by the consumer, unwrapped back into the vendor block by
+//! are neither: the vendor requires a tool-use turn replayed with its
+//! thinking intact, so they travel as the contract's `opaque` block
+//! (`LLM_CHAT` 0.3.0), carried by the consumer, unwrapped back into the
+//! vendor block by
 //! `replay_messages` on the next request. The request sends no
 //! `thinking` field unless `$config.thinking` (or `$config.extra`)
 //! supplies one — absence is the setting every current model accepts,

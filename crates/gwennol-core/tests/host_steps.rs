@@ -653,6 +653,11 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
     let made = made.expect("not a step error");
     assert_eq!(made["w"]["outcome"], "permission_denied");
     assert!(!dir.join("inner/deeper").exists(), "nothing was created");
+    assert!(
+        f.requests_for("writer")
+            .contains(&Access::WriteFile(dir.join("inner/deeper/new.txt"))),
+        "create_dirs write probe approved"
+    );
     let listed = listed.expect("not a step error");
     assert_eq!(listed["l"]["outcome"], "permission_denied");
     assert!(
