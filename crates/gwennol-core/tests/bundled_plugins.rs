@@ -24,7 +24,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use gwead::kernel::Kernel;
 use gwead::kernel::streams::StreamRegistry;
 use gwead::serde_json::{Value, json};
-use gwennol_core::{ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Turn, spi};
+use gwead::tokio_util::sync::CancellationToken;
+use gwennol_core::{
+    ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Session, SessionConfig,
+    StopReason, Turn, spi,
+};
 use provider_anthropic::wire::ANTHROPIC_VERSION;
 use provider_anthropic::{
     ENTRY_CHAT, ENTRY_RELAY, FETCH_ACTION, PLUGIN_NAME as PROVIDER, STREAM_ACTION,
@@ -76,6 +80,7 @@ fn fixture() -> &'static Fixture {
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
             trusted_step_type_providers: vec![PROVIDER.to_string()],
+            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         for plugin in &bundled {
@@ -289,6 +294,22 @@ fn opening_json() -> Value {
     })
 }
 
+/// The closing answer as a stream: the same quote, as text deltas.
+fn closing_sse(quoted: &str) -> String {
+    let text = json!(format!("It says: {quoted}"));
+    format!(
+        concat!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fixture\",\"stop_reason\":null,\"usage\":{{\"input_tokens\":40,\"output_tokens\":1}}}}}}\n\n",
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":9}}}}\n\n",
+            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        text = text
+    )
+}
+
 /// The closing answer quotes the tool result it was given, so the
 /// round trip is provable from the model's side.
 fn closing_json(quoted: &str) -> Value {
@@ -333,6 +354,9 @@ fn stub() -> &'static Stub {
             let streaming = parsed.get("stream").and_then(Value::as_bool) == Some(true);
             let (route, _) = path.split_once("/v1/messages").unwrap_or((path.as_str(), ""));
             match route {
+                // Never answers: the connection is held for longer
+                // than any cancel test waits, then dropped.
+                "/stall" => std::thread::sleep(std::time::Duration::from_secs(5)),
                 "/rate-limited" => respond(
                     &mut socket,
                     "429 Too Many Requests",
@@ -368,7 +392,8 @@ fn stub() -> &'static Stub {
                         "application/json",
                         &opening_json().to_string(),
                     ),
-                    (_, true) => stream(&mut socket, &opening_sse()),
+                    (Some(quoted), true) => stream(&mut socket, &closing_sse(&quoted)),
+                    (None, true) => stream(&mut socket, &opening_sse()),
                 },
             }
         });
@@ -823,6 +848,129 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
             {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
         ])
     );
+}
+
+/// The milestone-5 loop over the bundled plugins: the same round trip,
+/// driven by `Session` — opening turn streamed and rebuilt (thinking
+/// carried as `opaque`, text coalesced, the split tool call whole), the
+/// `read` tool dispatched by harvested descriptor with the model's
+/// call as its cause, the result rendered and carried back, the
+/// closing turn streamed. What the vendor received on the closing turn
+/// is the rebuilt message with its thinking block unwrapped in front
+/// of the tool call — the replay the vendor requires.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_loop_drives_the_bundled_provider_and_tools() {
+    let f = fixture();
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(PROVIDER.to_string(), f.config("/loop-round-trip"));
+    // Only one LLM_CHAT plugin is registered: resolved by role.
+    let mut session = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            system: Some("You are terse.".into()),
+            max_tokens: Some(200),
+            plugin_configs: configs,
+            ..SessionConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(session.provider(), PROVIDER);
+    let cancel = CancellationToken::new();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        session.turn("What does hello.txt say?", &cancel),
+    )
+    .await
+    .expect("the turn finishes within 30s")
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.usage.input_tokens, 12 + 40);
+    assert_eq!(outcome.usage.output_tokens, 17 + 9);
+
+    let transcript = session.transcript();
+    assert_eq!(transcript.len(), 4);
+    assert_eq!(
+        transcript[1],
+        json!({"role": "assistant", "content": [
+            opaque_block(),
+            {"type": "text", "text": "Let me read it."},
+            {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
+        ]}),
+        "rebuilt from the stream: opaque in place, text coalesced, the call whole"
+    );
+    assert_eq!(
+        transcript[2],
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_01",
+             "content": "hello from the workspace\n", "is_error": false}
+        ]})
+    );
+    assert_eq!(
+        transcript[3]["content"][0]["text"],
+        "It says: hello from the workspace\n"
+    );
+
+    let sent = {
+        let requests = f.stub.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(p, _, _)| p.starts_with("/loop-round-trip/"))
+            .map(|(_, _, b)| b.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["stream"], true);
+    assert_eq!(
+        sent[1]["messages"][1]["content"],
+        json!([
+            thinking_block(),
+            {"type": "text", "text": "Let me read it."},
+            {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
+        ]),
+        "the provider unwrapped its own opaque block on replay"
+    );
+    assert_eq!(sent[1]["tools"], f.tools(), "the harvest, on every round");
+}
+
+/// A cancel during a buffered round against the real provider: the
+/// cancellation reaches the HTTP step two invokes down and comes back
+/// flattened to text by the nested invoke, and the loop's own token
+/// — not the code — is what makes it a cancel rather than a fatal
+/// provider step error.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_buffered_round_against_the_bundled_provider_is_a_cancel() {
+    let f = fixture();
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(PROVIDER.to_string(), f.config("/stall"));
+    let mut session = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            stream: false,
+            plugin_configs: configs,
+            ..SessionConfig::default()
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let outcome = session.turn("stall", &cancel).await;
+            (session, outcome)
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    cancel.cancel();
+    let (session, outcome) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("the cancel ends the stalled round promptly")
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(gwennol_core::TurnError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(session.transcript().len(), 1, "nothing partial is kept");
 }
 
 // ---------------------------------------------------------- the tools

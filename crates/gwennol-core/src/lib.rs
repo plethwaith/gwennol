@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod context;
 pub mod host;
 pub mod kernel;
@@ -58,8 +59,12 @@ pub mod secrets;
 pub mod spi;
 pub mod steps;
 
+pub use agent::{
+    Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
+    Usage,
+};
 pub use gwead;
-pub use host::{HostConfig, ProcessEnv};
+pub use host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv};
 pub use kernel::{
     BootError, HOST_FS_MANIFEST, HOST_HTTP_MANIFEST, HOST_MANIFESTS, HOST_PROCESS_MANIFEST, boot,
     boot_with,

@@ -116,6 +116,7 @@ fn fixture() -> &'static Fixture {
             // The embedder half of the authorization the manifest's
             // provide: grant asks for.
             trusted_step_type_providers: vec![PLUGIN.to_string()],
+            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         kernel
@@ -142,6 +143,8 @@ struct SseStub {
     /// than dropped, so a broken request shows up in an assertion diff
     /// instead of vanishing.
     requests: Mutex<Vec<(String, Value)>>,
+    /// Paths whose response the relay hung up on mid-way.
+    hangups: Mutex<Vec<String>>,
 }
 
 /// The happy-path SSE body. One keepalive comment, a `ping` event the
@@ -191,6 +194,7 @@ fn sse_stub() -> &'static SseStub {
         let stub: &'static SseStub = Box::leak(Box::new(SseStub {
             addr: listener.local_addr().unwrap(),
             requests: Mutex::new(Vec::new()),
+            hangups: Mutex::new(Vec::new()),
         }));
         common::serve(listener, move |mut socket| {
             // A wedged connection (a client that never finishes its
@@ -247,17 +251,33 @@ fn sse_stub() -> &'static SseStub {
                 let _ = socket.write_all(reason.as_bytes());
                 return;
             }
-            let sse = match path.as_str() {
-                "/error-turn" => ERROR_SSE,
-                "/garbage-turn" => GARBAGE_SSE,
-                _ => HAPPY_SSE,
-            };
             let _ = socket.write_all(
                 b"HTTP/1.1 200 OK\r\n\
                   Content-Type: text/event-stream\r\n\
                   Connection: close\r\n\r\n",
             );
             let _ = socket.flush();
+            if path == "/slow-turn" {
+                // A long, slow turn: text events at a steady pace, so a
+                // consumer that hangs up does so with plenty still to
+                // come. Ends when the relay closes the connection.
+                for i in 0..200 {
+                    let event = format!(
+                        "event: text\ndata: {{\"type\":\"text\",\"text\":\"tick {i} \"}}\n\n"
+                    );
+                    if socket.write_all(event.as_bytes()).is_err() || socket.flush().is_err() {
+                        stub.hangups.lock().unwrap().push(path.clone());
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                return;
+            }
+            let sse = match path.as_str() {
+                "/error-turn" => ERROR_SSE,
+                "/garbage-turn" => GARBAGE_SSE,
+                _ => HAPPY_SSE,
+            };
             // Byte-level splits that respect neither lines nor fields,
             // exercised through the whole kernel pipe; the fixture's
             // multi-byte character rides along. (Whether a split lands
@@ -545,6 +565,66 @@ async fn an_oversized_error_body_is_truncated_with_a_marker() {
         "the message stays within the cap's ceiling ({} > {ceiling} bytes)",
         message.len()
     );
+}
+
+/// Owed by milestone 3, pinned here where the outcome is observable: a
+/// consumer that hangs up mid-turn is a benign stop for the relay, not
+/// a failed step. The dataflow action is driven directly so its result
+/// can be seen — through `chat`'s `io.invoke_streaming` the callee's
+/// outcome is only logged — with the reader dropped after the first
+/// chunk and the vendor still streaming. The relay must then close
+/// its upstream (the stub sees the hangup) and finish `Ok`; a relay
+/// that treated the closed output as an error would resolve `Err`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_hanging_up_is_a_graceful_stop_for_the_relay() {
+    use gwead::futures::StreamExt as _;
+    let f = fixture();
+    let input = json!({
+        "url": format!("http://{}/slow-turn", f.stub.addr),
+        "request": {"model": "m3-fixture", "stream": true, "messages": []}
+    });
+    let mut handle = f
+        .kernel
+        .execute(PLUGIN, STREAM_ACTION, input)
+        .with_config(&json!({}))
+        .into_dataflow_streaming_handle()
+        .expect("the dataflow action streams");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), handle.output.next())
+        .await
+        .expect("the relay produces within 10s")
+        .expect("not EOF")
+        .expect("not an I/O error");
+    assert!(
+        String::from_utf8_lossy(&first).contains("tick"),
+        "{first:?}"
+    );
+    // Hang up: the readable end goes away while the vendor is still
+    // sending — the relay's next write finds no reader.
+    drop(std::mem::replace(
+        &mut handle.output,
+        Box::pin(gwead::futures::stream::empty()),
+    ));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle.result)
+        .await
+        .expect("the relay winds down within 10s")
+        .expect("the pipeline reports");
+    assert!(
+        outcome.is_ok(),
+        "reader-gone is a graceful stop, not a failed step: {outcome:?}"
+    );
+    for _ in 0..250 {
+        if f.stub
+            .hangups
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "/slow-turn")
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the relay never closed its upstream: the vendor kept streaming");
 }
 
 /// The example implements only the streamed form and says so as a step

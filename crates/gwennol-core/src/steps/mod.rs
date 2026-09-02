@@ -27,6 +27,7 @@ pub mod process;
 use std::future::Future;
 use std::pin::Pin;
 
+use gwead::kernel::host_api::PluginErrorPayload;
 use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
@@ -45,14 +46,53 @@ pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
     requested.min(ceiling) as usize
 }
 
+/// The error code a host step fails with when its invocation was
+/// cancelled: a `KernelError::PluginError` carrying it, so a consumer —
+/// the agent loop — recognises cancellation as data and never by
+/// reading error text or guessing from a token's state.
+pub const CANCELLED_CODE: &str = "gwennol.cancelled";
+
+/// The `params.phase` value on a cancellation that withdrew the step's
+/// approval: the operator never answered, so nothing was done. Every
+/// other cancellation lands somewhere in the work, where the step
+/// cannot say how far it got.
+pub const CANCELLED_AT_APPROVAL: &str = "approval";
+
+/// The structured error a cancelled host step returns from inside its
+/// work.
+pub(crate) fn cancelled() -> StepError {
+    cancelled_with(Value::Null)
+}
+
+/// The structured error a host step returns when its approval was
+/// withdrawn: [`CANCELLED_CODE`] with `params.phase` set to
+/// [`CANCELLED_AT_APPROVAL`].
+pub(crate) fn withdrawn() -> StepError {
+    cancelled_with(gwead::serde_json::json!({"phase": CANCELLED_AT_APPROVAL}))
+}
+
+fn cancelled_with(params: Value) -> StepError {
+    StepError::Thrown(PluginErrorPayload {
+        code: CANCELLED_CODE.to_string(),
+        message: "cancelled".to_string(),
+        params,
+    })
+}
+
 /// Run `work` to completion, unless the invocation is cancelled first.
+///
+/// Biased toward cancellation: a checkpoint reached with the token
+/// already cancelled — the operator cancelled while an earlier phase
+/// ran — stops here by construction rather than by winning a coin toss
+/// against work that happens to be ready on its first poll.
 pub(crate) async fn or_cancelled<T>(
     cancel: &CancellationToken,
     work: impl Future<Output = T>,
 ) -> Result<T, StepError> {
     tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(cancelled()),
         r = work => Ok(r),
-        () = cancel.cancelled() => Err(StepError::Failed("cancelled".into())),
     }
 }
 

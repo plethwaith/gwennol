@@ -234,6 +234,78 @@ written, and it must be settled before a provider exists.
   renders tool results through `spi::tool::render_content`. Both are
   contract rules the loop is the first consumer of.
 - **Not in scope:** any frontend beyond a test `Operator`.
+- **Settled: cancellation withdraws a pending approval.** Gwead polls
+  its token between steps and a step's own checkpoints race their
+  work, so until this milestone an open prompt held a cancelled turn
+  until the operator answered it — the decision milestone 4 deferred
+  here. Now the one site every approval goes through races the
+  invocation's token, biased toward cancellation, and the checkpoints
+  are biased the same way: a token cancelled on arrival never asks,
+  and a checkpoint reached cancelled stops by construction. The
+  operator's `approve` future is dropped mid-flight, which the trait
+  documents as a cancel-safety obligation. Pinned with an operator
+  that holds a prompt open — the harness milestone 4's miss-path pin
+  was waiting for — for a read, the miss probe, a write (nothing
+  lands, not even the directories it would have made) and a spawn
+  (never runs). The walk before the miss probe is a few syscalls and
+  cannot be held open; its race is pinned at the boundary after it.
+  A cancelled host step says so as data — a `PluginError` carrying
+  `steps::CANCELLED_CODE`, with `params.phase` naming a withdrawn
+  approval — but the loop's own token is the authority: once it has
+  fired, whatever a step reports is the cut arriving (a nested invoke
+  flattens the code to text, and the text goes to the log), and the
+  code arriving without it is a step failure, reported and logged —
+  the kernel's action ceiling cancels an invocation the same way and
+  remaps only its own `Cancelled` to a timeout, and any plugin may
+  throw the code. The code's part is to say how far the step got:
+  withdrawn at the approval means nothing ran. The process step's
+  own select is biased the other way,
+  work first: a child that has already finished has acted, and its
+  result is the truth about that.
+- **Settled: every tool call is answered.** A tool's own `is_error`
+  is carried as is. A call the tool cannot answer — no such tool,
+  arguments its schema refuses, a step error (the operator denied,
+  the kernel refused), a malformed result — is answered with an
+  `is_error` result carrying the reason verbatim and never branched
+  on; the frontend sees `Event::ToolFailed` rather than
+  `Event::ToolResult`, so the two are never confused. Ending the turn
+  instead would leave a call unanswered and the transcript
+  unreplayable, and a denial in particular is something the model
+  should route around rather than something the user must re-prompt
+  past. Calls run one at a time, in the model's order, so approvals
+  arrive in that order too. A round the model ended in a refusal
+  while still asking for tools is stored with each call answered as
+  not run: the refusal is not continued, and the model keeps the
+  memory of having refused. Cancellation is the exception the other
+  way: the call it cuts off is answered as interrupted while running
+  (it may have acted), the calls after it as interrupted before
+  starting — naming cancellation, not the tool — the exchange is
+  stored whole, and the turn ends cancelled.
+- **Settled: the transcript holds whole things.** A provider round
+  that did not reach `end` is dropped, and so is one whose message is
+  empty — nothing to replay, and a vendor refuses an empty assistant
+  message anywhere but last; one that did is stored with the answer
+  to every call it made. A turn that fails or is
+  cancelled therefore leaves the transcript ending in a user message,
+  and the next turn's text joins that message after any results in
+  it — the protocol's results-before-text order, and never two user
+  messages in a row.
+- **Settled: provider failures and provider choice.** A `Failure`
+  marked `retryable` is retried unchanged with bounded backoff; any
+  other ends the turn. A provider step error is fatal and never
+  retried. Everything off the contract — an unknown stop reason or
+  event type, a block or field the closed schemas do not admit, a
+  stream that ends without `end` — fails the turn rather than being
+  guessed at, and one stream event is bounded by a configurable cap.
+  The provider is resolved by role and refused when more than one
+  plugin fulfils it, unless the session names one: which model a
+  session talks to should never be a silent first-wins.
+- **Settled: the action ceiling is the frontend's.** Gwead caps a
+  non-dataflow action at 60 seconds by default — sized for request
+  handlers — which would end a `bash` call the tool itself allows an
+  hour, and count the operator's deliberation against it.
+  `HostConfig::action_timeout` (default two hours: twice the longest
+  bound a host step applies to itself) is what the kernel boots with.
 
 ### 6. Non-interactive CLI
 

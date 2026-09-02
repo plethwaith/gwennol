@@ -24,8 +24,9 @@ and the check is action presence: a plugin claiming `LLM_CHAT` without a
 - **Payloads are never validated by the kernel.** The `input`/`output`
   schemas in the contract documents are documentation and tooling input.
   Whoever dispatches is responsible for conformance — concretely, the
-  milestone-5 loop must validate model-emitted tool arguments against the
-  tool's declared schema before dispatching a `call`.
+  agent loop (`gwennol_core::agent`) validates model-emitted tool
+  arguments against the tool's declared schema before dispatching a
+  `call`, and reads everything a provider returns fail-closed.
 
 ## `LLM_CHAT`
 
@@ -148,7 +149,7 @@ table numbers its handles from 1, and an execution run *without* a
 caller-supplied table has its streams drained when it returns. The table
 the caller supplies is granted to the executed action wholesale, so scope
 one table per call. Reading the handle after the action returns is the
-designed pattern — it is how the milestone-5 loop will consume a turn.
+designed pattern — it is how the agent loop consumes a turn.
 
 The stream yields UTF-8 newline-delimited JSON, one event per line
 (`streamEventShape` in the contract):
@@ -188,7 +189,8 @@ line — so consumers must not assume bounded lines.
 One dispatch caveat: `Kernel::execute_by_role` cannot carry a streams
 table, so a streaming caller resolves the role first
 (`Kernel::role_candidates`) and executes the winner with
-`.with_streams(…)` — the integration tests show the pattern.
+`.with_streams(…)` — the loop and the integration tests show the
+pattern.
 
 ## `TOOL`
 
@@ -202,7 +204,12 @@ out.
 `is_error: true` marks a failure the *model* should react to — file not
 found, command exited nonzero. Infrastructure failures (the plugin lacked
 a grant, the operator denied, the kernel refused) are step errors and
-never masquerade as tool results.
+never masquerade as tool results. The loop still answers such a call —
+the protocol requires every call answered — with an `is_error` result
+carrying the step's message verbatim, and tells the frontend as data
+that the tool did not answer (`Event::ToolFailed`), so the distinction
+this boundary exists for is kept at every layer; see the milestone-5
+record in the roadmap.
 
 That boundary constrains milestone 4 at the host-step layer, not just in
 tool manifests. A declarative tool's only failure primitive is the `try`

@@ -101,19 +101,61 @@ pub enum Decision {
 }
 
 /// Something the loop wants the frontend to show.
+///
+/// One event per thing that happened, in the order it happened: text as
+/// it streams (or per block, on a buffered turn), each tool call as the
+/// loop dispatches it, and exactly one of [`Event::ToolResult`] or
+/// [`Event::ToolFailed`] per call the model made — including a call the
+/// loop never dispatched, which gets its [`Event::ToolFailed`] with no
+/// [`Event::ToolCall`] before it, so a frontend hears about every
+/// result the model gets. What the model is *told* is the same in both
+/// cases — a `tool_result` block, `is_error` when the tool did not
+/// succeed — but the frontend is told which it was as data, so a tool
+/// that reported a failure and a tool that could not run are never
+/// confused (the boundary `docs/SPI.md` draws).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
     /// A chunk of model output text.
     Text(String),
-    /// The model is invoking a tool.
+    /// The loop is about to run a tool the model asked for.
     ToolCall(ToolCall),
-    /// A tool returned.
+    /// The tool answered. `content` is what the model sees — rendered
+    /// through the shared truncation convention — and `is_error` is the
+    /// tool's own verdict on it.
     ToolResult {
-        /// Tool name.
-        name: String,
-        /// JSON-encoded result.
-        result: String,
+        /// The call this answers.
+        call: ToolCall,
+        /// The result as handed to the model.
+        content: String,
+        /// The tool reported a failure the model should react to.
+        is_error: bool,
+    },
+    /// The tool could not answer, or was never asked. The model named a
+    /// tool that is not registered, sent arguments its schema refuses,
+    /// or the call failed as a step (the operator denied, the kernel
+    /// refused, the plugin returned a malformed result); or the turn
+    /// was cancelled while it ran; or the loop did not run it at all —
+    /// the turn was cancelled before it started, or the model refused
+    /// its own turn after asking — in which case no [`Event::ToolCall`]
+    /// precedes this. The model is told, as an `is_error` result
+    /// carrying `error` verbatim; the loop never branches on the text.
+    ToolFailed {
+        /// The call that got no answer.
+        call: ToolCall,
+        /// Why, as the model is told it.
+        error: String,
+    },
+    /// The provider refused a turn in a way it marked worth repeating,
+    /// and the loop is about to repeat it. Text already shown for the
+    /// failed attempt will be shown again.
+    Retry {
+        /// The attempt about to be made, counting the first as 1.
+        attempt: u32,
+        /// The most the loop will make.
+        max_attempts: u32,
+        /// The provider's reason for the failed attempt.
+        failure: crate::agent::Failure,
     },
     /// The current turn is complete.
     TurnComplete,
@@ -130,6 +172,14 @@ pub struct Turn {
 #[async_trait::async_trait]
 pub trait Operator: Send + Sync {
     /// Decide whether a native step may do something outside the sandbox.
+    ///
+    /// The question can be withdrawn: when the invocation behind it is
+    /// cancelled — the loop's turn was cancelled while this prompt was
+    /// open — the host stops waiting and this future is dropped before
+    /// it resolves. An implementation must therefore be safe to drop at
+    /// any await point: a prompt it put on screen should come down
+    /// (a guard type is the usual shape), and nothing it does after an
+    /// await may be needed for consistency.
     async fn approve(&self, request: ApprovalRequest) -> Decision;
 
     /// Produce a secret for a plugin, if the operator is willing to hand it
@@ -142,5 +192,10 @@ pub trait Operator: Send + Sync {
     fn emit(&self, event: Event);
 
     /// Block for the next user turn. `None` ends the session.
+    ///
+    /// Like [`Self::approve`], this future can be dropped before it
+    /// resolves: [`crate::agent::Session::run`] stops waiting for input
+    /// when its session token is cancelled. An implementation must be
+    /// safe to drop at any await point.
     async fn input(&self) -> Option<Turn>;
 }
