@@ -186,5 +186,10 @@ pub trait Operator: Send + Sync {
     fn emit(&self, event: Event);
 
     /// Block for the next user turn. `None` ends the session.
+    ///
+    /// Like [`Self::approve`], this future can be dropped before it
+    /// resolves: [`crate::agent::Session::run`] stops waiting for input
+    /// when its session token is cancelled. An implementation must be
+    /// safe to drop at any await point.
     async fn input(&self) -> Option<Turn>;
 }

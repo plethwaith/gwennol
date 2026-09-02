@@ -8,34 +8,22 @@ use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
 
 /// Why [`EventReader::next`] could not produce an event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReadError {
     /// The turn was cancelled while waiting for bytes.
+    #[error("cancelled")]
     Cancelled,
     /// One line grew past the cap without ending. Events can be
     /// arbitrarily long by contract, so the cap is the consumer's
     /// bound on buffering, not a contract limit.
+    #[error("a stream event exceeded the {cap}-byte cap without ending")]
     TooLong { cap: usize },
     /// A line was not a JSON document.
+    #[error("a stream line is not JSON: {0}")]
     NotJson(String),
     /// The read failed with a stream error code other than end-of-stream.
+    #[error("stream read failed with code {0}")]
     Io(i32),
-}
-
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadError::Cancelled => write!(f, "cancelled"),
-            ReadError::TooLong { cap } => {
-                write!(
-                    f,
-                    "a stream event exceeded the {cap}-byte cap without ending"
-                )
-            }
-            ReadError::NotJson(e) => write!(f, "a stream line is not JSON: {e}"),
-            ReadError::Io(code) => write!(f, "stream read failed with code {code}"),
-        }
-    }
 }
 
 /// One-event-at-a-time reader over a readable handle in `streams`.
@@ -48,7 +36,12 @@ pub(crate) struct EventReader {
     streams: SharedStreamRegistry,
     id: StreamId,
     buf: Vec<u8>,
+    /// Bytes before this offset have been returned as lines.
     consumed: usize,
+    /// Bytes before this offset hold no newline: the scan for the next
+    /// line resumes here, so a long event costs one pass, not one per
+    /// chunk it spans.
+    scanned: usize,
     cap: usize,
     eof: bool,
 }
@@ -65,6 +58,7 @@ impl EventReader {
             id,
             buf: Vec::new(),
             consumed: 0,
+            scanned: 0,
             cap,
             eof: false,
         }
@@ -80,18 +74,23 @@ impl EventReader {
         cancel: &CancellationToken,
     ) -> Result<Option<Value>, ReadError> {
         loop {
-            if let Some(nl) = self.buf[self.consumed..].iter().position(|b| *b == b'\n') {
-                let line = &self.buf[self.consumed..self.consumed + nl];
+            let from = self.scanned.max(self.consumed);
+            if let Some(offset) = self.buf[from..].iter().position(|b| *b == b'\n') {
+                let newline = from + offset;
+                let line = &self.buf[self.consumed..newline];
                 let parsed = gwead::serde_json::from_slice::<Value>(line);
-                self.consumed += nl + 1;
+                self.consumed = newline + 1;
+                self.scanned = self.consumed;
                 if self.consumed * 2 >= self.buf.len() {
                     self.buf.drain(..self.consumed);
                     self.consumed = 0;
+                    self.scanned = 0;
                 }
                 return parsed
                     .map(Some)
                     .map_err(|e| ReadError::NotJson(e.to_string()));
             }
+            self.scanned = self.buf.len();
             if self.eof {
                 return Ok(None);
             }

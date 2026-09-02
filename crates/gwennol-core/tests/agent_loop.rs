@@ -443,12 +443,13 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
         ],
         "/slow-tool" => quote(body),
         "/gated-tool" => one_call("gated", json!({"path": "hello.txt"})),
-        "/retry" | "/retry-once" if asked == 1 => vec![
+        "/empty" => vec![end("max_tokens")],
+        "/retry" | "/retry-once" | "/retry-clamped" if asked == 1 => vec![
             text("partial"),
             json!({"type": "error", "message": "overloaded", "retryable": true, "kind": "overloaded_error"}),
         ],
-        "/retry" | "/retry-once" => vec![text("recovered"), end("end_turn")],
-        "/always-retryable" => {
+        "/retry" | "/retry-once" | "/retry-clamped" => vec![text("recovered"), end("end_turn")],
+        "/always-retryable" | "/always-retryable-saturating" => {
             vec![json!({"type": "error", "message": "still overloaded", "retryable": true})]
         }
         "/fatal" => vec![
@@ -983,6 +984,40 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     );
     assert_eq!(f.stub.requests_for("/always-retryable").len(), 3);
 
+    // The backoff is clamped before the first wait and doubled without
+    // overflow: an hour's initial backoff under a millisecond ceiling
+    // retries at once, and a maximal one never panics the loop.
+    let mut s = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            retry: gwennol_core::RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::from_secs(3600),
+                max_backoff: Duration::from_millis(1),
+            },
+            ..config("/retry-clamped")
+        },
+    )
+    .unwrap();
+    assert_eq!(turn(&mut s, "clamped").await.unwrap().rounds, 1);
+    let mut s = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            retry: gwennol_core::RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::MAX,
+                max_backoff: Duration::from_millis(1),
+            },
+            ..config("/always-retryable-saturating")
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        turn(&mut s, "saturating").await.unwrap_err(),
+        TurnError::Provider(_)
+    ));
+    assert_eq!(f.stub.requests_for("/always-retryable-saturating").len(), 3);
+
     for route in ["/fatal", "/unknown-retryable"] {
         let mut s = session(route);
         let err = turn(&mut s, "no").await.unwrap_err();
@@ -1049,14 +1084,26 @@ async fn refusal_and_max_tokens_end_the_turn() {
     assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
     assert_eq!(s.transcript()[1]["content"][0]["text"], "cut off");
 
+    // A refusal that also asked for tools is kept, its calls answered
+    // as not run — the model remembers refusing, and the transcript
+    // stays replayable.
     let mut s = session("/refusal-with-call");
     let outcome = turn(&mut s, "hm").await.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Refusal);
+    assert_eq!(s.transcript().len(), 3);
+    assert_eq!(s.transcript()[1]["content"][0]["type"], "tool_use");
     assert_eq!(
-        s.transcript(),
-        &[user("hm")],
-        "an unanswerable message is not kept"
+        s.transcript()[2]["content"][0],
+        json!({"type": "tool_result", "tool_use_id": "c1",
+               "content": "not run: the model's turn ended in a refusal", "is_error": true})
     );
+
+    // An empty message is a completed turn with nothing to replay: not
+    // stored, so the next turn's text joins the user message it left.
+    let mut s = session("/empty");
+    let outcome = turn(&mut s, "cut short").await.unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+    assert_eq!(s.transcript(), &[user("cut short")]);
 }
 
 /// The round cap ends a turn whose model never stops asking for tools;
@@ -1078,6 +1125,21 @@ async fn the_round_limit_bounds_a_turn() {
     ));
     assert_eq!(s.transcript().len(), 7, "user + 3 × (assistant, results)");
     assert_eq!(s.transcript()[6]["role"], "user");
+
+    // Zero is read as one, and reported as what ran.
+    let mut s = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            max_rounds: 0,
+            ..config("/endless-tools")
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        turn(&mut s, "once").await.unwrap_err(),
+        TurnError::RoundLimit(1)
+    ));
+    assert_eq!(s.transcript().len(), 3);
 }
 
 /// After a turn that did not complete, the next turn's text joins the
@@ -1171,24 +1233,23 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
             Event::ToolCall(slow.clone()),
             Event::ToolFailed {
                 call: slow,
-                error: "interrupted: the turn was cancelled before this call completed".into()
+                error: "interrupted: the turn was cancelled while this call was running; it may have run in part or in full".into()
             },
         ],
         "the second call never started"
     );
     let transcript = s.transcript();
     assert_eq!(transcript.len(), 3, "the exchange is kept whole");
-    let results = transcript[2]["content"].as_array().unwrap();
-    assert_eq!(results.len(), 2);
-    for result in results {
-        assert_eq!(result["is_error"], true);
-        assert!(
-            result["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("interrupted:")
-        );
-    }
+    assert_eq!(
+        transcript[2]["content"],
+        json!([
+            {"type": "tool_result", "tool_use_id": "c1", "is_error": true,
+             "content": "interrupted: the turn was cancelled while this call was running; it may have run in part or in full"},
+            {"type": "tool_result", "tool_use_id": "c2", "is_error": true,
+             "content": "interrupted: the turn was cancelled before this call started"},
+        ]),
+        "the cut-off call and the never-started one are told apart"
+    );
     // The next turn continues from there: its text joins the results.
     let mut s = s;
     turn(&mut s, "carry on").await.unwrap();

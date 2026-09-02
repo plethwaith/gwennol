@@ -38,7 +38,10 @@
 //!   operator's refusal in particular is something the model should
 //!   go around, not something the user should have to re-prompt past.
 //!   Calls run one at a time, in the order the model made them, so
-//!   the operator's prompts arrive in that order too.
+//!   the operator's prompts arrive in that order too. A round the
+//!   model ended in a refusal while still asking for tools is stored
+//!   with each call answered as not run: the refusal is not continued,
+//!   and the model keeps the memory of having refused.
 //! - **Provider failures are data or fatal, never guessed.** A
 //!   `Failure` the provider marked `retryable` is retried, unchanged,
 //!   with bounded backoff ([`RetryPolicy`]); any other `Failure` ends
@@ -49,17 +52,21 @@
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a pending approval is
-//!   withdrawn, a running tool step is cancelled. Cancellation is
-//!   checked before any other reading of a failure, so a cancelled
-//!   tool call is never mistaken for one that could not run: it is
-//!   answered as *interrupted* — as are the calls after it that never
-//!   started — and the turn ends as [`TurnError::Cancelled`] once that
-//!   exchange is stored. The model is told the truth about a call
-//!   that did not complete, in words that name cancellation and not a
-//!   tool failure, because a tool earlier in the same message may
-//!   already have done its work.
+//!   withdrawn, a running tool step is cancelled. A cancelled
+//!   invocation says so as data — the kernel's own `Cancelled`, or a
+//!   host step's structured `steps::CANCELLED_CODE` — so a cancelled
+//!   tool call is never mistaken for one that could not run, and a
+//!   failure that merely lands after the token fired keeps its real
+//!   reason. The cut-off call is answered as *interrupted while
+//!   running* (it may have acted), the calls after it as *interrupted
+//!   before starting*, and the turn ends as [`TurnError::Cancelled`]
+//!   once that exchange is stored: the model is told the truth about
+//!   a call that did not complete, in words that name cancellation
+//!   and not a tool failure.
 //! - **The transcript holds only whole things.** A provider round
-//!   that did not reach its `end` event is dropped; a round that did
+//!   that did not reach its `end` event is dropped, and so is a round
+//!   whose message is empty (nothing to replay, and a vendor refuses
+//!   an empty assistant message anywhere but last); a round that did
 //!   is kept together with the answer to every call it made. A failed
 //!   or cancelled turn therefore leaves the transcript ending in a
 //!   user message — the user's text, or the last round's results — and
@@ -88,6 +95,7 @@ mod stream;
 mod tools;
 mod transcript;
 
+use gwead::kernel::streams::STREAM_IO_ERROR;
 use stream::{EventReader, ReadError};
 use tools::{ToolTable, parse_output};
 use transcript::{MessageBuilder, ToolUse, Transcript, check_assistant_message, check_block};
@@ -316,7 +324,12 @@ pub struct SessionConfig {
     pub stream: bool,
     /// The `$config` each plugin runs under, by plugin name — a
     /// provider's model and endpoint, say. A plugin not listed runs
-    /// under `{}`.
+    /// under `{}`. Applies to the action the loop dispatches: Gwead
+    /// hands a caller's config through to the actions it invokes, so
+    /// a plugin that invokes another runs it under its own config. The
+    /// bundled plugins invoke only themselves; re-keying config per
+    /// callee is a dispatch-orchestrator concern that arrives with
+    /// installable plugins.
     pub plugin_configs: BTreeMap<String, Value>,
     /// Most provider calls one turn may make before it is abandoned.
     pub max_rounds: u32,
@@ -454,8 +467,9 @@ impl Session {
         cancel: &CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
         self.transcript.push_user_text(text);
+        let max_rounds = self.config.max_rounds.max(1);
         let mut usage = Usage::default();
-        for round_no in 1..=self.config.max_rounds.max(1) {
+        for round_no in 1..=max_rounds {
             let round = self.round_with_retry(cancel).await?;
             usage.add(round.usage);
             if !self.config.stream {
@@ -471,58 +485,71 @@ impl Session {
                     "stop_reason is tool_use but the message has no tool_use block".into(),
                 ));
             }
-            if round.stop_reason == StopReason::Refusal && !round.calls.is_empty() {
-                // A refused turn is not continued, and a stored tool
-                // call must be answered: the two rules meet only by
-                // dropping the message. The refusal itself ends the
-                // turn; the next turn starts from the user's text.
-                tracing::warn!(
-                    calls = round.calls.len(),
-                    "provider refused a turn that also asked for tools; the message is not kept"
-                );
-                self.operator.emit(Event::TurnComplete);
-                return Ok(TurnOutcome {
-                    stop_reason: round.stop_reason,
-                    rounds: round_no,
-                    usage,
-                });
-            }
             if round.calls.is_empty() {
+                // An empty message — a refusal or a cap hit before any
+                // block completed — is not stored: there is nothing to
+                // replay, and a vendor refuses an empty assistant
+                // message anywhere but last. The next turn's text then
+                // joins the user message this one left.
+                if is_empty_message(&round.message) {
+                    tracing::debug!(stop_reason = ?round.stop_reason, "empty assistant message not stored");
+                } else {
+                    self.transcript.push_assistant(round.message);
+                }
+                return self.complete(round.stop_reason, round_no, usage);
+            }
+            if round.stop_reason == StopReason::Refusal {
+                // A refused turn is not continued, and a stored call
+                // must be answered: each is answered as not run, so the
+                // refusal — and any text before it — stays in the
+                // model's memory and the transcript stays replayable.
+                let results = round
+                    .calls
+                    .iter()
+                    .map(|call| not_run_result(call, REFUSED))
+                    .collect();
                 self.transcript.push_assistant(round.message);
-                self.operator.emit(Event::TurnComplete);
-                return Ok(TurnOutcome {
-                    stop_reason: round.stop_reason,
-                    rounds: round_no,
-                    usage,
-                });
+                self.transcript.push_tool_results(results);
+                return self.complete(round.stop_reason, round_no, usage);
             }
             // Every call answered, in order, in the next message. A
             // cancellation part-way answers the rest as interrupted, so
             // the exchange is still whole when it is stored — a tool
             // before the cut may already have acted.
             let mut results = Vec::with_capacity(round.calls.len());
-            let mut interrupted = false;
             for call in &round.calls {
-                if interrupted || cancel.is_cancelled() {
-                    results.push(interrupted_result(call));
-                    continue;
-                }
-                match self.answer(call, cancel).await {
-                    Ok(block) => results.push(block),
-                    Err(TurnError::Cancelled) => {
-                        results.push(interrupted_result(call));
-                        interrupted = true;
+                let block = if cancel.is_cancelled() {
+                    not_run_result(call, INTERRUPTED_BEFORE_START)
+                } else {
+                    match self.answer(call, cancel).await {
+                        Ok(block) => block,
+                        Err(Interrupted) => not_run_result(call, INTERRUPTED_WHILE_RUNNING),
                     }
-                    Err(other) => return Err(other),
-                }
+                };
+                results.push(block);
             }
             self.transcript.push_assistant(round.message);
             self.transcript.push_tool_results(results);
-            if interrupted || cancel.is_cancelled() {
+            if cancel.is_cancelled() {
                 return Err(TurnError::Cancelled);
             }
         }
-        Err(TurnError::RoundLimit(self.config.max_rounds))
+        Err(TurnError::RoundLimit(max_rounds))
+    }
+
+    /// The turn is over: tell the frontend, and say how.
+    fn complete(
+        &self,
+        stop_reason: StopReason,
+        rounds: u32,
+        usage: Usage,
+    ) -> Result<TurnOutcome, TurnError> {
+        self.operator.emit(Event::TurnComplete);
+        Ok(TurnOutcome {
+            stop_reason,
+            rounds,
+            usage,
+        })
     }
 
     fn config_for(&self, plugin: &str) -> &Value {
@@ -570,12 +597,16 @@ impl Session {
                         max_attempts,
                         failure,
                     });
+                    // Clamped before it is waited, doubled without
+                    // overflow: the policy's values are the frontend's
+                    // and may be anything.
+                    let wait = backoff.min(self.config.retry.max_backoff);
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => return Err(TurnError::Cancelled),
-                        () = tokio::time::sleep(backoff) => {}
+                        () = tokio::time::sleep(wait) => {}
                     }
-                    backoff = (backoff * 2).min(self.config.retry.max_backoff);
+                    backoff = backoff.saturating_mul(2);
                 }
                 RoundResult::Failed(failure) => return Err(TurnError::Provider(failure)),
             }
@@ -591,10 +622,10 @@ impl Session {
             .execute(&self.provider, spi::llm_chat::CHAT, input)
             .with_config(self.config_for(&self.provider))
             .with_cancel(cancel.child_token());
-        // A provider step error is fatal — unless the loop itself
-        // cancelled, which is what a cancelled invocation reports as.
+        // A provider step error is fatal — unless it is the invocation
+        // reporting its own cancellation.
         let fatal = |e: KernelError| {
-            if cancel.is_cancelled() {
+            if is_cancellation(&e) {
                 TurnError::Cancelled
             } else {
                 TurnError::Step(e)
@@ -636,13 +667,20 @@ impl Session {
         cancel: &CancellationToken,
     ) -> Result<RoundResult, TurnError> {
         let mut builder = MessageBuilder::default();
-        let mut calls = Vec::new();
         loop {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 Ok(None) => return Err(TurnError::StreamEnded),
                 Err(ReadError::Cancelled) => return Err(TurnError::Cancelled),
-                Err(ReadError::Io(_)) => return Err(TurnError::StreamEnded),
+                // The source failed: the relay died, or the transport
+                // under it. Any other code is about the handle itself —
+                // closed, wrong direction, unknown — and cannot arise
+                // from a table the loop owns; it is reported as what
+                // it is rather than folded into "the cause was lost".
+                Err(ReadError::Io(STREAM_IO_ERROR)) => {
+                    tracing::warn!("stream source reported an I/O error mid-turn");
+                    return Err(TurnError::StreamEnded);
+                }
                 Err(e) => return Err(TurnError::Contract(e.to_string())),
             };
             let Some(fields) = event.as_object() else {
@@ -660,14 +698,7 @@ impl Session {
                     self.operator.emit(Event::Text(text.to_string()));
                     builder.text(text);
                 }
-                Some("tool_use") => {
-                    let call = check_block(&event)
-                        .map_err(TurnError::Contract)?
-                        .expect("a checked tool_use block is a call");
-                    calls.push(call);
-                    builder.block(event);
-                }
-                Some("opaque") => {
+                Some("tool_use" | "opaque") => {
                     check_block(&event).map_err(TurnError::Contract)?;
                     builder.block(event);
                 }
@@ -679,17 +710,13 @@ impl Session {
                             )));
                         }
                     }
-                    let stop_reason =
-                        StopReason::parse(fields.get("stop_reason").unwrap_or(&Value::Null))
-                            .map_err(TurnError::Contract)?;
-                    let usage = Usage::parse(fields.get("usage").unwrap_or(&Value::Null))
-                        .map_err(TurnError::Contract)?;
-                    return Ok(RoundResult::Message(Round {
-                        message: builder.finish(),
-                        calls,
-                        stop_reason,
-                        usage,
-                    }));
+                    return round_from(
+                        builder.finish(),
+                        fields.get("stop_reason"),
+                        fields.get("usage"),
+                    )
+                    .map(RoundResult::Message)
+                    .map_err(TurnError::Contract);
                 }
                 Some("error") => {
                     let failure = Failure::parse(fields, true).map_err(TurnError::Contract)?;
@@ -710,9 +737,15 @@ impl Session {
     }
 
     /// Answer one tool call: the `tool_result` block the model gets.
-    /// Every path but cancellation produces a block — see the module
-    /// docs for why a call that could not run is still answered.
-    async fn answer(&self, call: &ToolUse, cancel: &CancellationToken) -> Result<Value, TurnError> {
+    /// Every path produces a block — see the module docs for why a call
+    /// that could not run is still answered — except the invocation
+    /// reporting its own cancellation, which the caller answers as
+    /// interrupted.
+    async fn answer(
+        &self,
+        call: &ToolUse,
+        cancel: &CancellationToken,
+    ) -> Result<Value, Interrupted> {
         let tool_call = ToolCall {
             id: Some(call.id.clone()),
             name: call.name.clone(),
@@ -744,13 +777,15 @@ impl Session {
                         Ok(result) => parse_output(&result.output).map_err(|e| {
                             format!("{:?} returned a malformed result: {e}", call.name)
                         }),
-                        Err(_) if cancel.is_cancelled() => {
+                        Err(e) if is_cancellation(&e) => {
                             self.operator.emit(Event::ToolFailed {
                                 call: tool_call,
-                                error: INTERRUPTED.to_string(),
+                                error: INTERRUPTED_WHILE_RUNNING.to_string(),
                             });
-                            return Err(TurnError::Cancelled);
+                            return Err(Interrupted);
                         }
+                        // A failure that lands after the token fired
+                        // is still that failure: its reason is kept.
                         Err(e) => Err(format!(
                             "{:?} failed before producing a result: {e}",
                             call.name
@@ -788,18 +823,65 @@ impl Session {
     }
 }
 
-/// What the model is told about a call the turn's cancellation cut off.
-/// Names cancellation, not the tool: the tool did not fail, it was not
-/// allowed to finish — or to start.
-const INTERRUPTED: &str = "interrupted: the turn was cancelled before this call completed";
+/// The invocation behind a tool call reported its own cancellation.
+struct Interrupted;
 
-/// The `tool_result` block answering a call that cancellation cut off.
-fn interrupted_result(call: &ToolUse) -> Value {
+/// Whether a kernel error is the invocation reporting its cancellation
+/// — the kernel's own between-step check, or a host step's structured
+/// cancellation (`steps::CANCELLED_CODE`) — as opposed to a failure that
+/// happens to arrive after the token fired, which keeps its real reason.
+fn is_cancellation(e: &KernelError) -> bool {
+    match e {
+        KernelError::Cancelled { .. } => true,
+        KernelError::PluginError { code, .. } => code == crate::steps::CANCELLED_CODE,
+        _ => false,
+    }
+}
+
+/// What the model is told about a call cancellation cut off while it
+/// ran. Names cancellation, not the tool, and claims no more than is
+/// known: the work may have happened.
+const INTERRUPTED_WHILE_RUNNING: &str = "interrupted: the turn was cancelled while this call was running; it may have run in part or in full";
+
+/// What the model is told about a call cancellation reached before it
+/// started.
+const INTERRUPTED_BEFORE_START: &str =
+    "interrupted: the turn was cancelled before this call started";
+
+/// What the model is told about a call it made in a turn it then
+/// refused to continue.
+const REFUSED: &str = "not run: the model's turn ended in a refusal";
+
+/// The `tool_result` block answering a call that was not run, and why.
+fn not_run_result(call: &ToolUse, reason: &str) -> Value {
     json!({
         "type": "tool_result",
         "tool_use_id": call.id,
-        "content": INTERRUPTED,
+        "content": reason,
         "is_error": true,
+    })
+}
+
+/// An assistant message with no content blocks at all.
+fn is_empty_message(message: &Value) -> bool {
+    message["content"].as_array().is_some_and(Vec::is_empty)
+}
+
+/// A completed round from its pieces — the shared tail of the buffered
+/// form and of the stream's `end` event.
+fn round_from(
+    message: Value,
+    stop_reason: Option<&Value>,
+    usage: Option<&Value>,
+) -> Result<Round, String> {
+    let calls = check_assistant_message(&message)?;
+    let stop_reason = StopReason::parse(stop_reason.unwrap_or(&Value::Null))?;
+    let usage = Usage::parse(usage.unwrap_or(&Value::Null))?;
+    Ok(Round {
+        message,
+        calls,
+        stop_reason,
+        usage,
     })
 }
 
@@ -840,17 +922,13 @@ fn interpret_buffered(out: &Value) -> Result<RoundResult, TurnError> {
     let message = fields
         .get("message")
         .ok_or_else(|| TurnError::Contract("chat output has no `message`".into()))?;
-    let calls = check_assistant_message(message).map_err(TurnError::Contract)?;
-    let stop_reason = StopReason::parse(fields.get("stop_reason").unwrap_or(&Value::Null))
-        .map_err(TurnError::Contract)?;
-    let usage =
-        Usage::parse(fields.get("usage").unwrap_or(&Value::Null)).map_err(TurnError::Contract)?;
-    Ok(RoundResult::Message(Round {
-        message: message.clone(),
-        calls,
-        stop_reason,
-        usage,
-    }))
+    round_from(
+        message.clone(),
+        fields.get("stop_reason"),
+        fields.get("usage"),
+    )
+    .map(RoundResult::Message)
+    .map_err(TurnError::Contract)
 }
 
 impl std::fmt::Debug for RoundResult {
