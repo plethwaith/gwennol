@@ -136,3 +136,71 @@ impl Stream {
         let _ = sys::stream_close(self.handle);
     }
 }
+
+/// What became of one line written with [`Stream::write_json_line`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The consumer took it.
+    Delivered,
+    /// The consumer has closed its handle — [`StreamError::Closed`],
+    /// which is the normal way a producer learns the reader stopped
+    /// listening. Wind down; don't treat it as a failure.
+    ReaderGone,
+}
+
+impl Stream {
+    /// Write one JSON value as one newline-terminated line — the
+    /// contract's NDJSON event framing — folding the consumer's hangup
+    /// into [`Delivery::ReaderGone`] instead of an error.
+    ///
+    /// Compact serialisation is what keeps one event on one line: a
+    /// value carrying raw newlines inside its strings is escaped, never
+    /// split.
+    pub fn write_json_line(&self, value: &serde_json::Value) -> Result<Delivery, StreamError> {
+        let mut line = serde_json::to_string(value).map_err(|_| StreamError::Io)?;
+        line.push('\n');
+        match self.write_all(line.as_bytes()) {
+            Ok(()) => Ok(Delivery::Delivered),
+            Err(StreamError::Closed) => Ok(Delivery::ReaderGone),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read the rest of the stream as lossy UTF-8, trimmed and truncated
+    /// to `cap` bytes — an excerpt for an error message, typically a
+    /// vendor's non-2xx body. Up to one extra chunk is consumed past the
+    /// cap; that overshoot is how truncation is detected, and is trimmed
+    /// away. Every degraded state marks itself: a truncated excerpt
+    /// says so, a read error mid-body marks the partial excerpt as
+    /// interrupted, and a body that could not be read at all says that
+    /// instead of posing as empty.
+    pub fn read_excerpt(&self, cap: usize) -> String {
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut interrupted = false;
+        while collected.len() <= cap {
+            match self.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => collected.extend_from_slice(&buf[..n]),
+                Err(_) => {
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+        let truncated = collected.len() > cap;
+        collected.truncate(cap);
+        let mut text = String::from_utf8_lossy(&collected).trim().to_string();
+        let marker = match (text.is_empty(), truncated, interrupted) {
+            (true, false, true) => "(body unreadable)",
+            (_, true, _) => "…(truncated)",
+            (false, false, true) => "…(read interrupted)",
+            _ => return text,
+        };
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(marker);
+        text
+    }
+}

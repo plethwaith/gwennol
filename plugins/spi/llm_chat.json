@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "name": "LLM_CHAT",
   "displayName": "Chat-model provider",
-  "version": "0.1.0",
-  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
+  "version": "0.3.0",
+  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the vendor answered but the turn failed, a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
       "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`.",
@@ -61,8 +61,17 @@
               "stream": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "A Gwead stream handle: an index into the StreamRegistry the caller attached to this execution, meaningless against any other table (each table numbers its handles from 1; an execution run without a caller-supplied table has its streams drained when it returns). It yields UTF-8 newline-delimited JSON, one `streamEventShape` event per line, ending with an `end` event followed by end-of-stream. End-of-stream without an `end` event means the turn failed mid-stream — an `error` event, when the provider can still say why, is followed by end-of-stream, never by `end`."
+                "description": "A Gwead stream handle: an index into the StreamRegistry the caller attached to this execution, meaningless against any other table (each table numbers its handles from 1; an execution run without a caller-supplied table has its streams drained when it returns). It yields UTF-8 newline-delimited JSON, one `streamEventShape` event per line, ending with an `end` event followed by end-of-stream. The assistant message a consumer rebuilds from the stream — to replay on the next turn — is the events in order, adjacent `text` events coalesced into one text block, `tool_use` and `opaque` events kept whole and in place. End-of-stream without an `end` event means the turn failed mid-stream — an `error` event, when the provider can still say why, is followed by end-of-stream, never by `end`."
               }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["error"],
+            "additionalProperties": false,
+            "description": "The failed form, buffered path only: the request reached the vendor and the vendor said no — a non-2xx status, or an error document — so the provider can still say why, as data. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn. A streamed turn reports the same failure as its `error` event instead.",
+            "properties": {
+              "error": { "$ref": "#/$defs/Failure" }
             }
           }
         ]
@@ -95,6 +104,17 @@
       },
       {
         "type": "object",
+        "required": ["type", "provider", "data"],
+        "additionalProperties": false,
+        "description": "A complete OpaqueBlock, emitted whole in its position among the turn's blocks. A consumer rebuilding the assistant message from the stream keeps it there, between the text and tool_use blocks around it.",
+        "properties": {
+          "type": { "const": "opaque" },
+          "provider": { "type": "string" },
+          "data": {}
+        }
+      },
+      {
+        "type": "object",
         "required": ["type", "stop_reason", "usage"],
         "additionalProperties": false,
         "description": "The final event of every successful stream.",
@@ -108,7 +128,7 @@
         "type": "object",
         "required": ["type", "message"],
         "additionalProperties": false,
-        "description": "The turn failed and the provider can still say why. Always the last event: followed by end-of-stream, never by `end`. `retryable` marks failures worth repeating unchanged (rate limit, overload) as opposed to ones that will fail again (bad credentials); absent means unknown. `kind` is a provider-specific identifier, informational only.",
+        "description": "The turn failed and the provider can still say why. Always the last event: followed by end-of-stream, never by `end`. The same three fields as `Failure`, flattened beside `type`. `retryable` marks failures worth repeating unchanged (rate limit, overload) as opposed to ones that will fail again (bad credentials); absent means unknown. `kind` is a provider-specific identifier, informational only.",
         "properties": {
           "type": { "const": "error" },
           "message": { "type": "string" },
@@ -147,7 +167,7 @@
       "type": "object",
       "required": ["role", "content"],
       "additionalProperties": false,
-      "description": "May be empty: a refusal, or `max_tokens` hit immediately, can stop a turn before any block completes.",
+      "description": "May be empty: a refusal, or `max_tokens` hit immediately, can stop a turn before any block completes. Replayed on later turns exactly as the provider produced it — opaque blocks included, in place.",
       "properties": {
         "role": { "const": "assistant" },
         "content": {
@@ -155,10 +175,22 @@
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/TextBlock" },
-              { "$ref": "#/$defs/ToolUseBlock" }
+              { "$ref": "#/$defs/ToolUseBlock" },
+              { "$ref": "#/$defs/OpaqueBlock" }
             ]
           }
         }
+      }
+    },
+    "OpaqueBlock": {
+      "type": "object",
+      "required": ["type", "provider", "data"],
+      "additionalProperties": false,
+      "description": "Provider state the consumer carries but never reads: a vendor's thinking block, say, which the vendor requires replayed verbatim in a later tool-use turn. Produced only by a provider, consumed only by a provider. A consumer keeps it in its position in the assistant message and replays it unchanged — never rendered, altered, reordered, or dropped — and makes no assumption about the shape of `data`. `provider` names the plugin that produced it, so a provider ignores blocks another produced.",
+      "properties": {
+        "type": { "const": "opaque" },
+        "provider": { "type": "string", "description": "The producing plugin's manifest name." },
+        "data": { "description": "Any JSON. Meaningful to `provider` alone." }
       }
     },
     "TextBlock": {
@@ -208,6 +240,17 @@
     "StopReason": {
       "enum": ["end_turn", "tool_use", "max_tokens", "refusal"],
       "description": "Why generation stopped: the model finished, the model wants tool results, `max_tokens` was hit, or the model declined to continue (a `refusal` turn must not be retried or continued). A consumer receiving a value outside this enum must treat the turn as failed; adding a value is therefore a contract change, never a quiet extension."
+    },
+    "Failure": {
+      "type": "object",
+      "required": ["message"],
+      "additionalProperties": false,
+      "description": "Why a turn failed, from a provider that can still say. `retryable` marks failures worth repeating unchanged (rate limit, overload, a transient server error) as opposed to ones that will fail again (bad credentials, a malformed request); absent means unknown. `kind` is the provider's own identifier for the failure class (an Anthropic `error.type`, say), informational only: consumers branch on `retryable`, never on `kind` or `message`.",
+      "properties": {
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "kind": { "type": "string" }
+      }
     },
     "Usage": {
       "type": "object",

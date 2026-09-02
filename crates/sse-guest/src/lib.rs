@@ -22,12 +22,9 @@
 //! chunk-boundary reassembly, multi-line `data:` joining, keepalive
 //! filtering, and NDJSON-safe re-serialisation.
 
-use gwennol_guest::{Args, Stream, Target, cancelled, entrypoints, invoke_streaming};
+use gwennol_guest::sse::SseParser;
+use gwennol_guest::{Args, Delivery, Stream, Target, cancelled, entrypoints, invoke_streaming};
 use serde_json::{Value, json};
-
-pub mod sse;
-
-use sse::SseParser;
 
 /// The plugin this module ships inside. Guest code and manifest are two
 /// halves of one artifact, so the name is a constant, not
@@ -115,7 +112,7 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         .and_then(Value::as_i64)
         .ok_or("the fetch step recorded no HTTP status")?;
     if !(200..300).contains(&status) {
-        let reason = read_capped(&upstream, ERROR_BODY_CAP);
+        let reason = upstream.read_excerpt(ERROR_BODY_CAP);
         let message = if reason.is_empty() {
             format!("vendor answered HTTP {status}")
         } else {
@@ -124,9 +121,9 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         let event = json!({
             "type": "error",
             "message": message,
-            // Timeouts, rate limits and server-side failures are worth
-            // repeating unchanged; the other 4xx will fail again.
-            "retryable": matches!(status, 408 | 429) || (500..=599).contains(&status),
+            // The shared classifier: this fixture and the real provider
+            // must answer alike, since the loop's retry policy keys on it.
+            "retryable": gwennol_guest::retryable_http_status(status),
         });
         let _ = emit(&output, &event)?; // reader-gone changes nothing here
         upstream.close();
@@ -195,17 +192,6 @@ fn relay_sse(args: Args) -> Result<Value, String> {
     Ok(Value::Null)
 }
 
-/// What became of one emitted NDJSON line.
-enum Delivery {
-    /// The consumer took it.
-    Delivered,
-    /// The consumer has closed its handle —
-    /// [`gwennol_guest::StreamError::Closed`], which the stream docs
-    /// call "the normal way to learn the reader stopped listening".
-    /// Wind down; don't treat it as a failure.
-    ReaderGone,
-}
-
 /// Re-serialise one SSE data payload as one NDJSON line on `output`.
 ///
 /// The parse is load-bearing twice over: multi-line `data:` joins with
@@ -220,54 +206,12 @@ fn emit_data(output: &Stream, data: &str) -> Result<Delivery, String> {
     emit(output, &value)
 }
 
-/// Write one JSON value as one NDJSON line, folding the consumer's
-/// hangup into [`Delivery::ReaderGone`] instead of an error.
+/// Write one JSON value as one NDJSON line; the consumer's hangup is
+/// [`Delivery::ReaderGone`], not an error.
 fn emit(output: &Stream, value: &Value) -> Result<Delivery, String> {
-    let mut line = serde_json::to_string(value).map_err(|e| e.to_string())?;
-    line.push('\n');
-    match output.write_all(line.as_bytes()) {
-        Ok(()) => Ok(Delivery::Delivered),
-        Err(gwennol_guest::StreamError::Closed) => Ok(Delivery::ReaderGone),
-        Err(e) => Err(format!("output write failed: {e}")),
-    }
-}
-
-/// Read a stream as lossy UTF-8, trimmed and truncated to `cap` bytes
-/// — the error-body excerpt for a non-2xx answer. (Up to one extra
-/// chunk is consumed past the cap; that overshoot is how truncation is
-/// detected, and is trimmed away.) Every degraded state marks itself:
-/// a truncated excerpt says so, a read error mid-body marks the
-/// partial excerpt as interrupted, and a body that could not be read
-/// at all says that instead of posing as empty — the HTTP status alone
-/// is still worth reporting.
-fn read_capped(stream: &Stream, cap: usize) -> String {
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 1024];
-    let mut interrupted = false;
-    while collected.len() <= cap {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => collected.extend_from_slice(&buf[..n]),
-            Err(_) => {
-                interrupted = true;
-                break;
-            }
-        }
-    }
-    let truncated = collected.len() > cap;
-    collected.truncate(cap);
-    let mut text = String::from_utf8_lossy(&collected).trim().to_string();
-    let marker = match (text.is_empty(), truncated, interrupted) {
-        (true, false, true) => "(error body unreadable)",
-        (_, true, _) => "…(truncated)",
-        (false, false, true) => "…(read interrupted)",
-        _ => return text,
-    };
-    if !text.is_empty() {
-        text.push(' ');
-    }
-    text.push_str(marker);
-    text
+    output
+        .write_json_line(value)
+        .map_err(|e| format!("output write failed: {e}"))
 }
 
 entrypoints! {

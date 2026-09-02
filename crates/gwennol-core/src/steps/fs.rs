@@ -1,8 +1,27 @@
 //! `host_fs.read`, `host_fs.write`, `host_fs.list`.
+//!
+//! # Outcomes are data
+//!
+//! A filesystem answer the *model* should react to — no such file, that
+//! path is a directory, permission denied — comes back as the step's
+//! result with an `outcome` field naming it, never as a step error. The
+//! rule is `docs/SPI.md`'s: a declarative tool's only failure primitive
+//! is `try`, whose `catch` sees an error as a string, so a tool that
+//! wrapped these steps in `try` could tell "file not found" from "the
+//! operator said no" only by matching English text. Handing the model's
+//! outcomes over as data leaves the string path to the failures it is
+//! for: the operator's denial, the kernel's refusal, cancellation, and
+//! I/O errors nobody can act on.
+//!
+//! Every miss is still approved first. The operator sees the path the
+//! plugin probed — canonical up to its deepest existing ancestor, since a
+//! missing file has no canonical path of its own — before the plugin
+//! learns that nothing is there.
 
 use std::hash::{BuildHasher as _, Hasher as _, RandomState};
+use std::path::{Path, PathBuf};
 
-use gwead::kernel::{PluginExecution, StepError};
+use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -22,7 +41,83 @@ pub const DEFAULT_LIST_MAX_ENTRIES: u64 = 1000;
 /// Hard ceiling on `max_entries`: larger requests are clamped.
 pub const LIST_ENTRIES_CEILING: u64 = 100_000;
 
-/// `host_fs.read`: `{path, max_bytes?}` → `{content, truncated, size}`.
+/// The `outcome` value of a step that did its work.
+pub const OUTCOME_OK: &str = "ok";
+
+/// A filesystem answer the model can act on, as the `outcome` a step
+/// reports instead of failing. Each variant is one value of the
+/// manifests' `outcome` enumeration; the mapping from OS errors is
+/// [`Outcome::classify`], and everything it does not classify stays a
+/// step error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing exists at the path (or a component of it is missing).
+    NotFound,
+    /// The path names a directory where a file was expected.
+    IsDirectory,
+    /// A component of the path — or the path itself, for a listing —
+    /// is not a directory.
+    NotADirectory,
+    /// The agent's user may not do this.
+    PermissionDenied,
+    /// A write destination is a symlink, which the host refuses to
+    /// write through or replace (the approved path would not name where
+    /// the bytes land, and the rename would destroy the link).
+    IsSymlink,
+}
+
+impl Outcome {
+    /// The outcome an I/O error maps to, if the model can act on it.
+    pub fn classify(e: &std::io::Error) -> Option<Outcome> {
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::NotFound => Some(Outcome::NotFound),
+            ErrorKind::IsADirectory => Some(Outcome::IsDirectory),
+            ErrorKind::NotADirectory => Some(Outcome::NotADirectory),
+            ErrorKind::PermissionDenied => Some(Outcome::PermissionDenied),
+            _ => None,
+        }
+    }
+
+    /// The manifests' enumeration value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Outcome::NotFound => "not_found",
+            Outcome::IsDirectory => "is_directory",
+            Outcome::NotADirectory => "not_a_directory",
+            Outcome::PermissionDenied => "permission_denied",
+            Outcome::IsSymlink => "is_symlink",
+        }
+    }
+
+    /// The step result for this outcome at `path`: the enumeration value
+    /// plus a one-line `message` a tool can hand the model verbatim.
+    fn result(self, path: &Path) -> StepOutput {
+        let path = path.display();
+        let message = match self {
+            Outcome::NotFound => format!("no such file or directory: {path}"),
+            Outcome::IsDirectory => format!("is a directory: {path}"),
+            Outcome::NotADirectory => format!("not a directory: {path}"),
+            Outcome::PermissionDenied => format!("permission denied: {path}"),
+            Outcome::IsSymlink => {
+                format!("is a symlink, which the host will not write through or replace: {path}")
+            }
+        };
+        json!({"outcome": self.name(), "message": message}).into()
+    }
+}
+
+/// Turn an I/O error at `path` into either a data outcome or a step
+/// error. `what` names the operation for the error message.
+fn outcome_or_error(what: &str, path: &Path, e: std::io::Error) -> Result<StepOutput, StepError> {
+    match Outcome::classify(&e) {
+        Some(outcome) => Ok(outcome.result(path)),
+        None => Err(StepError::Failed(format!("{what} {}: {e}", path.display()))),
+    }
+}
+
+/// `host_fs.read`: `{path, max_bytes?}` → `{outcome: "ok", content,
+/// truncated, size}`, or `{outcome, message}` for a miss.
 ///
 /// The operator is shown the *canonical* path — symlinks resolved — and
 /// the step verifies, by device and inode, that it names the very file
@@ -79,9 +174,25 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             let canonical = tokio::fs::canonicalize(&path).await?;
             std::io::Result::Ok((file, meta, canonical))
         };
-        let (file, meta, canonical) = or_cancelled(&cancel, open)
-            .await?
-            .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
+        let (file, meta, canonical) = match or_cancelled(&cancel, open).await? {
+            Ok(opened) => opened,
+            // No handle to bind an approval to — but the operator still
+            // sees the probe before the plugin learns its answer. The
+            // path is approved canonical up to its deepest existing
+            // ancestor, the closest thing a missing file has to a
+            // canonical path.
+            Err(e) => {
+                let Some(outcome) = Outcome::classify(&e) else {
+                    return Err(StepError::Failed(format!("read {}: {e}", path.display())));
+                };
+                let probed = or_cancelled(&cancel, canonicalize_missing(&path))
+                    .await?
+                    .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
+                let ask = approval(&*ex, Access::ReadFile(probed));
+                approve(ask).await.map_err(StepError::Failed)?;
+                return Ok(outcome.result(&path));
+            }
+        };
         // The operator judges the canonical path, so it must name the file
         // the handle holds — otherwise the path was swapped mid-open and
         // the step refuses rather than approve one file and read another.
@@ -100,6 +211,11 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         }
         let ask = approval(&*ex, Access::ReadFile(canonical));
         approve(ask).await.map_err(StepError::Failed)?;
+        // Opening a directory read-only succeeds on unix; it is the read
+        // that would fail, and "is a directory" is the model's to act on.
+        if meta.is_dir() {
+            return Ok(Outcome::IsDirectory.result(&path));
+        }
         let size = meta.len();
         let read = async {
             let mut bytes = Vec::new();
@@ -116,14 +232,22 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             .await?
             .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
         let (content, truncated) = lossy_capped(&bytes, max);
-        Ok(json!({"content": content, "truncated": truncated, "size": size}).into())
+        Ok(json!({
+            "outcome": OUTCOME_OK,
+            "content": content,
+            "truncated": truncated,
+            "size": size,
+        })
+        .into())
     })
 }
 
-/// Resolve `path` for a write approval: the deepest existing ancestor is
-/// canonicalised — a symlinked directory resolves to where it really leads
-/// — and the not-yet-existing remainder is appended as spelled.
-async fn canonicalize_for_write(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+/// Resolve a path that need not exist: the deepest existing ancestor is
+/// canonicalised — a symlinked directory resolves to where it really
+/// leads — and the not-yet-existing remainder is appended as spelled.
+/// This is the path a write approval names, and the path a miss is
+/// approved under.
+async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
     let mut existing = path;
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
     loop {
@@ -134,7 +258,20 @@ async fn canonicalize_for_write(path: &std::path::Path) -> std::io::Result<std::
                 }
                 return Ok(canonical);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A component that exists but is not a directory, or one
+            // the agent's user may not search, ends the walk the same
+            // way a missing one does: what lies below it cannot be
+            // canonicalised, only spelled — and the step is about to
+            // report the outcome as data, so the approval must not be
+            // the thing that turns it back into an error.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 rest.push(
                     existing
                         .file_name()
@@ -158,9 +295,9 @@ async fn canonicalize_for_write(path: &std::path::Path) -> std::io::Result<std::
 /// there is no create-then-chmod gap in which another opener can grab a
 /// readable fd.
 async fn create_temp_sibling(
-    dest: &std::path::Path,
+    dest: &Path,
     restrict: bool,
-) -> std::io::Result<(tokio::fs::File, std::path::PathBuf)> {
+) -> std::io::Result<(tokio::fs::File, PathBuf)> {
     let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -211,11 +348,16 @@ async fn fill_temp(
     Ok(())
 }
 
-/// `host_fs.write`: `{path, content, create_dirs?}` → `{bytes_written}`.
+/// `host_fs.write`: `{path, content, create_dirs?}` → `{outcome: "ok",
+/// bytes_written}`, or `{outcome, message}` when the destination cannot
+/// take the file (a missing parent without `create_dirs`, a directory or
+/// a non-directory in the way, permission denied, a symlink).
 ///
-/// A symlink destination is refused before the operator is asked, and the
-/// approved path is canonical up to its deepest existing ancestor — so the
-/// operator judges where the bytes will actually land, not an alias.
+/// A symlink destination is never written through or replaced — the
+/// outcome is `is_symlink`, approved as a probe under the link's own
+/// name — and otherwise the approved path is canonical up to its deepest
+/// existing ancestor, so the operator judges where the bytes will
+/// actually land, not an alias.
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
@@ -234,30 +376,50 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         };
         let create_dirs = bool_param(&p, "create_dirs", false)?;
         let cancel = ex.cancel_token();
-        // A symlink destination is refused outright: writing through it
+        // A symlink destination is never written: writing through it
         // would land the bytes somewhere the approved path does not name,
-        // and the rename would otherwise silently destroy the link.
+        // and the rename would otherwise silently destroy the link. The
+        // model can act on that (write to the target, or elsewhere), so
+        // it is an outcome, not an error — approved first, like every
+        // probe, under the link's own name with its parent canonical:
+        // resolving the link would show the operator a write to the
+        // target that is precisely what will not happen.
         if let Ok(m) = tokio::fs::symlink_metadata(&path).await
             && m.file_type().is_symlink()
         {
-            return Err(StepError::Failed(format!(
-                "{} is a symlink; refusing to write through or replace it",
-                path.display()
-            )));
+            let parent = path.parent().unwrap_or(&path);
+            let mut probed = or_cancelled(&cancel, canonicalize_missing(parent))
+                .await?
+                .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
+            if let Some(name) = path.file_name() {
+                probed.push(name);
+            }
+            let ask = approval(&*ex, Access::WriteFile(probed));
+            approve(ask).await.map_err(StepError::Failed)?;
+            return Ok(Outcome::IsSymlink.result(&path));
         }
-        let canonical = or_cancelled(&cancel, canonicalize_for_write(&path))
+        let canonical = or_cancelled(&cancel, canonicalize_missing(&path))
             .await?
             .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
         let ask = approval(&*ex, Access::WriteFile(canonical.clone()));
         approve(ask).await.map_err(StepError::Failed)?;
-        if create_dirs && let Some(parent) = canonical.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StepError::Failed(format!("mkdir {}: {e}", parent.display())))?;
+        if create_dirs
+            && let Some(parent) = canonical.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            // `create_dir_all` reports a parent that exists as a
+            // non-directory as AlreadyExists, which is not itself an
+            // outcome — but the answer is "not a directory", and the
+            // model can act on it.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(Outcome::NotADirectory.result(parent));
+            }
+            return outcome_or_error("mkdir", parent, e);
         }
         // Whether this replaces an existing file decides both the
         // temporary's birth mode and the permissions it ends with.
         let dest_perms = match tokio::fs::metadata(&canonical).await {
+            Ok(meta) if meta.is_dir() => return Ok(Outcome::IsDirectory.result(&path)),
             Ok(meta) => {
                 #[cfg(unix)]
                 let perms = {
@@ -273,21 +435,20 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 Some(perms)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(StepError::Failed(format!(
-                    "write {}: {e}",
-                    canonical.display()
-                )));
-            }
+            Err(e) => return outcome_or_error("write", &canonical, e),
         };
         // Creation and rename are quick local operations and are not raced
         // against cancellation: a dropped future cannot clean up after
         // itself, so cancellation is consulted *between* phases instead. A
         // cancelled write either leaves the destination untouched with the
         // temporary removed, or — once the rename begins — completes.
-        let (file, tmp) = create_temp_sibling(&canonical, dest_perms.is_some())
-            .await
-            .map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
+        let (file, tmp) = match create_temp_sibling(&canonical, dest_perms.is_some()).await {
+            Ok(created) => created,
+            // The parent is missing (and `create_dirs` was not asked
+            // for), is not a directory, or is not writable: the
+            // destination's answer, reported as such.
+            Err(e) => return outcome_or_error("write", &path, e),
+        };
         let filled = or_cancelled(&cancel, fill_temp(file, &content, dest_perms)).await;
         let cancelled_after_fill = cancel.is_cancelled();
         if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
@@ -299,17 +460,15 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         }
         if let Err(e) = tokio::fs::rename(&tmp, &canonical).await {
             let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(StepError::Failed(format!(
-                "write {}: {e}",
-                canonical.display()
-            )));
+            return outcome_or_error("write", &canonical, e);
         }
-        Ok(json!({"bytes_written": content.len()}).into())
+        Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into())
     })
 }
 
-/// `host_fs.list`: `{path, max_entries?}` →
-/// `{entries: [{name, kind, size}], truncated}`.
+/// `host_fs.list`: `{path, max_entries?}` → `{outcome: "ok", entries:
+/// [{name, kind, size}], truncated}`, or `{outcome, message}` when there
+/// is no directory to list.
 ///
 /// The operator is shown, and the step lists, the canonical directory —
 /// symlinks resolved. One level only — recursion is a tool's decision to
@@ -328,14 +487,29 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             LIST_ENTRIES_CEILING,
         );
         let cancel = ex.cancel_token();
-        let canonical = or_cancelled(&cancel, tokio::fs::canonicalize(&path))
-            .await?
-            .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
+        let canonical = match or_cancelled(&cancel, tokio::fs::canonicalize(&path)).await? {
+            Ok(canonical) => canonical,
+            // Nothing to list — approved as a probe of the deepest
+            // existing ancestor plus the spelled remainder, then
+            // answered as data.
+            Err(e) => {
+                let Some(outcome) = Outcome::classify(&e) else {
+                    return Err(StepError::Failed(format!("list {}: {e}", path.display())));
+                };
+                let probed = or_cancelled(&cancel, canonicalize_missing(&path))
+                    .await?
+                    .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
+                let ask = approval(&*ex, Access::ListDir(probed));
+                approve(ask).await.map_err(StepError::Failed)?;
+                return Ok(outcome.result(&path));
+            }
+        };
         let ask = approval(&*ex, Access::ListDir(canonical.clone()));
         approve(ask).await.map_err(StepError::Failed)?;
-        let mut rd = tokio::fs::read_dir(&canonical)
-            .await
-            .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
+        let mut rd = match tokio::fs::read_dir(&canonical).await {
+            Ok(rd) => rd,
+            Err(e) => return outcome_or_error("list", &path, e),
+        };
         let mut entries = Vec::new();
         let mut truncated = false;
         loop {
@@ -361,7 +535,7 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             }));
         }
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        Ok(json!({"entries": entries, "truncated": truncated}).into())
+        Ok(json!({"outcome": OUTCOME_OK, "entries": entries, "truncated": truncated}).into())
     })
 }
 
@@ -383,5 +557,48 @@ mod tests {
         assert_eq!(mode, 0o600, "temporary was created readable");
         drop(file);
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn only_the_answers_a_model_can_act_on_become_outcomes() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            Outcome::classify(&Error::from(ErrorKind::NotFound)),
+            Some(Outcome::NotFound)
+        );
+        assert_eq!(
+            Outcome::classify(&Error::from(ErrorKind::PermissionDenied)),
+            Some(Outcome::PermissionDenied)
+        );
+        assert_eq!(
+            Outcome::classify(&Error::from(ErrorKind::IsADirectory)),
+            Some(Outcome::IsDirectory)
+        );
+        assert_eq!(
+            Outcome::classify(&Error::from(ErrorKind::NotADirectory)),
+            Some(Outcome::NotADirectory)
+        );
+        // A disk error is nobody's to react to: it stays a step error.
+        assert_eq!(Outcome::classify(&Error::other("I/O error")), None);
+        assert_eq!(
+            Outcome::classify(&Error::from(ErrorKind::Interrupted)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_canonicalises_to_its_deepest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let probed = canonicalize_missing(&root.join("no/such/file.txt"))
+            .await
+            .unwrap();
+        assert_eq!(probed, root.join("no/such/file.txt"));
+        // A file in the middle of the path ends the walk the same way.
+        std::fs::write(root.join("plain"), "x").unwrap();
+        let probed = canonicalize_missing(&root.join("plain/below.txt"))
+            .await
+            .unwrap();
+        assert_eq!(probed, root.join("plain/below.txt"));
     }
 }

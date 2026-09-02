@@ -52,6 +52,17 @@ blocks:
 | `text` | `text` | either role |
 | `tool_use` | `id`, `name`, `input` | `assistant` |
 | `tool_result` | `tool_use_id`, `content`, `is_error?` | `user` |
+| `opaque` | `provider`, `data` | `assistant` |
+
+An `opaque` block is provider state the consumer carries but never
+reads — a vendor's thinking block, which the vendor requires replayed
+verbatim in a later tool-use turn, is the case it exists for. Produced
+only by a provider, consumed only by a provider: a consumer keeps it in
+its position in the assistant message and replays it unchanged — never
+rendered, altered, reordered, or dropped — and assumes nothing about the
+shape of `data`. `provider` names the producing plugin, so a provider
+ignores blocks another produced (a conversation that changes provider
+mid-way loses only what the new provider could not have used).
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
@@ -76,6 +87,10 @@ are contract here:
   blocks.
 - `id` values are opaque and unique within a conversation. The loop
   echoes them; it never parses or fabricates them.
+- The assistant message that asked for the tools is replayed exactly as
+  the provider produced it, `opaque` blocks in place. A vendor that
+  reasons before calling a tool checks that its reasoning came back
+  with the call, and refuses the turn when it did not.
 - A streamed turn that hits `max_tokens` while a tool call is still
   being generated drops the partial call: the provider emits no
   `tool_use` event for it and ends with `stop_reason: "max_tokens"`. A
@@ -102,14 +117,26 @@ alike — and open beyond its two required fields: a provider may add its
 own counters (cache reads, say), and consumers must tolerate and may
 ignore them.
 
-A buffered turn that fails — the request never succeeded, there is no
-message — is an ordinary step error. A structured taxonomy for those
-failures (which are retryable, which are misconfiguration) is deliberately
-deferred to milestone 4, when a real provider exists to inform it; until
-it lands, the loop must treat provider step errors as uniformly fatal to
-the turn and **must not** infer meaning from error-message text. The
-streamed path does not wait for that taxonomy: its `error` event already
-carries `retryable`, because a stream failure leaves no other channel.
+### Failure, buffered — settled
+
+Settled in milestone 4, with a real provider to inform it. The buffered
+form has a third shape, `{"error": {"message", "retryable"?, "kind"?}}`
+— the same three fields the stream's `error` event carries — for a
+turn the vendor answered and refused: a non-2xx status, or an error
+document in place of a message. The provider fills `retryable` from
+what it knows of its own API (rate limits, overload and transient
+server errors are worth repeating unchanged; authentication,
+malformed-request and not-found answers will fail again) and `kind`
+with the vendor's own class identifier. Consumers branch on
+`retryable` and nothing else: `kind` and `message` are informational.
+
+What stays a step error is exactly what the provider could not classify
+without reading error text: the transport failed before any answer
+arrived, the operator denied the egress, the kernel refused the step. A
+step error from a provider is uniformly fatal to the turn — the loop
+must not retry it, and **must not** infer meaning from its message. That
+is the same line the `TOOL` contract draws below: an outcome the caller
+should react to arrives as data, or it is an error nobody should parse.
 
 ### Response, streamed
 
@@ -133,6 +160,9 @@ The stream yields UTF-8 newline-delimited JSON, one event per line
   the call whole: arguments are machine-consumed, so incremental display
   buys nothing and every consumer would otherwise reassemble JSON
   fragments.
+- `{"type": "opaque", "provider": "…", "data": …}` — a complete
+  `opaque` block, emitted whole in its position among the turn's
+  blocks.
 - `{"type": "end", "stop_reason": "…", "usage": { … }}` — the final event
   of every successful stream, followed by end-of-stream.
 - `{"type": "error", "message": "…", "retryable": …, "kind": "…"}` — the
@@ -141,6 +171,12 @@ The stream yields UTF-8 newline-delimited JSON, one event per line
   worth repeating unchanged (rate limit, overload) as opposed to ones
   that will fail again (bad credentials); absent means unknown. `kind` is
   a provider-specific identifier, informational only.
+
+The assistant message a consumer rebuilds from the stream — to replay
+on the next turn — is the events in order: adjacent `text` events
+coalesced into one text block, `tool_use` and `opaque` events kept
+whole and in place. That is what keeps a vendor's reasoning in front of
+the tool call it led to.
 
 End-of-stream without an `end` or `error` event means the turn failed
 mid-stream with the cause lost; a failure before any bytes flow is an
@@ -175,10 +211,28 @@ wrapped `host_fs.read` in `try` could separate "file not found" from "the
 operator said no" only by matching English error text, and a denial that
 slipped the match would become `is_error: true`, exactly the masquerade
 forbidden above. The rule is therefore: **an outcome the model should
-react to must arrive as data, not as an error** — `host_process.run`
-already returns a nonzero exit status as data, and milestone 4 extends
-the host steps where needed (a `host_fs.read` miss, say) rather than
-letting any tool match on error strings.
+react to must arrive as data, not as an error**. Settled in milestone 4
+at the host-step layer: every `host_fs` step reports the answers a model
+can act on — `not_found`, `is_directory`, `not_a_directory`,
+`permission_denied`, and for a write `is_symlink` — as a result whose
+`outcome` names them, with a one-line `message` fit to hand over
+verbatim, and `host_process.run`
+already returned a nonzero exit status as data. A bundled tool branches
+on `outcome` and never wraps a host step in `try`; the string path is
+left to the failures it is for.
+
+### Truncation — settled
+
+A tool that cut its output says so as data: `truncated: true` on the
+result, with `content` the prefix it kept. The tool never appends a
+marker itself — composing one declaratively would mean a branch per
+truncatable field, and four tools would grow four spellings. The caller
+renders the one shared marker, `gwennol_core::spi::tool::TRUNCATED_MARKER`,
+onto the end of `content` before the model sees it —
+`spi::tool::render_content` is the single implementation — so the model
+learns "this is a prefix" in one fixed form whichever tool produced it.
+A tool composed of several capped steps reports `truncated` when any of
+them was cut.
 
 ### How a tool's schema reaches the model — settled
 
@@ -272,9 +326,11 @@ Doors closed on purpose for the MVP, listed so they read as decisions
 rather than oversights. Each would be a contract change; none blocks
 milestones 3–7.
 
-- **Thinking blocks.** The assistant block set is text and `tool_use`
-  only. Extended-thinking models need their thinking blocks replayed in
-  multi-turn tool use, which is a new block type when it comes.
+- **Thinking, as content.** A vendor's thinking travels only as an
+  `opaque` block (above, settled in milestone 4): replayed, never
+  shown. Surfacing reasoning to the operator — a summary the frontend
+  could display — would be a block the consumer *reads*, and is not on
+  this wire.
 - **Prompt caching, request side.** There is no `cache_control` or
   equivalent; a provider may cache however its API allows, and the open
   `usage` object lets it report the effect, but the contract offers no
@@ -289,6 +345,5 @@ milestones 3–7.
   wire.
 - **Non-text tool results.** `content` is a UTF-8 string. Binary output
   is the tool's problem (lossy conversion, or refusing); image results
-  are a later block-type change. A shared convention for signalling
-  truncation inside `content` is milestone 4's to write, so its four
-  tools agree.
+  are a later block-type change. Truncation is signalled as data
+  (`truncated`, above), never inside `content`.

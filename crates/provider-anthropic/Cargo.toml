@@ -1,0 +1,28 @@
+# The bundled Anthropic provider: an LLM_CHAT plugin whose guest code —
+# request shaping and the Messages API stream translation — is Rust
+# compiled to wasm32-unknown-unknown, occupying the script-runtime slot
+# under the plugin's own name (docs/SUBSTRATE.md). The manifest half is
+# plugins/providers/anthropic.json; `cargo xtask bundle` compiles this
+# crate and fills the manifest's `wasmModules` slot with the result.
+# Compiled for the host target only so lints, docs, and the translation
+# unit tests cover it.
+[package]
+name = "provider-anthropic"
+description = "Gwennol's bundled model provider for the Anthropic Messages API: the LLM_CHAT contract over host_http.post, streamed and buffered."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+# cdylib is the wasm module; rlib keeps `cargo test` able to link the
+# unit tests and lets the integration suite import the exported names.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gwennol-guest = { path = "../gwennol-guest" }
+serde_json.workspace = true

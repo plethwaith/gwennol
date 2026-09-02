@@ -20,7 +20,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gwead::kernel::streams::StreamRegistry;
@@ -39,48 +39,18 @@ use common::{Permissive, assert_conforms, contracts, drain_stream_events};
 // ----------------------------------------------- building the guest
 
 /// Compile the example guest to wasm and return the module bytes,
-/// base64-encoded for the manifest. Built once per test process.
+/// base64-encoded for the manifest. Built once per test process,
+/// through the same bundler `cargo xtask bundle` and the bundled-plugin
+/// suite use — the example is held to the build path real plugins get.
 fn guest_wasm_base64() -> &'static str {
     static WASM: OnceLock<String> = OnceLock::new();
     WASM.get_or_init(|| {
         use base64::Engine as _;
-        let workspace = workspace_root();
-        // A separate target dir: the outer `cargo test` holds the lock
-        // on `target/`, and this dir has its own.
-        let target_dir = workspace.join("target/wasm-guest");
-        let output = std::process::Command::new(env!("CARGO"))
-            .current_dir(&workspace)
-            .args([
-                "build",
-                "-p",
-                PLUGIN,
-                "--target",
-                "wasm32-unknown-unknown",
-                "--release",
-                "--locked",
-                "--target-dir",
-            ])
-            .arg(&target_dir)
-            .output()
-            .expect("cargo is runnable");
-        assert!(
-            output.status.success(),
-            "building the example guest failed (is the target installed? \
-             `rustup target add wasm32-unknown-unknown`):\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let artifact = target_dir.join("wasm32-unknown-unknown/release/sse_guest.wasm");
-        let bytes = std::fs::read(&artifact)
-            .unwrap_or_else(|e| panic!("guest artifact missing at {}: {e}", artifact.display()));
+        let crate_dir = Path::new("crates").join(PLUGIN);
+        let bytes = xtask::build_guest(&xtask::workspace_root(), &crate_dir)
+            .unwrap_or_else(|e| panic!("building the example guest failed: {e}"));
         base64::engine::general_purpose::STANDARD.encode(bytes)
     })
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root resolves")
 }
 
 // ----------------------------------------------------- the manifest
@@ -249,6 +219,10 @@ fn sse_stub() -> &'static SseStub {
                 "/http-notfound-turn" => Some((
                     "404 Not Found",
                     r#"{"error":{"type":"not_found_error","message":"no such model"}}"#.to_string(),
+                )),
+                "/http-conflict-turn" => Some((
+                    "409 Conflict",
+                    r#"{"error":{"type":"api_error","message":"try again"}}"#.to_string(),
                 )),
                 // One sentinel inside the excerpt's overshoot window
                 // (bytes the relay reads but must trim away) and one
@@ -512,6 +486,27 @@ async fn a_client_error_is_not_marked_retryable() {
     assert!(
         message.contains("404") && message.contains("no such model"),
         "{message}"
+    );
+}
+
+/// A 409 is contention, worth repeating: the fixture answers through
+/// the shared `retryable_http_status`, so this pins that the two
+/// LLM_CHAT guests in the repository classify it alike — a fixture
+/// that grew its own inline rule again would fail here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflict_is_marked_retryable_like_the_real_provider() {
+    let f = fixture();
+    let events = stream_turn_events(f, "/http-conflict-turn").await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["type"], json!("error"));
+    assert_eq!(
+        events[0]["retryable"],
+        json!(true),
+        "409 is worth repeating"
+    );
+    assert!(
+        gwennol_guest::retryable_http_status(409),
+        "the shared classifier agrees"
     );
 }
 

@@ -1,0 +1,56 @@
+{
+  "formatVersion": 1,
+  "name": "tool-read",
+  "version": "0.1.0",
+  "description": "The `read` tool: one host_fs.read, its outcome branched on as data. Reaches nothing else.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_fs.read"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "read",
+        "description": "Read a file from the workspace as UTF-8 text. Relative paths resolve against the workspace root. Output is cut at max_bytes (default 262144) and marked as truncated when it was.",
+        "parameters": {
+          "type": "object",
+          "required": ["path"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "description": "File path, absolute or relative to the workspace root." },
+            "max_bytes": { "type": "integer", "minimum": 1, "description": "Cap on returned bytes (default 262144)." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "read",
+          "type": "host_fs.read",
+          "params": { "path": "{{$input.path}}", "max_bytes": "{{$input.max_bytes ?? 262144}}" }
+        },
+        {
+          "id": "answer",
+          "type": "ifs",
+          "params": { "ifs": [
+            {
+              "test": "$steps.read.result.outcome == 'ok'",
+              "then": [
+                { "id": "ok", "type": "return", "params": { "value": {
+                  "content": "{{$steps.read.result.content}}",
+                  "is_error": false,
+                  "truncated": "{{$steps.read.result.truncated}}"
+                } } }
+              ]
+            },
+            {
+              "then": [
+                { "id": "miss", "type": "return", "params": { "value": {
+                  "content": "{{$steps.read.result.message}}",
+                  "is_error": true
+                } } }
+              ]
+            }
+          ] }
+        }
+      ]
+    }
+  }
+}

@@ -1,9 +1,10 @@
 //! An incremental server-sent-events parser.
 //!
 //! Pure with respect to the guest ABI — bytes in, events out — so the
-//! host-target unit tests below cover it directly; the wasm entry point
-//! only wires it to streams. Implements the subset of the SSE wire
-//! format a model provider's stream actually uses:
+//! host-target unit tests below cover it directly, and a guest entry
+//! point only wires it to a [`Stream`](crate::Stream). Implements the
+//! subset of the SSE wire format a model provider's stream actually
+//! uses:
 //!
 //! - a line ending is `\n`, with an optional preceding `\r` stripped;
 //! - an event is terminated by an empty line, and is dispatched only if

@@ -1,0 +1,96 @@
+{
+  "formatVersion": 1,
+  "name": "provider-anthropic",
+  "version": "0.1.0",
+  "description": "Gwennol's bundled model provider: the LLM_CHAT contract over the Anthropic Messages API, streamed and buffered. Everything that reaches outside the sandbox is declared here — one host_http.post per turn, to api.anthropic.com, with the api_key secret on the x-api-key header — and only the request shaping and stream translation run as guest code, which never sees the key. The guest module is filled in from crates/provider-anthropic by `cargo xtask bundle`; this file as committed is deliberately not registrable.",
+  "roles": ["LLM_CHAT"],
+  "permissions": [
+    "provide:step_type:script:provider-anthropic",
+    "step_type:host_http.post",
+    "network:egress:api.anthropic.com"
+  ],
+  "usesSecrets": ["api_key"],
+  "configSchema": {
+    "userFields": [
+      { "key": "model", "type": "string", "required": false, "defaultValue": "claude-opus-5", "description": "Messages API model id." },
+      { "key": "base_url", "type": "string", "required": false, "defaultValue": "https://api.anthropic.com", "description": "API origin, optionally with a path prefix for a proxy; trailing slashes are dropped. Any host other than api.anthropic.com also needs its own network:egress grant on this manifest." },
+      { "key": "max_tokens", "type": "integer", "required": false, "description": "Default max_tokens when the chat input names none: 16384 buffered, 65536 streamed." },
+      { "key": "thinking", "type": "object", "required": false, "description": "A Messages API `thinking` object, sent verbatim (`extra.thinking` is the same knob by another route). Absent by default: no `thinking` field is sent and the model's own default applies — on, for current models — and the thinking blocks the vendor produces travel as the contract's `opaque` blocks, replayed verbatim on the next turn as the vendor requires. An explicit {\"type\": \"disabled\"} is refused by models that cannot turn thinking off." },
+      { "key": "extra", "type": "object", "required": false, "description": "Shallow-merged into the request body for keys the provider did not set itself — sampling knobs, `thinking` when the `thinking` field above is unset, and other vendor features the contract deliberately leaves to config." },
+      { "key": "timeout_ms", "type": "integer", "required": false, "defaultValue": 600000, "description": "Buffered turn: budget for the whole response (clamped by the host to 1 hour)." },
+      { "key": "idle_timeout_ms", "type": "integer", "required": false, "defaultValue": 120000, "description": "Streamed turn: longest gap allowed between chunks." }
+    ]
+  },
+  "wasmModules": {
+    "guest": { "path": "crates/provider-anthropic" }
+  },
+  "stepTypeImpls": [
+    { "stepType": "script", "matches": "provider-anthropic", "wasmModule": "guest" }
+  ],
+  "actions": {
+    "chat": {
+      "description": "One model turn per the LLM_CHAT contract. The guest builds the Messages API request and dispatches stream_turn or fetch_turn; the key never enters the guest.",
+      "steps": [
+        { "id": "run", "type": "script", "params": { "language": "provider-anthropic", "source": "chat" } }
+      ]
+    },
+    "fetch_turn": {
+      "description": "A buffered Messages API request. Input: {url, request}, both built by the guest — the URL from $config.base_url with trailing slashes dropped; which host it may reach is the network:egress grant above, not the input. Output: {status, body, truncated} for the guest to translate.",
+      "steps": [
+        {
+          "id": "fetch",
+          "type": "host_http.post",
+          "params": {
+            "url": "{{$input.url}}",
+            "headers": {
+              "x-api-key": "{{$secrets.api_key}}",
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json"
+            },
+            "body": "{{$input.request}}",
+            "stream": false,
+            "timeout_ms": "{{$config.timeout_ms ?? 600000}}"
+          }
+        },
+        {
+          "id": "out",
+          "type": "return",
+          "params": { "value": {
+            "status": "{{$steps.fetch.result.status}}",
+            "body": "{{$steps.fetch.result.body}}",
+            "truncated": "{{$steps.fetch.result.truncated}}"
+          } }
+        }
+      ]
+    },
+    "stream_turn": {
+      "description": "A streamed Messages API request relayed as contract NDJSON. Input: {url, request}, as for fetch_turn. The relay's output is the stream handle chat returns.",
+      "dataflow": true,
+      "steps": [
+        {
+          "id": "fetch",
+          "type": "host_http.post",
+          "params": {
+            "url": "{{$input.url}}",
+            "headers": {
+              "x-api-key": "{{$secrets.api_key}}",
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+              "accept": "text/event-stream"
+            },
+            "body": "{{$input.request}}",
+            "stream": true,
+            "idle_timeout_ms": "{{$config.idle_timeout_ms ?? 120000}}"
+          }
+        },
+        {
+          "id": "relay",
+          "type": "script",
+          "longRunning": true,
+          "dependsOn": ["fetch"],
+          "params": { "language": "provider-anthropic", "source": "relay_sse" }
+        }
+      ]
+    }
+  }
+}

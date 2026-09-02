@@ -1,0 +1,22 @@
+# Repository tasks, `cargo xtask <command>`. The one task today is
+# `bundle`: compile every guest-backed plugin's crate to wasm and fill
+# its manifest's `wasmModules` slot with the bytes — the build-time half
+# of the plugin substrate (docs/SUBSTRATE.md, "Building"). A library as
+# well as a binary so the integration suites bundle through the same
+# code the command runs, instead of a second copy of it.
+[package]
+name = "xtask"
+description = "Gwennol repository tasks: bundle guest-backed plugin manifests from source."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+base64 = "0.22"

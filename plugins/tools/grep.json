@@ -1,0 +1,80 @@
+{
+  "formatVersion": 1,
+  "name": "tool-grep",
+  "version": "0.1.0",
+  "description": "The `grep` tool: one host_process.run of the system grep, its exit status branched on as data (1 is \"no matches\", not an error; 2 with matches on stdout is matches plus the files it could not read, since grep exits 2 for any unreadable file even when lines were selected). Reaches nothing else.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_process.run"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "grep",
+        "description": "Search file contents recursively with an extended regular expression (grep -rnIE). Binary files and .git directories are skipped. Each match is reported as path:line:text. Output is cut at 262144 bytes (stdout and stderr each, when both are reported) and marked as truncated when it was.",
+        "parameters": {
+          "type": "object",
+          "required": ["pattern"],
+          "additionalProperties": false,
+          "properties": {
+            "pattern": { "type": "string", "description": "An extended (POSIX ERE) regular expression." },
+            "path": { "type": "string", "description": "File or directory to search, relative to the workspace root. Default: the whole workspace." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "run",
+          "type": "host_process.run",
+          "params": {
+            "argv": ["grep", "-rnI", "--exclude-dir=.git", "-E", "-e", "{{$input.pattern}}", "--", "{{$input.path ?? '.'}}"],
+            "timeout_ms": 60000,
+            "max_output_bytes": 262144
+          }
+        },
+        {
+          "id": "answer",
+          "type": "ifs",
+          "params": { "ifs": [
+            {
+              "test": "$steps.run.result.status == 0",
+              "then": [
+                { "id": "matches", "type": "return", "params": { "value": {
+                  "content": "{{$steps.run.result.stdout}}",
+                  "is_error": false,
+                  "truncated": "{{$steps.run.result.stdout_truncated}}"
+                } } }
+              ]
+            },
+            {
+              "test": "$steps.run.result.status == 2 && $steps.run.result.stdout != ''",
+              "then": [
+                { "id": "partial", "type": "return", "params": { "value": {
+                  "content": "{{$steps.run.result.stdout}}\n[grep could not read everything]\n{{$steps.run.result.stderr}}",
+                  "is_error": false,
+                  "truncated": "{{$steps.run.result.stdout_truncated || $steps.run.result.stderr_truncated}}"
+                } } }
+              ]
+            },
+            {
+              "test": "$steps.run.result.status == 1",
+              "then": [
+                { "id": "none", "type": "return", "params": { "value": {
+                  "content": "no matches",
+                  "is_error": false
+                } } }
+              ]
+            },
+            {
+              "then": [
+                { "id": "failed", "type": "return", "params": { "value": {
+                  "content": "grep failed (exit status {{$steps.run.result.status ?? 'killed by signal'}}): {{$steps.run.result.stderr}}",
+                  "is_error": true,
+                  "truncated": "{{$steps.run.result.stderr_truncated}}"
+                } } }
+              ]
+            }
+          ] }
+        }
+      ]
+    }
+  }
+}

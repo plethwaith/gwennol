@@ -1,0 +1,4 @@
+# `cargo xtask <command>` — repository tasks that are Rust code rather
+# than shell: see crates/xtask.
+[alias]
+xtask = "run --quiet --package xtask --"

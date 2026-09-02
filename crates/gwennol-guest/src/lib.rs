@@ -36,7 +36,10 @@
 //!   allowlist, and prior steps' results.
 //! - [`Stream`] — byte-stream I/O on Gwead stream handles, including
 //!   the pre-provisioned output of a `long_running` step in a
-//!   `dataflow: true` action ([`Stream::output`]).
+//!   `dataflow: true` action ([`Stream::output`]), with NDJSON line
+//!   framing ([`Stream::write_json_line`]) for contract events.
+//! - [`sse`] — an incremental server-sent-events parser, for the
+//!   provider-shaped guests that relay a vendor stream.
 //! - [`invoke`]/[`invoke_streaming`] — dispatch back into the kernel,
 //!   into another action of the same plugin (always permitted) or into
 //!   another plugin or role (gated by the manifest's `invoke:*` grants).
@@ -66,13 +69,14 @@
 mod args;
 mod entry;
 mod invoke;
+pub mod sse;
 mod stream;
 pub mod sys;
 
 pub use args::Args;
 pub use entry::{__alloc_impl, __execute_impl, EntryFn, dispatch};
 pub use invoke::{Target, invoke, invoke_streaming};
-pub use stream::{Stream, StreamError};
+pub use stream::{Delivery, Stream, StreamError};
 
 /// Severity for [`log`], mapped onto the host's `tracing` levels.
 ///
@@ -110,6 +114,16 @@ pub fn log(level: Level, message: &str) {
     sys::host_log(level.code(), message.as_bytes());
 }
 
+/// Whether an HTTP status is worth repeating unchanged — the one
+/// answer every guest that fills the contract's `retryable` from a
+/// status gives, so two guests cannot disagree about a 409. Timeouts
+/// (408), contention (409), rate limits (429) and server-side failures
+/// (5xx) are worth a retry; every other client error will fail again.
+/// The same set the vendor SDKs retry on.
+pub fn retryable_http_status(status: i64) -> bool {
+    matches!(status, 408 | 409 | 429) || (500..=599).contains(&status)
+}
+
 /// Whether the parent step's cancellation token has fired.
 ///
 /// Long-running loops should poll this between chunks and wind down
@@ -117,4 +131,19 @@ pub fn log(level: Level, message: &str) {
 /// embedder's cancel both arrive through it.
 pub fn cancelled() -> bool {
     sys::is_cancelled() != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_http_status;
+
+    #[test]
+    fn the_retryable_statuses_are_the_ones_the_vendor_sdks_retry() {
+        for status in [408, 409, 429, 500, 502, 503, 529, 599] {
+            assert!(retryable_http_status(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 404, 413, 422, 600] {
+            assert!(!retryable_http_status(status), "{status}");
+        }
+    }
 }
