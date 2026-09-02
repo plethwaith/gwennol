@@ -621,6 +621,46 @@ async fn fs_read_reports_an_unsearchable_ancestor_as_permission_denied() {
     );
 }
 
+/// The same unsearchable ancestor, for the other two steps: a listing
+/// below it and a write below it are both `permission_denied` as data,
+/// each approved under the path with the sealed part spelled as given.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let dir = f.workspace.join("sealed-too");
+    std::fs::create_dir_all(dir.join("inner")).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(dir.join("inner")).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: this user (root?) searches a mode-000 directory anyway");
+        return;
+    }
+    let listed = run("lister", json!({"dir": "sealed-too/inner", "max": 10})).await;
+    let written = run(
+        "plain_writer",
+        json!({"path": "sealed-too/inner/new.txt", "content": "z"}),
+    )
+    .await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listed = listed.expect("not a step error");
+    assert_eq!(listed["l"]["outcome"], "permission_denied");
+    assert!(
+        f.requests_for("lister")
+            .contains(&Access::ListDir(dir.join("inner"))),
+        "list probe approved"
+    );
+    let written = written.expect("not a step error");
+    assert_eq!(written["w"]["outcome"], "permission_denied");
+    assert!(
+        f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(dir.join("inner/new.txt"))),
+        "write probe approved"
+    );
+    assert!(!dir.join("inner/new.txt").exists(), "nothing was written");
+}
+
 #[tokio::test]
 async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
     let f = fixture();

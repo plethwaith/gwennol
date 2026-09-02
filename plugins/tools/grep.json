@@ -9,7 +9,7 @@
     "call": {
       "tool": {
         "name": "grep",
-        "description": "Search file contents recursively with an extended regular expression (grep -rnIE). Binary files and .git directories are skipped. Each match is reported as path:line:text. Output is cut at 262144 bytes and marked as truncated when it was.",
+        "description": "Search file contents recursively with an extended regular expression (grep -rnIE). Binary files and .git directories are skipped. Each match is reported as path:line:text. Output is cut at 262144 bytes (stdout and stderr each, when both are reported) and marked as truncated when it was.",
         "parameters": {
           "type": "object",
           "required": ["pattern"],

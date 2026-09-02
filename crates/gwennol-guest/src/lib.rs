@@ -132,3 +132,18 @@ pub fn retryable_http_status(status: i64) -> bool {
 pub fn cancelled() -> bool {
     sys::is_cancelled() != 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_http_status;
+
+    #[test]
+    fn the_retryable_statuses_are_the_ones_the_vendor_sdks_retry() {
+        for status in [408, 409, 429, 500, 502, 503, 529, 599] {
+            assert!(retryable_http_status(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 404, 413, 422, 600] {
+            assert!(!retryable_http_status(status), "{status}");
+        }
+    }
+}
