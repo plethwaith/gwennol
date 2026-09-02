@@ -163,12 +163,6 @@ The stream yields UTF-8 newline-delimited JSON, one event per line
 - `{"type": "opaque", "provider": "…", "data": …}` — a complete
   `opaque` block, emitted whole in its position among the turn's
   blocks.
-
-The assistant message a consumer rebuilds from the stream — to replay
-on the next turn — is the events in order: adjacent `text` events
-coalesced into one text block, `tool_use` and `opaque` events kept
-whole and in place. That is what keeps a vendor's reasoning in front of
-the tool call it led to.
 - `{"type": "end", "stop_reason": "…", "usage": { … }}` — the final event
   of every successful stream, followed by end-of-stream.
 - `{"type": "error", "message": "…", "retryable": …, "kind": "…"}` — the
@@ -177,6 +171,12 @@ the tool call it led to.
   worth repeating unchanged (rate limit, overload) as opposed to ones
   that will fail again (bad credentials); absent means unknown. `kind` is
   a provider-specific identifier, informational only.
+
+The assistant message a consumer rebuilds from the stream — to replay
+on the next turn — is the events in order: adjacent `text` events
+coalesced into one text block, `tool_use` and `opaque` events kept
+whole and in place. That is what keeps a vendor's reasoning in front of
+the tool call it led to.
 
 End-of-stream without an `end` or `error` event means the turn failed
 mid-stream with the cause lost; a failure before any bytes flow is an

@@ -191,7 +191,7 @@ written, and it must be settled before a provider exists.
 - **Settled: truncation is data too.** A tool reports `truncated: true`
   (`TOOL` 0.2.0) and never composes a marker; `spi::tool::render_content`
   appends the one shared marker before the model sees the result.
-- **Settled: the buffered failure taxonomy** is the `LLM_CHAT` 0.2.0
+- **Settled: the buffered failure taxonomy** is the `LLM_CHAT` 0.2.0 (now 0.3.0)
   `{"error": Failure}` form — the vendor answered and said no, with
   `retryable` filled from its answer. What the provider cannot classify
   without reading error text stays a step error, uniformly fatal.

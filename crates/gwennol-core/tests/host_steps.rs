@@ -643,7 +643,16 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
         json!({"path": "sealed-too/inner/new.txt", "content": "z"}),
     )
     .await;
+    // With create_dirs the refusal comes from mkdir, a different branch.
+    let made = run(
+        "writer",
+        json!({"path": "sealed-too/inner/deeper/new.txt", "content": "z", "dir": "."}),
+    )
+    .await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let made = made.expect("not a step error");
+    assert_eq!(made["w"]["outcome"], "permission_denied");
+    assert!(!dir.join("inner/deeper").exists(), "nothing was created");
     let listed = listed.expect("not a step error");
     assert_eq!(listed["l"]["outcome"], "permission_denied");
     assert!(

@@ -216,7 +216,10 @@ event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Read first."}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Read "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first."}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-01"}}
@@ -509,7 +512,10 @@ fn the_step_walker_reaches_every_nesting() {
         ]}},
         {"id": "k", "type": "parallel", "params": {"branches": [
             [{"id": "l", "type": "invoke", "params": {}}],
-            [{"id": "m", "type": "host_fs.read", "params": {}},
+            // A type that appears nowhere else in the tree, so a walker
+            // that skipped this branch could not pass on the strength
+            // of a twin at top level.
+            [{"id": "m", "type": "host_only.under_parallel", "params": {}},
              {"id": "n", "type": "ifs", "params": {"ifs": [
                  {"then": [{"id": "o", "type": "script", "params": {}}]}
              ]}}]
@@ -530,6 +536,7 @@ fn the_step_walker_reaches_every_nesting() {
         "host_fs.list",
         "parallel",
         "invoke",
+        "host_only.under_parallel",
         "script",
     ]
     .into_iter()

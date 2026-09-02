@@ -7,14 +7,16 @@
 //!
 //! - **request**: [`build_request`] turns the contract's `chat` input
 //!   plus the plugin's `$config` into a Messages API request body. The
-//!   contract's block shapes were chosen to be the vendor's, so
-//!   `messages` and `tools` pass through verbatim; what needs code is
-//!   the defaults and the knobs the contract deliberately leaves to
-//!   config (`docs/SPI.md`, "Known exclusions").
+//!   contract's block shapes were chosen to be the vendor's, so `tools`
+//!   pass through verbatim and `messages` nearly so — the one rewrite
+//!   is unwrapping this provider's `opaque` blocks back into the vendor
+//!   blocks they carry; what else needs code is the defaults and the
+//!   knobs the contract deliberately leaves to config (`docs/SPI.md`,
+//!   "Known exclusions").
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
-//!   `Failure` the contract's 0.2.0 buffered form carries when the
-//!   vendor answered and said no.
+//!   `Failure` the contract's buffered failed form (since 0.2.0)
+//!   carries when the vendor answered and said no.
 //! - **stream**: [`StreamTranslator`] is the state machine that folds
 //!   the Messages API's server-sent events into contract events: text
 //!   deltas relayed as they arrive, tool calls buffered and emitted
@@ -29,8 +31,12 @@
 //! included, which the provider cannot resume — into a `Failure`, never
 //! into a guess. The vendor's *own* forward-compatibility rule runs the
 //! other way: unknown SSE event types, delta types and content-block
-//! types are documented as safe to ignore, and are — each skip is
-//! noted so the glue can log it. Thinking blocks are neither: the
+//! types are documented as safe to ignore, and are. A skipped content
+//! block is noted so the glue can log it — it is the one skip that
+//! loses something the model produced; an unknown event or delta type
+//! is dropped silently, since a delta kind can recur on every fragment
+//! of a turn and a note per fragment would be noise. Thinking blocks
+//! are neither: the
 //! vendor requires a tool-use turn replayed with its thinking intact,
 //! so they travel as the contract's `opaque` block (`LLM_CHAT` 0.3.0),
 //! carried by the consumer, unwrapped back into the vendor block by
@@ -496,25 +502,25 @@ fn contract_block(block: &Value) -> Result<Mapped, Failure> {
 /// the host's cap: a cut JSON document is not a message, and the
 /// failure says so rather than reporting a parse error.
 pub fn buffered_output(status: i64, body: &str, truncated: bool) -> Translated {
-    let failed = |failure: Failure| Translated {
-        output: failure.into_buffered_output(),
-        notes: Vec::new(),
-    };
-    if truncated {
-        return failed(Failure::new(
+    // Notes survive a failure: a turn that skipped a block and then
+    // failed on its stop reason is exactly the one the breadcrumb is for.
+    let mut notes = Vec::new();
+    let output = if truncated {
+        Failure::new(
             "the vendor's response exceeded the buffered body cap",
             Some(false),
             "response_too_large",
-        ));
-    }
-    if !(200..300).contains(&status) {
-        return failed(http_failure(status, body));
-    }
-    let mut notes = Vec::new();
-    match translate_message(body, &mut notes) {
-        Ok(output) => Translated { output, notes },
-        Err(failure) => failed(failure),
-    }
+        )
+        .into_buffered_output()
+    } else if !(200..300).contains(&status) {
+        http_failure(status, body).into_buffered_output()
+    } else {
+        match translate_message(body, &mut notes) {
+            Ok(output) => output,
+            Err(failure) => failure.into_buffered_output(),
+        }
+    };
+    Translated { output, notes }
 }
 
 /// A buffered turn translated, plus what the translation left out.
@@ -1070,6 +1076,32 @@ mod tests {
             out.notes,
             vec!["skipped a content block of kind server_tool_use"]
         );
+
+        // The note survives a translation that then fails — that turn
+        // is exactly the one the breadcrumb exists for.
+        let out = buffered_output(
+            200,
+            r#"{"content": [{"type": "server_tool_use", "id": "x"}], "stop_reason": "end_turn"}"#,
+            false,
+        );
+        assert_eq!(out.output["error"]["kind"], "missing_usage");
+        assert_eq!(
+            out.notes,
+            vec!["skipped a content block of kind server_tool_use"]
+        );
+
+        // Redacted thinking is carried verbatim on this path too.
+        let out = buffered_output(
+            200,
+            r#"{"content": [{"type": "redacted_thinking", "data": "EmwKAhgB"}],
+                "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+            false,
+        );
+        assert_eq!(
+            out.output["message"]["content"],
+            json!([{"type": "opaque", "provider": crate::PLUGIN_NAME,
+                    "data": {"type": "redacted_thinking", "data": "EmwKAhgB"}}])
+        );
     }
 
     /// The round trip the vendor requires: the opaque block the buffered
@@ -1184,7 +1216,11 @@ mod tests {
             ),
             (
                 "content_block_delta",
-                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hm"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "m"}}),
             ),
             (
                 "content_block_delta",
@@ -1514,6 +1550,11 @@ mod tests {
                     json!({"type": "end", "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2}})
                 ),
             ]
+        );
+        assert_eq!(
+            t.take_notes(),
+            vec!["skipped a content block of kind server_tool_use"],
+            "the skipped block is noted once; the unknown event and delta are not"
         );
     }
 }
