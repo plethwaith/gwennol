@@ -249,6 +249,13 @@ written, and it must be settled before a provider exists.
   lands, not even the directories it would have made) and a spawn
   (never runs). The walk before the miss probe is a few syscalls and
   cannot be held open; its race is pinned at the boundary after it.
+  A cancelled host step says so as data — a `PluginError` carrying
+  `steps::CANCELLED_CODE` — so the loop recognises cancellation by
+  code, never by reading a message or inferring it from the token's
+  state: a failure that merely lands after the token fired keeps its
+  reason. The process step's own select is biased the other way,
+  work first: a child that has already finished has acted, and its
+  result is the truth about that.
 - **Settled: every tool call is answered.** A tool's own `is_error`
   is carried as is. A call the tool cannot answer — no such tool,
   arguments its schema refuses, a step error (the operator denied,
@@ -260,14 +267,19 @@ written, and it must be settled before a provider exists.
   unreplayable, and a denial in particular is something the model
   should route around rather than something the user must re-prompt
   past. Calls run one at a time, in the model's order, so approvals
-  arrive in that order too. Cancellation is the exception the other
-  way: a call it cuts off, and every call after it, is answered as
-  *interrupted* — naming cancellation, not the tool, since a tool
-  earlier in the same message may already have acted — the exchange
-  is stored whole, and the turn ends cancelled.
+  arrive in that order too. A round the model ended in a refusal
+  while still asking for tools is stored with each call answered as
+  not run: the refusal is not continued, and the model keeps the
+  memory of having refused. Cancellation is the exception the other
+  way: the call it cuts off is answered as interrupted while running
+  (it may have acted), the calls after it as interrupted before
+  starting — naming cancellation, not the tool — the exchange is
+  stored whole, and the turn ends cancelled.
 - **Settled: the transcript holds whole things.** A provider round
-  that did not reach `end` is dropped; one that did is stored with
-  the answer to every call it made. A turn that fails or is
+  that did not reach `end` is dropped, and so is one whose message is
+  empty — nothing to replay, and a vendor refuses an empty assistant
+  message anywhere but last; one that did is stored with the answer
+  to every call it made. A turn that fails or is
   cancelled therefore leaves the transcript ending in a user message,
   and the next turn's text joins that message after any results in
   it — the protocol's results-before-text order, and never two user
@@ -282,6 +294,12 @@ written, and it must be settled before a provider exists.
   The provider is resolved by role and refused when more than one
   plugin fulfils it, unless the session names one: which model a
   session talks to should never be a silent first-wins.
+- **Settled: the action ceiling is the frontend's.** Gwead caps a
+  non-dataflow action at 60 seconds by default — sized for request
+  handlers — which would end a `bash` call the tool itself allows an
+  hour, and count the operator's deliberation against it.
+  `HostConfig::action_timeout` (default two hours: twice the longest
+  bound a host step applies to itself) is what the kernel boots with.
 
 ### 6. Non-interactive CLI
 
