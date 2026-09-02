@@ -12,6 +12,7 @@
 // happens not to touch.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU32;
@@ -37,6 +38,51 @@ impl Operator for Permissive {
     fn emit(&self, _: Event) {}
     async fn input(&self) -> Option<Turn> {
         None
+    }
+}
+
+// ------------------------------------------------- the cancel harness
+
+/// An approval the test holds open: `arrived` fires when the operator
+/// is asked, `release` lets the answer through — and in the
+/// cancellation pins it never does, because the point is what happens
+/// to a prompt nobody answers.
+pub struct Gate {
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl Gate {
+    /// The operator's side: announce the prompt, then wait to be let
+    /// through. Cancel-safe — a dropped wait takes no permit.
+    pub async fn hold(&self) {
+        self.arrived.notify_one();
+        let permit = self.release.acquire().await.expect("gate never closes");
+        permit.forget();
+    }
+}
+
+/// One gate per plugin name, created on first use by either side.
+#[derive(Default)]
+pub struct Gates(Mutex<HashMap<String, Arc<Gate>>>);
+
+impl Gates {
+    pub fn gate(&self, plugin: &str) -> Arc<Gate> {
+        self.0
+            .lock()
+            .unwrap()
+            .entry(plugin.to_string())
+            .or_default()
+            .clone()
     }
 }
 

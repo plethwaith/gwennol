@@ -80,6 +80,7 @@ fn fixture() -> &'static Fixture {
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
             trusted_step_type_providers: vec![PROVIDER.to_string()],
+            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         for plugin in &bundled {

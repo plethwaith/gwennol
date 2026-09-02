@@ -17,7 +17,7 @@
 //! script the model's side by route; and a buffered one that answers
 //! from canned responses in its `$config`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,7 +30,6 @@ use gwennol_core::{
     Access, ApprovalRequest, Decision, Event, Operator, Session, SessionConfig, SessionError,
     StopReason, ToolCall, Turn, TurnError, spi,
 };
-use tokio::sync::{Notify, Semaphore};
 
 mod common;
 use common::{assert_conforms, contracts};
@@ -54,42 +53,17 @@ async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
     (out, events)
 }
 
-/// An approval the test holds open: `arrived` fires when the operator
-/// is asked, `release` lets the answer through.
-struct Gate {
-    arrived: Notify,
-    release: Semaphore,
-}
-
-impl Default for Gate {
-    fn default() -> Self {
-        Self {
-            arrived: Notify::new(),
-            release: Semaphore::new(0),
-        }
-    }
-}
-
 /// Approves everything except plugins named `denied*`; holds approvals
 /// for plugins named `gated*` until the test releases them; records
 /// every request; feeds `Session::run` from a queue.
 #[derive(Default)]
 struct Harness {
     requests: Mutex<Vec<ApprovalRequest>>,
-    gates: Mutex<HashMap<String, Arc<Gate>>>,
+    gates: common::Gates,
     inputs: Mutex<VecDeque<String>>,
 }
 
 impl Harness {
-    fn gate(&self, plugin: &str) -> Arc<Gate> {
-        self.gates
-            .lock()
-            .unwrap()
-            .entry(plugin.to_string())
-            .or_default()
-            .clone()
-    }
-
     fn requests_for(&self, plugin: &str) -> Vec<ApprovalRequest> {
         self.requests
             .lock()
@@ -110,10 +84,7 @@ impl Operator for Harness {
             return Decision::Deny;
         }
         if plugin.starts_with("gated") {
-            let gate = self.gate(&plugin);
-            gate.arrived.notify_one();
-            let permit = gate.release.acquire().await.expect("gate never closes");
-            permit.forget();
+            self.gates.gate(&plugin).hold().await;
         }
         Decision::Allow
     }
@@ -1229,7 +1200,7 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_at_an_open_approval_withdraws_it() {
     let f = fixture();
-    let gate = f.harness.gate("gated_tool");
+    let gate = f.harness.gates.gate("gated_tool");
     let mut s = session("/gated-tool");
     let cancel = CancellationToken::new();
     let handle = tokio::spawn({

@@ -7,7 +7,7 @@ use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{StepFuture, capped, lossy_capped, resolve, u64_param};
+use super::{StepFuture, cancelled, capped, lossy_capped, resolve, u64_param};
 use crate::host::{approval, approve, host, resolve_path};
 use crate::operator::Access;
 
@@ -137,7 +137,7 @@ pub fn process_run<'a>(
                 stdin: stdin.clone(),
             },
         );
-        approve(&cancel, ask).await.map_err(StepError::Failed)?;
+        approve(ask).await?;
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -180,7 +180,12 @@ pub fn process_run<'a>(
             std::io::Result::Ok((status, out?, err?))
         });
 
+        // Biased, work first: a child that has already finished has
+        // acted, and its result is the truth about that — reporting a
+        // deadline or a cancellation that landed in the same instant
+        // would tell the caller the work did not happen.
         let (status, stdout_bytes, stderr_bytes) = tokio::select! {
+            biased;
             r = &mut work => r.map_err(|e| StepError::Failed(format!("wait {:?}: {e}", argv[0])))?,
             () = tokio::time::sleep(timeout) => {
                 if let Some(pid) = pid { kill_group(pid); }
@@ -195,7 +200,7 @@ pub fn process_run<'a>(
             () = cancel.cancelled() => {
                 if let Some(pid) = pid { kill_group(pid); }
                 let _ = tokio::time::timeout(REAP_GRACE, &mut work).await;
-                return Err(StepError::Failed("cancelled".into()));
+                return Err(cancelled());
             }
         };
         let (stdout, stdout_truncated) = lossy_capped(&stdout_bytes, max);

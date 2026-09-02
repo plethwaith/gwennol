@@ -5,7 +5,6 @@
 //! The host is a process singleton, so this binary boots one kernel with
 //! every fixture plugin registered up front and shares it across tests.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -16,26 +15,11 @@ use gwead::kernel::streams::{STREAM_EOF, STREAM_IO_ERROR, StreamRegistry, read_a
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
-use tokio::sync::{Notify, Semaphore};
+use gwennol_core::{
+    Access, ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, ToolCall, Turn,
+};
 
-/// An approval the test holds open: `arrived` fires when the operator
-/// is asked, `release` would let the answer through — and in every
-/// test here it never does, because the point is what happens to a
-/// prompt nobody answers.
-struct Gate {
-    arrived: Notify,
-    release: Semaphore,
-}
-
-impl Default for Gate {
-    fn default() -> Self {
-        Self {
-            arrived: Notify::new(),
-            release: Semaphore::new(0),
-        }
-    }
-}
+mod common;
 
 /// Records every approval request; denies anything a `denied*` plugin
 /// asks for; holds anything a `gated*` plugin asks for until released;
@@ -43,18 +27,7 @@ impl Default for Gate {
 #[derive(Default)]
 struct Recorder {
     requests: Mutex<Vec<ApprovalRequest>>,
-    gates: Mutex<HashMap<String, Arc<Gate>>>,
-}
-
-impl Recorder {
-    fn gate(&self, plugin: &str) -> Arc<Gate> {
-        self.gates
-            .lock()
-            .unwrap()
-            .entry(plugin.to_string())
-            .or_default()
-            .clone()
-    }
+    gates: common::Gates,
 }
 
 #[async_trait::async_trait]
@@ -66,10 +39,7 @@ impl Operator for Recorder {
             return Decision::Deny;
         }
         if plugin.starts_with("gated") {
-            let gate = self.gate(&plugin);
-            gate.arrived.notify_one();
-            let permit = gate.release.acquire().await.expect("gate never closes");
-            permit.forget();
+            self.gates.gate(&plugin).hold().await;
         }
         Decision::Allow
     }
@@ -81,6 +51,9 @@ impl Operator for Recorder {
         None
     }
 }
+
+/// This suite's kernel-level ceiling on one action.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Fixture {
     kernel: Arc<Kernel>,
@@ -136,7 +109,17 @@ fn fixture() -> &'static Fixture {
         // to workspace joins (macOS tempdirs sit behind the /var symlink).
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         let operator = Arc::new(Recorder::default());
-        let mut kernel = gwennol_core::boot(operator.clone(), workspace.clone()).unwrap();
+        let mut kernel = gwennol_core::boot_with(HostConfig {
+            operator: operator.clone(),
+            workspace_root: workspace.clone(),
+            process_env: ProcessEnv::default(),
+            trusted_step_type_providers: Vec::new(),
+            // Short enough to pin that the frontend's value, not
+            // gwead's, is the ceiling; long enough for every other
+            // test here.
+            action_timeout: ACTION_TIMEOUT,
+        })
+        .unwrap();
         for m in fixture_plugins() {
             kernel.register_plugin_from_json(&m.to_string()).unwrap();
         }
@@ -1630,7 +1613,7 @@ fn host_manifests_are_valid_and_nothing_is_freely_usable() {
 /// into a few syscalls' worth of work would be a coin toss.
 async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError {
     let f = fixture();
-    let gate = f.operator.gate(plugin);
+    let gate = f.operator.gates.gate(plugin);
     let cancel = CancellationToken::new();
     let running = tokio::spawn({
         let cancel = cancel.clone();
@@ -1653,7 +1636,12 @@ async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError
         .unwrap_or_else(|_| panic!("{plugin}: the unanswered prompt held the cancelled invocation"))
         .unwrap()
         .expect_err("a cancelled invocation fails");
-    assert!(err.to_string().contains("cancelled"), "{plugin}: {err}");
+    // Cancellation is data — the code, not the text — so a consumer
+    // never has to read the message to know.
+    assert!(
+        matches!(&err, KernelError::PluginError { code, .. } if code == gwennol_core::steps::CANCELLED_CODE),
+        "{plugin}: {err}"
+    );
     assert_eq!(
         gate.release.available_permits(),
         0,
@@ -1723,4 +1711,28 @@ async fn a_spawn_withdrawn_at_its_prompt_never_runs() {
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!marker.exists(), "the child was spawned after cancellation");
+}
+
+// -------------------------------------------------- the action ceiling
+
+/// The kernel's wallclock ceiling on an action is the frontend's
+/// (`HostConfig::action_timeout`), not gwead's 60-second default: this
+/// suite boots with 15 s, and a child the step itself would allow to
+/// run for a minute is ended by the kernel at the suite's ceiling, as a
+/// timeout rather than a cancellation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
+    let started = std::time::Instant::now();
+    let err = run(
+        "runner",
+        json!({"argv": ["sleep", "30"], "stdin": "", "timeout_ms": 60000, "max_output_bytes": 1024}),
+    )
+    .await
+    .expect_err("the ceiling ends the action");
+    assert!(matches!(err, KernelError::ExecutionTimeout { .. }), "{err}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= ACTION_TIMEOUT && elapsed < ACTION_TIMEOUT + Duration::from_secs(10),
+        "ended at the suite's ceiling, not gwead's: {elapsed:?}"
+    );
 }

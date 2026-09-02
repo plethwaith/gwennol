@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use gwead::kernel::PluginExecution;
+use gwead::kernel::host_api::StepError;
 use gwead::tokio_util::sync::CancellationToken;
 
 use crate::context::tool_call;
@@ -102,7 +104,22 @@ pub struct HostConfig {
     /// not a routing choice. [`crate::boot`] passes the empty list;
     /// registering a guest-backed plugin requires [`crate::boot_with`].
     pub trusted_step_type_providers: Vec<String>,
+    /// The kernel's wallclock ceiling on one plugin action, where the
+    /// manifest sets none and the action is not a dataflow. It is the
+    /// backstop behind the host steps' own bounds — the longest of
+    /// which, a process's or a request's timeout, clamps at one hour —
+    /// and it keeps running while the operator deliberates over an
+    /// approval, so it must exceed the longest step plus that. Gwead's
+    /// own default is 60 seconds, sized for request handlers; a tool
+    /// call that outlives it fails as a step, and a buffered provider
+    /// turn that does fails the turn. [`DEFAULT_ACTION_TIMEOUT`] is
+    /// what [`crate::boot`] passes.
+    pub action_timeout: Duration,
 }
+
+/// Two hours: twice the longest bound a host step applies to itself,
+/// leaving the other half for the operator's deliberation.
+pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 static HOST: OnceLock<HostConfig> = OnceLock::new();
 
@@ -159,15 +176,28 @@ pub fn resolve_path(raw: &str) -> PathBuf {
     out
 }
 
+/// A question for the operator, bound to the invocation asking it.
+///
+/// Built by [`approval`] and consumed by [`approve`]; the cancellation
+/// token is captured here, from the execution, so no call site can pair
+/// a request with the wrong token.
+pub struct Ask {
+    request: ApprovalRequest,
+    cancel: CancellationToken,
+}
+
 /// Describe what the executing plugin wants, ready for [`approve`].
 ///
 /// Split from the asking so the borrow of the execution ends before the
-/// step body awaits: the request owns everything the operator is shown.
-pub fn approval(ex: &(dyn PluginExecution + Send), access: Access) -> ApprovalRequest {
-    ApprovalRequest {
-        plugin: ex.plugin_name().to_string(),
-        cause: tool_call(ex.exec_ctx()),
-        access,
+/// step body awaits: the ask owns everything the operator is shown.
+pub fn approval(ex: &(dyn PluginExecution + Send), access: Access) -> Ask {
+    Ask {
+        request: ApprovalRequest {
+            plugin: ex.plugin_name().to_string(),
+            cause: tool_call(ex.exec_ctx()),
+            access,
+        },
+        cancel: ex.cancel_token(),
     }
 }
 
@@ -196,7 +226,9 @@ fn describe(access: &Access) -> String {
     }
 }
 
-/// Ask the operator. `Err` carries a message suitable for a `StepError`.
+/// Ask the operator. A denial is a plain step failure; a withdrawal is
+/// the structured cancellation every host step reports
+/// ([`crate::steps::CANCELLED_CODE`]).
 ///
 /// The question is withdrawn when the invocation is cancelled: a turn
 /// the operator cancelled must not stay parked on a prompt the operator
@@ -206,17 +238,20 @@ fn describe(access: &Access) -> String {
 /// dropped mid-flight, which [`Operator::approve`] documents. Settled in
 /// milestone 5, where the loop first owned a cancel surface; every
 /// approval site goes through here, so it holds uniformly.
-pub async fn approve(cancel: &CancellationToken, request: ApprovalRequest) -> Result<(), String> {
+pub async fn approve(ask: Ask) -> Result<(), StepError> {
+    let Ask { request, cancel } = ask;
     let describe = describe(&request.access);
     let plugin = request.plugin.clone();
     let decision = tokio::select! {
         biased;
-        () = cancel.cancelled() => return Err("cancelled".to_string()),
+        () = cancel.cancelled() => return Err(crate::steps::cancelled()),
         decision = host().operator.approve(request) => decision,
     };
     match decision {
         Decision::Allow => Ok(()),
-        Decision::Deny => Err(format!("operator denied {describe} for plugin '{plugin}'")),
+        Decision::Deny => Err(StepError::Failed(format!(
+            "operator denied {describe} for plugin '{plugin}'"
+        ))),
     }
 }
 

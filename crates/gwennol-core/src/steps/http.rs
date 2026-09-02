@@ -18,7 +18,9 @@ use reqwest::Method;
 use tokio::time::Instant;
 use url::Url;
 
-use super::{StepFuture, bool_param, capped, lossy_capped, resolve, str_param, u64_param};
+use super::{
+    StepFuture, bool_param, cancelled, capped, lossy_capped, resolve, str_param, u64_param,
+};
 use crate::host::{approval, approve};
 use crate::operator::Access;
 
@@ -316,7 +318,7 @@ fn request<'a>(
                     url: url.to_string(),
                 },
             );
-            approve(&cancel, ask).await.map_err(StepError::Failed)?;
+            approve(ask).await?;
             let hop_deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
 
             let mut req = client().request(method.clone(), url.clone());
@@ -345,7 +347,7 @@ fn request<'a>(
                         "request to {host} exceeded timeout of {timeout:?}"
                     ))),
                 },
-                () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
+                () = cancel.cancelled() => return Err(cancelled()),
             };
 
             let location = resp
@@ -421,7 +423,7 @@ fn request<'a>(
                         "reading response from {host} exceeded timeout of {timeout:?}"
                     ))),
                 },
-                () = cancel.cancelled() => return Err(StepError::Failed("cancelled".into())),
+                () = cancel.cancelled() => return Err(cancelled()),
             };
             let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(|e| {

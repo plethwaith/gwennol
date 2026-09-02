@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gwead::kernel::native_impls::NativeStepImplTable;
-use gwead::kernel::{Kernel, KernelConfig, KernelError};
+use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
 
-use crate::host::{HostConfig, ProcessEnv, install};
+use crate::host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv, install};
 use crate::operator::Operator;
 use crate::secrets::OperatorSecrets;
 use crate::spi;
@@ -57,6 +57,7 @@ pub fn boot(operator: Arc<dyn Operator>, workspace_root: PathBuf) -> Result<Kern
         workspace_root,
         process_env: ProcessEnv::default(),
         trusted_step_type_providers: Vec::new(),
+        action_timeout: DEFAULT_ACTION_TIMEOUT,
     })
 }
 
@@ -66,7 +67,11 @@ pub fn boot_with(host: HostConfig) -> Result<Kernel, BootError> {
     let operator = host.operator.clone();
     let mut config = KernelConfig::default()
         .with_native_step_impls(NativeStepImplTable::discover()?)
-        .with_secret_resolver(Arc::new(OperatorSecrets(operator)));
+        .with_secret_resolver(Arc::new(OperatorSecrets(operator)))
+        // The one kernel limit the host re-sizes: see
+        // HostConfig::action_timeout for why gwead's default does not
+        // fit an agent's actions.
+        .with_limits(RuntimeLimits::default().with_default_wallclock_timeout(host.action_timeout));
     // The embedder half of the script-runtime authorization; the other
     // half is the provide:step_type: declaration in the trusted
     // plugin's own manifest. See HostConfig::trusted_step_type_providers.

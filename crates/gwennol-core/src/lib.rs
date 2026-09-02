@@ -64,7 +64,7 @@ pub use agent::{
     Usage,
 };
 pub use gwead;
-pub use host::{HostConfig, ProcessEnv};
+pub use host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv};
 pub use kernel::{
     BootError, HOST_FS_MANIFEST, HOST_HTTP_MANIFEST, HOST_MANIFESTS, HOST_PROCESS_MANIFEST, boot,
     boot_with,

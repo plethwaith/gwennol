@@ -116,6 +116,7 @@ fn fixture() -> &'static Fixture {
             // The embedder half of the authorization the manifest's
             // provide: grant asks for.
             trusted_step_type_providers: vec![PLUGIN.to_string()],
+            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         kernel

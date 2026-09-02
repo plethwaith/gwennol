@@ -27,6 +27,7 @@ pub mod process;
 use std::future::Future;
 use std::pin::Pin;
 
+use gwead::kernel::host_api::PluginErrorPayload;
 use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
@@ -45,6 +46,21 @@ pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
     requested.min(ceiling) as usize
 }
 
+/// The error code a host step fails with when its invocation was
+/// cancelled: a `KernelError::PluginError` carrying it, so a consumer —
+/// the agent loop — recognises cancellation as data and never by
+/// reading error text or guessing from a token's state.
+pub const CANCELLED_CODE: &str = "gwennol.cancelled";
+
+/// The structured error a cancelled host step returns.
+pub(crate) fn cancelled() -> StepError {
+    StepError::Thrown(PluginErrorPayload {
+        code: CANCELLED_CODE.to_string(),
+        message: "cancelled".to_string(),
+        params: Value::Null,
+    })
+}
+
 /// Run `work` to completion, unless the invocation is cancelled first.
 ///
 /// Biased toward cancellation: a checkpoint reached with the token
@@ -57,7 +73,7 @@ pub(crate) async fn or_cancelled<T>(
 ) -> Result<T, StepError> {
     tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(StepError::Failed("cancelled".into())),
+        () = cancel.cancelled() => Err(cancelled()),
         r = work => Ok(r),
     }
 }
