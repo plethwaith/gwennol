@@ -189,7 +189,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                     .await?
                     .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
                 let ask = approval(&*ex, Access::ReadFile(probed));
-                approve(ask).await.map_err(StepError::Failed)?;
+                approve(&cancel, ask).await.map_err(StepError::Failed)?;
                 return Ok(outcome.result(&path));
             }
         };
@@ -210,7 +210,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             }
         }
         let ask = approval(&*ex, Access::ReadFile(canonical));
-        approve(ask).await.map_err(StepError::Failed)?;
+        approve(&cancel, ask).await.map_err(StepError::Failed)?;
         // Opening a directory read-only succeeds on unix; it is the read
         // that would fail, and "is a directory" is the model's to act on.
         if meta.is_dir() {
@@ -395,14 +395,14 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 probed.push(name);
             }
             let ask = approval(&*ex, Access::WriteFile(probed));
-            approve(ask).await.map_err(StepError::Failed)?;
+            approve(&cancel, ask).await.map_err(StepError::Failed)?;
             return Ok(Outcome::IsSymlink.result(&path));
         }
         let canonical = or_cancelled(&cancel, canonicalize_missing(&path))
             .await?
             .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
         let ask = approval(&*ex, Access::WriteFile(canonical.clone()));
-        approve(ask).await.map_err(StepError::Failed)?;
+        approve(&cancel, ask).await.map_err(StepError::Failed)?;
         if create_dirs
             && let Some(parent) = canonical.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
@@ -500,12 +500,12 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
                     .await?
                     .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
                 let ask = approval(&*ex, Access::ListDir(probed));
-                approve(ask).await.map_err(StepError::Failed)?;
+                approve(&cancel, ask).await.map_err(StepError::Failed)?;
                 return Ok(outcome.result(&path));
             }
         };
         let ask = approval(&*ex, Access::ListDir(canonical.clone()));
-        approve(ask).await.map_err(StepError::Failed)?;
+        approve(&cancel, ask).await.map_err(StepError::Failed)?;
         let mut rd = match tokio::fs::read_dir(&canonical).await {
             Ok(rd) => rd,
             Err(e) => return outcome_or_error("list", &path, e),

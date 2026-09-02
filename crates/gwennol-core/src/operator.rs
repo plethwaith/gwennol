@@ -130,6 +130,14 @@ pub struct Turn {
 #[async_trait::async_trait]
 pub trait Operator: Send + Sync {
     /// Decide whether a native step may do something outside the sandbox.
+    ///
+    /// The question can be withdrawn: when the invocation behind it is
+    /// cancelled — the loop's turn was cancelled while this prompt was
+    /// open — the host stops waiting and this future is dropped before
+    /// it resolves. An implementation must therefore be safe to drop at
+    /// any await point: a prompt it put on screen should come down
+    /// (a guard type is the usual shape), and nothing it does after an
+    /// await may be needed for consistency.
     async fn approve(&self, request: ApprovalRequest) -> Decision;
 
     /// Produce a secret for a plugin, if the operator is willing to hand it

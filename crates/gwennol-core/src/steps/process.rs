@@ -128,6 +128,7 @@ pub fn process_run<'a>(
             OUTPUT_BYTES_CEILING,
         );
 
+        let cancel = ex.cancel_token();
         let ask = approval(
             &*ex,
             Access::Spawn {
@@ -136,7 +137,7 @@ pub fn process_run<'a>(
                 stdin: stdin.clone(),
             },
         );
-        approve(ask).await.map_err(StepError::Failed)?;
+        approve(&cancel, ask).await.map_err(StepError::Failed)?;
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -179,7 +180,6 @@ pub fn process_run<'a>(
             std::io::Result::Ok((status, out?, err?))
         });
 
-        let cancel = ex.cancel_token();
         let (status, stdout_bytes, stderr_bytes) = tokio::select! {
             r = &mut work => r.map_err(|e| StepError::Failed(format!("wait {:?}: {e}", argv[0])))?,
             () = tokio::time::sleep(timeout) => {

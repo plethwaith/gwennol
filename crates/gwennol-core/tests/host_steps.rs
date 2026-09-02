@@ -5,33 +5,73 @@
 //! The host is a process singleton, so this binary boots one kernel with
 //! every fixture plugin registered up front and shares it across tests.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use gwead::kernel::streams::{STREAM_EOF, STREAM_IO_ERROR, StreamRegistry, read_async_shared};
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
+use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
+use tokio::sync::{Notify, Semaphore};
+
+/// An approval the test holds open: `arrived` fires when the operator
+/// is asked, `release` would let the answer through — and in every
+/// test here it never does, because the point is what happens to a
+/// prompt nobody answers.
+struct Gate {
+    arrived: Notify,
+    release: Semaphore,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            arrived: Notify::new(),
+            release: Semaphore::new(0),
+        }
+    }
+}
 
 /// Records every approval request; denies anything a `denied*` plugin
-/// asks for; answers `token` for the `secretive` plugin.
+/// asks for; holds anything a `gated*` plugin asks for until released;
+/// answers `token` for the `secretive` plugin.
 #[derive(Default)]
 struct Recorder {
     requests: Mutex<Vec<ApprovalRequest>>,
+    gates: Mutex<HashMap<String, Arc<Gate>>>,
+}
+
+impl Recorder {
+    fn gate(&self, plugin: &str) -> Arc<Gate> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(plugin.to_string())
+            .or_default()
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl Operator for Recorder {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        let deny = request.plugin.starts_with("denied");
+        let plugin = request.plugin.clone();
         self.requests.lock().unwrap().push(request);
-        if deny {
-            Decision::Deny
-        } else {
-            Decision::Allow
+        if plugin.starts_with("denied") {
+            return Decision::Deny;
         }
+        if plugin.starts_with("gated") {
+            let gate = self.gate(&plugin);
+            gate.arrived.notify_one();
+            let permit = gate.release.acquire().await.expect("gate never closes");
+            permit.forget();
+        }
+        Decision::Allow
     }
     async fn secret(&self, plugin: &str, name: &str) -> Option<String> {
         (plugin == "secretive" && name == "token").then(|| "s3cr3t".to_string())
@@ -180,6 +220,30 @@ fn fixture_plugins() -> Vec<Value> {
             "delegator",
             &["invoke:plugin:reader"],
             json!([{"id": "i", "type": "invoke", "params": {"plugin": "reader", "action": "go", "input": {"path": "{{$input.path}}", "max_bytes": 1024}}}]),
+        ),
+        // The cancel harness: their approvals are held open by the
+        // operator until the test says otherwise.
+        plugin(
+            "gated_reader",
+            &["step_type:host_fs.read"],
+            json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}", "max_bytes": 1024}},
+                   {"id": "after", "type": "let", "params": {"value": "ran"}}]),
+        ),
+        plugin(
+            "gated_prober",
+            &["step_type:host_fs.read"],
+            json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}", "max_bytes": 1024}},
+                   {"id": "after", "type": "let", "params": {"value": "ran"}}]),
+        ),
+        plugin(
+            "gated_writer",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
+        ),
+        plugin(
+            "gated_runner",
+            &["step_type:host_process.run"],
+            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
         ),
         plugin(
             "ungranted",
@@ -1554,4 +1618,109 @@ fn host_manifests_are_valid_and_nothing_is_freely_usable() {
             "host_http.post",
         ]
     );
+}
+
+// ------------------------------------------------ cancel at the prompt
+
+/// Run `plugin` with its own token, wait until the operator has been
+/// asked, cancel, and return the invocation's error — which must arrive
+/// without the operator ever answering. The milestone-5 cancel harness:
+/// an approval held open is the one place a step can be cancelled at a
+/// known point, so these pins are deterministic where a cancel fired
+/// into a few syscalls' worth of work would be a coin toss.
+async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError {
+    let f = fixture();
+    let gate = f.operator.gate(plugin);
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            fixture()
+                .kernel
+                .execute(plugin, "go", input)
+                .with_config(&json!({}))
+                .with_cancel(cancel)
+                .run()
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{plugin} never asked the operator"));
+    cancel.cancel();
+    let err = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap_or_else(|_| panic!("{plugin}: the unanswered prompt held the cancelled invocation"))
+        .unwrap()
+        .expect_err("a cancelled invocation fails");
+    assert!(err.to_string().contains("cancelled"), "{plugin}: {err}");
+    assert_eq!(
+        gate.release.available_permits(),
+        0,
+        "{plugin}: the operator never answered"
+    );
+    err
+}
+
+/// Cancelling an invocation parked on an approval withdraws the
+/// question: the step fails as cancelled without the prompt being
+/// answered, and the steps after it never run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_invocation_withdraws_its_pending_approval() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("gated.txt"), "held").unwrap();
+    cancel_at_the_prompt("gated_reader", json!({"path": "gated.txt"})).await;
+    let asked = f.requests_for("gated_reader");
+    assert_eq!(asked, vec![Access::ReadFile(f.workspace.join("gated.txt"))]);
+}
+
+/// The miss path — the probe of a file that is not there — asks the
+/// operator under the deepest-existing-ancestor path like any read,
+/// and a cancellation at that prompt ends the invocation there: the
+/// plugin never learns the outcome. (The walk *before* the prompt is a
+/// few syscalls and cannot be held open, so the race the write path's
+/// `or_cancelled` guards is pinned at the boundary after it.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_probe_withdrawn_at_its_prompt_ends_the_invocation() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("probed")).unwrap();
+    cancel_at_the_prompt("gated_prober", json!({"path": "probed/missing/file.txt"})).await;
+    let asked = f.requests_for("gated_prober");
+    assert_eq!(
+        asked,
+        vec![Access::ReadFile(
+            f.workspace.join("probed/missing/file.txt")
+        )]
+    );
+}
+
+/// A write withdrawn at its prompt leaves nothing behind: no
+/// destination, no temporary file, not even the directories
+/// `create_dirs` would have made — the approval precedes all of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_withdrawn_at_its_prompt_leaves_nothing_behind() {
+    let f = fixture();
+    cancel_at_the_prompt(
+        "gated_writer",
+        json!({"path": "gated-out/made/target.txt", "content": "never"}),
+    )
+    .await;
+    assert!(
+        !f.workspace.join("gated-out").exists(),
+        "nothing was created before the approval"
+    );
+}
+
+/// A spawn withdrawn at its prompt never runs the program.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spawn_withdrawn_at_its_prompt_never_runs() {
+    let f = fixture();
+    let marker = f.workspace.join("spawned.marker");
+    cancel_at_the_prompt(
+        "gated_runner",
+        json!({"argv": ["touch", marker.to_string_lossy()]}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "the child was spawned after cancellation");
 }

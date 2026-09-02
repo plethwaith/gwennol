@@ -46,13 +46,19 @@ pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
 }
 
 /// Run `work` to completion, unless the invocation is cancelled first.
+///
+/// Biased toward cancellation: a checkpoint reached with the token
+/// already cancelled — the operator cancelled while an earlier phase
+/// ran — stops here by construction rather than by winning a coin toss
+/// against work that happens to be ready on its first poll.
 pub(crate) async fn or_cancelled<T>(
     cancel: &CancellationToken,
     work: impl Future<Output = T>,
 ) -> Result<T, StepError> {
     tokio::select! {
-        r = work => Ok(r),
+        biased;
         () = cancel.cancelled() => Err(StepError::Failed("cancelled".into())),
+        r = work => Ok(r),
     }
 }
 

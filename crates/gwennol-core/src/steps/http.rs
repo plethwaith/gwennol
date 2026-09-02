@@ -316,7 +316,7 @@ fn request<'a>(
                     url: url.to_string(),
                 },
             );
-            approve(ask).await.map_err(StepError::Failed)?;
+            approve(&cancel, ask).await.map_err(StepError::Failed)?;
             let hop_deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
 
             let mut req = client().request(method.clone(), url.clone());

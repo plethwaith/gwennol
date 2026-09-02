@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use gwead::kernel::PluginExecution;
+use gwead::tokio_util::sync::CancellationToken;
 
 use crate::context::tool_call;
 use crate::operator::{Access, ApprovalRequest, Decision, Operator};
@@ -191,10 +192,24 @@ fn describe(access: &Access) -> String {
 }
 
 /// Ask the operator. `Err` carries a message suitable for a `StepError`.
-pub async fn approve(request: ApprovalRequest) -> Result<(), String> {
+///
+/// The question is withdrawn when the invocation is cancelled: a turn
+/// the operator cancelled must not stay parked on a prompt the operator
+/// then has to answer for it to stop, so the ask races the invocation's
+/// token, biased toward cancellation — a token already cancelled on
+/// arrival never asks at all. The operator's `approve` future is then
+/// dropped mid-flight, which [`Operator::approve`] documents. Settled in
+/// milestone 5, where the loop first owned a cancel surface; every
+/// approval site goes through here, so it holds uniformly.
+pub async fn approve(cancel: &CancellationToken, request: ApprovalRequest) -> Result<(), String> {
     let describe = describe(&request.access);
     let plugin = request.plugin.clone();
-    match host().operator.approve(request).await {
+    let decision = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err("cancelled".to_string()),
+        decision = host().operator.approve(request) => decision,
+    };
+    match decision {
         Decision::Allow => Ok(()),
         Decision::Deny => Err(format!("operator denied {describe} for plugin '{plugin}'")),
     }
