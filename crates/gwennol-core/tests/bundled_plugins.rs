@@ -354,6 +354,9 @@ fn stub() -> &'static Stub {
             let streaming = parsed.get("stream").and_then(Value::as_bool) == Some(true);
             let (route, _) = path.split_once("/v1/messages").unwrap_or((path.as_str(), ""));
             match route {
+                // Never answers: the connection is held for longer
+                // than any cancel test waits, then dropped.
+                "/stall" => std::thread::sleep(std::time::Duration::from_secs(5)),
                 "/rate-limited" => respond(
                     &mut socket,
                     "429 Too Many Requests",
@@ -928,6 +931,46 @@ async fn the_loop_drives_the_bundled_provider_and_tools() {
         "the provider unwrapped its own opaque block on replay"
     );
     assert_eq!(sent[1]["tools"], f.tools(), "the harvest, on every round");
+}
+
+/// A cancel during a buffered round against the real provider: the
+/// cancellation reaches the HTTP step two invokes down and comes back
+/// flattened to text by the nested invoke, and the loop's own token
+/// — not the code — is what makes it a cancel rather than a fatal
+/// provider step error.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_buffered_round_against_the_bundled_provider_is_a_cancel() {
+    let f = fixture();
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(PROVIDER.to_string(), f.config("/stall"));
+    let mut session = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            stream: false,
+            plugin_configs: configs,
+            ..SessionConfig::default()
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let outcome = session.turn("stall", &cancel).await;
+            (session, outcome)
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    cancel.cancel();
+    let (session, outcome) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("the cancel ends the stalled round promptly")
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(gwennol_core::TurnError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(session.transcript().len(), 1, "nothing partial is kept");
 }
 
 // ---------------------------------------------------------- the tools

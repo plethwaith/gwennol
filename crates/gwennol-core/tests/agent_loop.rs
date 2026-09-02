@@ -280,6 +280,15 @@ fn fixture_plugins() -> Vec<Value> {
             ret(json!({"content": "abc", "is_error": false, "truncated": true})),
         ),
         tool_plugin("fixture_broken", "broken", &[], ret(json!({"nope": 1}))),
+        // Throws the host's cancellation code without any cancellation:
+        // throw_error is an intrinsic every plugin may use.
+        tool_plugin(
+            "fixture_forger",
+            "forger",
+            &[],
+            json!([{"id": "t", "type": "throw_error", "params": {
+                "code": gwennol_core::steps::CANCELLED_CODE, "message": "forged"}}]),
+        ),
         tool_plugin(
             "fixture_slow",
             "slow",
@@ -431,6 +440,7 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
         "/unknown-tool" => one_call("nope", json!({})),
         "/bad-args" => one_call("echo", json!({"message": 5})),
         "/broken-tool" => one_call("broken", json!({})),
+        "/forged-cancel" => one_call("forger", json!({})),
         "/cut-tool" => one_call("cut", json!({})),
         "/read-tool" => one_call("read_file", json!({"path": "hello.txt"})),
         "/denied-tool" => one_call("denied", json!({"path": "hello.txt"})),
@@ -668,6 +678,7 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
             "denied",
             "echo",
             "fail",
+            "forger",
             "gated",
             "read_file",
             "slow"
@@ -874,6 +885,14 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
             json!({"path": "hello.txt"}),
             "operator denied",
         ),
+        // The code without the turn's token is not a cancel: the
+        // kernel's ceiling, or — here — the plugin's own doing.
+        (
+            "/forged-cancel",
+            "forger",
+            json!({}),
+            "a cancellation the turn did not request",
+        ),
     ] {
         let mut s = session(route);
         let (outcome, events) = with_events(async { turn(&mut s, route).await }).await;
@@ -1054,6 +1073,18 @@ async fn off_contract_streams_fail_the_turn_closed() {
     assert_eq!(events, vec![Event::Text("hel".into())]);
     assert_eq!(s.transcript(), &[user("cut")]);
 
+    // Under the default cap a 100 KB event is one event, assembled
+    // across the reader's chunks.
+    let mut s = session("/big-event");
+    turn(&mut s, "big").await.unwrap();
+    assert_eq!(
+        s.transcript()[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len(),
+        100_000
+    );
+
     // The event cap is the loop's bound on buffering.
     let f = fixture();
     let mut s = Session::new(
@@ -1088,8 +1119,20 @@ async fn refusal_and_max_tokens_end_the_turn() {
     // as not run — the model remembers refusing, and the transcript
     // stays replayable.
     let mut s = session("/refusal-with-call");
-    let outcome = turn(&mut s, "hm").await.unwrap();
+    let (outcome, events) = with_events(async { turn(&mut s, "hm").await }).await;
+    let outcome = outcome.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Refusal);
+    assert_eq!(
+        events,
+        vec![
+            Event::ToolFailed {
+                call: tool_call("c1", "echo", json!({"message": "x"})),
+                error: "not run: the model's turn ended in a refusal".into()
+            },
+            Event::TurnComplete,
+        ],
+        "the frontend is told about every result the model gets"
+    );
     assert_eq!(s.transcript().len(), 3);
     assert_eq!(s.transcript()[1]["content"][0]["type"], "tool_use");
     assert_eq!(
@@ -1235,8 +1278,12 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
                 call: slow,
                 error: "interrupted: the turn was cancelled while this call was running; it may have run in part or in full".into()
             },
+            Event::ToolFailed {
+                call: tool_call("c2", "echo", json!({"message": "never"})),
+                error: "interrupted: the turn was cancelled before this call started".into()
+            },
         ],
-        "the second call never started"
+        "the second call never started, and the frontend is told so without a ToolCall"
     );
     let transcript = s.transcript();
     assert_eq!(transcript.len(), 3, "the exchange is kept whole");
@@ -1267,23 +1314,74 @@ async fn cancelling_at_an_open_approval_withdraws_it() {
     let handle = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            let outcome = s.turn("ask", &cancel).await;
-            (s, outcome)
+            let (outcome, events) = with_events(async { s.turn("ask", &cancel).await }).await;
+            (s, outcome, events)
         }
     });
     tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
         .await
         .expect("the tool asked the operator");
     cancel.cancel();
-    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), handle)
+    let (s, outcome, events) = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("the withdrawn approval does not hold the turn")
         .unwrap();
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
-    assert_eq!(s.transcript()[2]["content"][0]["is_error"], true);
+    // The host step said it was withdrawn at the approval, so the model
+    // is told nothing ran — not the cautious "may have run".
+    let gated = tool_call("c1", "gated", json!({"path": "hello.txt"}));
+    assert_eq!(
+        events,
+        vec![
+            Event::ToolCall(gated.clone()),
+            Event::ToolFailed {
+                call: gated,
+                error: "interrupted: the turn was cancelled before this call started".into()
+            },
+        ]
+    );
+    assert_eq!(
+        s.transcript()[2]["content"][0],
+        json!({"type": "tool_result", "tool_use_id": "c1", "is_error": true,
+               "content": "interrupted: the turn was cancelled before this call started"})
+    );
     assert_eq!(
         gate.release.available_permits(),
         0,
         "the operator never answered"
     );
+}
+
+/// A token already cancelled when the turn starts: the kernel refuses
+/// the provider invocation at its first step with its own `Cancelled`,
+/// and the loop's token — the authority — reads it as the cancel it
+/// is, on both forms.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
+    let f = fixture();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let mut streamed = session("/text");
+    assert!(matches!(
+        streamed.turn("never", &cancel).await.unwrap_err(),
+        TurnError::Cancelled
+    ));
+    assert_eq!(streamed.transcript(), &[user("never")]);
+    assert!(
+        f.stub
+            .requests_for("/text")
+            .iter()
+            .all(|b| b["messages"][0] != user("never"))
+    );
+
+    let mut buffered = canned(vec![json!({
+        "message": {"role": "assistant", "content": [text("unreached")]},
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })]);
+    assert!(matches!(
+        buffered.turn("never", &cancel).await.unwrap_err(),
+        TurnError::Cancelled
+    ));
+    assert_eq!(buffered.transcript(), &[user("never")]);
 }

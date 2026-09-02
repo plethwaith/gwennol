@@ -250,10 +250,16 @@ written, and it must be settled before a provider exists.
   (never runs). The walk before the miss probe is a few syscalls and
   cannot be held open; its race is pinned at the boundary after it.
   A cancelled host step says so as data — a `PluginError` carrying
-  `steps::CANCELLED_CODE` — so the loop recognises cancellation by
-  code, never by reading a message or inferring it from the token's
-  state: a failure that merely lands after the token fired keeps its
-  reason. The process step's own select is biased the other way,
+  `steps::CANCELLED_CODE`, with `params.phase` naming a withdrawn
+  approval — but the loop's own token is the authority: once it has
+  fired, whatever a step reports is the cut arriving (a nested invoke
+  flattens the code to text, and the text goes to the log), and the
+  code arriving without it is a step failure, reported and logged —
+  the kernel's action ceiling cancels an invocation the same way and
+  remaps only its own `Cancelled` to a timeout, and any plugin may
+  throw the code. The code's part is to say how far the step got:
+  withdrawn at the approval means nothing ran. The process step's
+  own select is biased the other way,
   work first: a child that has already finished has acted, and its
   result is the truth about that.
 - **Settled: every tool call is answered.** A tool's own `is_error`

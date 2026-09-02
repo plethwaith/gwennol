@@ -201,6 +201,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_event_larger_than_a_chunk_is_assembled_in_one_pass() {
+        // A 100 KB event delivered in 3 KB pieces: many reads per line,
+        // each resuming the scan where the last stopped.
+        let text = "x".repeat(100_000);
+        let line = format!("{{\"type\":\"text\",\"text\":\"{text}\"}}\n{{\"type\":\"end\"}}\n");
+        let line: &'static str = Box::leak(line.into_boxed_str());
+        let chunks: Vec<&'static str> = line
+            .as_bytes()
+            .chunks(3000)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let (streams, id) = readable(chunks);
+        let cancel = CancellationToken::new();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        let event = reader.next(&cancel).await.unwrap().unwrap();
+        assert_eq!(event["text"].as_str().unwrap().len(), 100_000);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap(),
+            Some(json!({"type": "end"}))
+        );
+        assert_eq!(reader.next(&cancel).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_failures_carry_the_streams_code() {
+        use gwead::kernel::streams::STREAM_IO_ERROR;
+        // A source that fails: the I/O code.
+        let source = Box::pin(gwead::futures::stream::iter([
+            Ok(Bytes::from_static(b"{\"type\":\"text\",\"text\":\"a\"}\n")),
+            Err(std::io::Error::other("transport died")),
+        ]));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/x-ndjson", source);
+        let streams = Arc::new(Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        assert!(reader.next(&cancel).await.unwrap().is_some());
+        assert_eq!(
+            reader.next(&cancel).await.unwrap_err(),
+            ReadError::Io(STREAM_IO_ERROR)
+        );
+
+        // A handle closed under the reader: the closed code, not EOF.
+        let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
+        let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
+        lock_shared(&streams).close(id);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap_err(),
+            ReadError::Io(STREAM_CLOSED)
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_wins_and_dropping_the_reader_closes_the_handle() {
         // A source that never yields: the read parks, and only the
         // token can end it.

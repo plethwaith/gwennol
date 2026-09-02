@@ -52,17 +52,19 @@
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a pending approval is
-//!   withdrawn, a running tool step is cancelled. A cancelled
-//!   invocation says so as data — the kernel's own `Cancelled`, or a
-//!   host step's structured `steps::CANCELLED_CODE` — so a cancelled
-//!   tool call is never mistaken for one that could not run, and a
-//!   failure that merely lands after the token fired keeps its real
-//!   reason. The cut-off call is answered as *interrupted while
-//!   running* (it may have acted), the calls after it as *interrupted
-//!   before starting*, and the turn ends as [`TurnError::Cancelled`]
-//!   once that exchange is stored: the model is told the truth about
-//!   a call that did not complete, in words that name cancellation
-//!   and not a tool failure.
+//!   withdrawn, a running tool step is cancelled. The turn's own token
+//!   is the authority: once it has fired, whatever a step reports is
+//!   the cut arriving (its text goes to the log), and a cancellation
+//!   code arriving *without* it — the kernel's action ceiling ended
+//!   the step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
+//!   step failure, reported as such and logged. The code's part is to
+//!   say how far the step got: a withdrawn approval means nothing ran.
+//!   The cut-off call is answered as *interrupted while running* (it
+//!   may have acted) or *interrupted before starting*, the calls after
+//!   it as before starting, and the turn ends as
+//!   [`TurnError::Cancelled`] once that exchange is stored: the model
+//!   is told the truth about a call that did not complete, in words
+//!   that name cancellation and not a tool failure.
 //! - **The transcript holds only whole things.** A provider round
 //!   that did not reach its `end` event is dropped, and so is a round
 //!   whose message is empty (nothing to replay, and a vendor refuses
@@ -506,7 +508,7 @@ impl Session {
                 let results = round
                     .calls
                     .iter()
-                    .map(|call| not_run_result(call, REFUSED))
+                    .map(|call| self.not_run(call, REFUSED))
                     .collect();
                 self.transcript.push_assistant(round.message);
                 self.transcript.push_tool_results(results);
@@ -519,11 +521,11 @@ impl Session {
             let mut results = Vec::with_capacity(round.calls.len());
             for call in &round.calls {
                 let block = if cancel.is_cancelled() {
-                    not_run_result(call, INTERRUPTED_BEFORE_START)
+                    self.not_run(call, Cut::BeforeStart.reason())
                 } else {
                     match self.answer(call, cancel).await {
                         Ok(block) => block,
-                        Err(Interrupted) => not_run_result(call, INTERRUPTED_WHILE_RUNNING),
+                        Err(Interrupted(cut)) => self.not_run(call, cut.reason()),
                     }
                 };
                 results.push(block);
@@ -622,12 +624,14 @@ impl Session {
             .execute(&self.provider, spi::llm_chat::CHAT, input)
             .with_config(self.config_for(&self.provider))
             .with_cancel(cancel.child_token());
-        // A provider step error is fatal — unless it is the invocation
-        // reporting its own cancellation.
+        // A provider step error is fatal — unless the turn's own token
+        // fired, in which case the error is the cancellation arriving.
         let fatal = |e: KernelError| {
-            if is_cancellation(&e) {
+            if cancel.is_cancelled() {
+                tracing::info!(error = %e, "provider round ended by the turn's cancellation");
                 TurnError::Cancelled
             } else {
+                warn_if_unrequested(&e);
                 TurnError::Step(e)
             }
         };
@@ -671,17 +675,7 @@ impl Session {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 Ok(None) => return Err(TurnError::StreamEnded),
-                Err(ReadError::Cancelled) => return Err(TurnError::Cancelled),
-                // The source failed: the relay died, or the transport
-                // under it. Any other code is about the handle itself —
-                // closed, wrong direction, unknown — and cannot arise
-                // from a table the loop owns; it is reported as what
-                // it is rather than folded into "the cause was lost".
-                Err(ReadError::Io(STREAM_IO_ERROR)) => {
-                    tracing::warn!("stream source reported an I/O error mid-turn");
-                    return Err(TurnError::StreamEnded);
-                }
-                Err(e) => return Err(TurnError::Contract(e.to_string())),
+                Err(e) => return Err(stream_read_failure(e)),
             };
             let Some(fields) = event.as_object() else {
                 return Err(TurnError::Contract(format!(
@@ -777,15 +771,28 @@ impl Session {
                         Ok(result) => parse_output(&result.output).map_err(|e| {
                             format!("{:?} returned a malformed result: {e}", call.name)
                         }),
-                        Err(e) if is_cancellation(&e) => {
-                            self.operator.emit(Event::ToolFailed {
-                                call: tool_call,
-                                error: INTERRUPTED_WHILE_RUNNING.to_string(),
-                            });
-                            return Err(Interrupted);
+                        // The turn's token is the authority on
+                        // cancellation: once it fired, whatever the
+                        // step reports is the cut arriving — its text
+                        // goes to the log, and the model is told the
+                        // call was interrupted, which is true whatever
+                        // else went wrong. The code only says how far
+                        // the step got.
+                        Err(e) if cancel.is_cancelled() => {
+                            tracing::info!(tool = %call.name, id = %call.id, error = %e, "tool call ended by the turn's cancellation");
+                            return Err(Interrupted(Cut::from_error(&e)));
                         }
-                        // A failure that lands after the token fired
-                        // is still that failure: its reason is kept.
+                        // A cancellation nobody asked for is a failure
+                        // to report, not a cut: the kernel's action
+                        // ceiling ended the step, or the plugin threw
+                        // the code itself.
+                        Err(e) if reports_cancellation(&e) => {
+                            warn_if_unrequested(&e);
+                            Err(format!(
+                                "{:?} stopped with a cancellation the turn did not request — the kernel's action ceiling, or the plugin's own doing: {e}",
+                                call.name
+                            ))
+                        }
                         Err(e) => Err(format!(
                             "{:?} failed before producing a result: {e}",
                             call.name
@@ -823,14 +830,78 @@ impl Session {
     }
 }
 
-/// The invocation behind a tool call reported its own cancellation.
-struct Interrupted;
+impl Session {
+    /// Answer a call that was not run, and tell the frontend: one
+    /// [`Event::ToolFailed`] per such call, with no [`Event::ToolCall`]
+    /// before it since the loop never dispatched it.
+    fn not_run(&self, call: &ToolUse, reason: &str) -> Value {
+        self.operator.emit(Event::ToolFailed {
+            call: ToolCall {
+                id: Some(call.id.clone()),
+                name: call.name.clone(),
+                arguments: call.input.to_string(),
+            },
+            error: reason.to_string(),
+        });
+        json!({
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": reason,
+            "is_error": true,
+        })
+    }
+}
 
-/// Whether a kernel error is the invocation reporting its cancellation
-/// — the kernel's own between-step check, or a host step's structured
-/// cancellation (`steps::CANCELLED_CODE`) — as opposed to a failure that
-/// happens to arrive after the token fired, which keeps its real reason.
-fn is_cancellation(e: &KernelError) -> bool {
+/// The turn's cancellation cut a tool call off.
+struct Interrupted(Cut);
+
+/// Where the cancellation found the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// Nothing had happened: the loop had not dispatched it, or the
+    /// host step's approval was withdrawn before the operator answered.
+    BeforeStart,
+    /// The step was somewhere in its work, and cannot say how far.
+    WhileRunning,
+}
+
+impl Cut {
+    /// Read how far the cancelled step got from what it reported. Only
+    /// a host step's own structured error can say it never started; a
+    /// cancellation flattened by a nested invoke, or the kernel's own,
+    /// is read as the cautious answer.
+    fn from_error(e: &KernelError) -> Self {
+        match e {
+            KernelError::PluginError { code, params, .. }
+                if code == crate::steps::CANCELLED_CODE
+                    && params["phase"] == crate::steps::CANCELLED_AT_APPROVAL =>
+            {
+                Cut::BeforeStart
+            }
+            _ => Cut::WhileRunning,
+        }
+    }
+
+    /// What the model is told. Names cancellation, not the tool, and
+    /// claims no more than is known.
+    fn reason(self) -> &'static str {
+        match self {
+            Cut::WhileRunning => {
+                "interrupted: the turn was cancelled while this call was running; it may have run in part or in full"
+            }
+            Cut::BeforeStart => "interrupted: the turn was cancelled before this call started",
+        }
+    }
+}
+
+/// Whether a kernel error carries a cancellation: the kernel's own
+/// between-step check, or a host step's structured
+/// `steps::CANCELLED_CODE`. Never on its own a reason to treat a turn
+/// as cancelled — the turn's token is the authority — because the code
+/// also arrives when the kernel's action ceiling cancels the invocation
+/// (gwead remaps only its own `Cancelled` to a timeout), and because
+/// any plugin may throw it.
+fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
         KernelError::PluginError { code, .. } => code == crate::steps::CANCELLED_CODE,
@@ -838,28 +909,32 @@ fn is_cancellation(e: &KernelError) -> bool {
     }
 }
 
-/// What the model is told about a call cancellation cut off while it
-/// ran. Names cancellation, not the tool, and claims no more than is
-/// known: the work may have happened.
-const INTERRUPTED_WHILE_RUNNING: &str = "interrupted: the turn was cancelled while this call was running; it may have run in part or in full";
-
-/// What the model is told about a call cancellation reached before it
-/// started.
-const INTERRUPTED_BEFORE_START: &str =
-    "interrupted: the turn was cancelled before this call started";
+/// A cancellation the turn did not ask for leaves a footprint.
+fn warn_if_unrequested(e: &KernelError) {
+    if reports_cancellation(e) {
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling ended the step, or the plugin threw the code itself");
+    }
+}
 
 /// What the model is told about a call it made in a turn it then
 /// refused to continue.
 const REFUSED: &str = "not run: the model's turn ended in a refusal";
 
-/// The `tool_result` block answering a call that was not run, and why.
-fn not_run_result(call: &ToolUse, reason: &str) -> Value {
-    json!({
-        "type": "tool_result",
-        "tool_use_id": call.id,
-        "content": reason,
-        "is_error": true,
-    })
+/// What a failed stream read means for the turn. The source failing
+/// (`STREAM_IO_ERROR`: the relay died, or the transport under it) is
+/// the failed turn whose cause was lost. Any other code is about the
+/// handle itself — closed, wrong direction, unknown — and cannot arise
+/// from a table the loop owns, so it is reported as what it is rather
+/// than folded into "the cause was lost".
+fn stream_read_failure(e: ReadError) -> TurnError {
+    match e {
+        ReadError::Cancelled => TurnError::Cancelled,
+        ReadError::Io(STREAM_IO_ERROR) => {
+            tracing::warn!("stream source reported an I/O error mid-turn");
+            TurnError::StreamEnded
+        }
+        other => TurnError::Contract(other.to_string()),
+    }
 }
 
 /// An assistant message with no content blocks at all.
@@ -993,6 +1068,58 @@ mod tests {
         );
         StopReason::parse(&json!("pause_turn")).unwrap_err();
         StopReason::parse(&json!(null)).unwrap_err();
+    }
+
+    #[test]
+    fn a_stream_read_failure_is_read_by_its_code() {
+        use gwead::kernel::streams::{STREAM_CLOSED, STREAM_INVALID_HANDLE};
+        assert!(matches!(
+            stream_read_failure(ReadError::Cancelled),
+            TurnError::Cancelled
+        ));
+        assert!(matches!(
+            stream_read_failure(ReadError::Io(STREAM_IO_ERROR)),
+            TurnError::StreamEnded
+        ));
+        for code in [STREAM_CLOSED, STREAM_INVALID_HANDLE] {
+            match stream_read_failure(ReadError::Io(code)) {
+                TurnError::Contract(msg) => assert!(msg.contains(&code.to_string()), "{msg}"),
+                other => panic!("{other}"),
+            }
+        }
+        assert!(matches!(
+            stream_read_failure(ReadError::TooLong { cap: 8 }),
+            TurnError::Contract(_)
+        ));
+    }
+
+    #[test]
+    fn a_cut_is_read_from_the_host_steps_structured_error_only() {
+        let withdrawn = KernelError::PluginError {
+            code: crate::steps::CANCELLED_CODE.into(),
+            message: "cancelled".into(),
+            params: json!({"phase": crate::steps::CANCELLED_AT_APPROVAL}),
+        };
+        assert_eq!(Cut::from_error(&withdrawn), Cut::BeforeStart);
+        let in_work = KernelError::PluginError {
+            code: crate::steps::CANCELLED_CODE.into(),
+            message: "cancelled".into(),
+            params: Value::Null,
+        };
+        assert_eq!(Cut::from_error(&in_work), Cut::WhileRunning);
+        assert!(reports_cancellation(&in_work));
+        let kernels_own = KernelError::Cancelled {
+            at_step: "s".into(),
+        };
+        assert_eq!(Cut::from_error(&kernels_own), Cut::WhileRunning);
+        assert!(reports_cancellation(&kernels_own));
+        // A nested invoke flattens the code into text: cautious, and
+        // not a cancellation report.
+        let flattened = KernelError::Execution(
+            "invoke failed: Plugin error gwennol.cancelled: cancelled".into(),
+        );
+        assert_eq!(Cut::from_error(&flattened), Cut::WhileRunning);
+        assert!(!reports_cancellation(&flattened));
     }
 
     #[test]
