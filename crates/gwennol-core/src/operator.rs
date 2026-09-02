@@ -105,10 +105,13 @@ pub enum Decision {
 /// One event per thing that happened, in the order it happened: text as
 /// it streams (or per block, on a buffered turn), each tool call as the
 /// loop dispatches it, and exactly one of [`Event::ToolResult`] or
-/// [`Event::ToolFailed`] per call. What the model is *told* is the same
-/// in both cases — a `tool_result` block, `is_error` when the tool did
-/// not succeed — but the frontend is told which it was as data, so a
-/// tool that reported a failure and a tool that could not run are never
+/// [`Event::ToolFailed`] per call the model made — including a call the
+/// loop never dispatched, which gets its [`Event::ToolFailed`] with no
+/// [`Event::ToolCall`] before it, so a frontend hears about every
+/// result the model gets. What the model is *told* is the same in both
+/// cases — a `tool_result` block, `is_error` when the tool did not
+/// succeed — but the frontend is told which it was as data, so a tool
+/// that reported a failure and a tool that could not run are never
 /// confused (the boundary `docs/SPI.md` draws).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -128,12 +131,15 @@ pub enum Event {
         /// The tool reported a failure the model should react to.
         is_error: bool,
     },
-    /// The tool could not answer: the model named a tool that is not
-    /// registered, sent arguments its schema refuses, or the call failed
-    /// as a step (the operator denied, the kernel refused, the plugin
-    /// returned a malformed result) — or the turn was cancelled while
-    /// it ran. The model is told, as an `is_error` result carrying
-    /// `error` verbatim; the loop never branches on the text.
+    /// The tool could not answer, or was never asked. The model named a
+    /// tool that is not registered, sent arguments its schema refuses,
+    /// or the call failed as a step (the operator denied, the kernel
+    /// refused, the plugin returned a malformed result); or the turn
+    /// was cancelled while it ran; or the loop did not run it at all —
+    /// the turn was cancelled before it started, or the model refused
+    /// its own turn after asking — in which case no [`Event::ToolCall`]
+    /// precedes this. The model is told, as an `is_error` result
+    /// carrying `error` verbatim; the loop never branches on the text.
     ToolFailed {
         /// The call that got no answer.
         call: ToolCall,
