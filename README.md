@@ -34,11 +34,12 @@ manifests.
 **Pre-alpha.** The native host step types (milestone 1), the
 `LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md)),
 the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
-[docs/SUBSTRATE.md](docs/SUBSTRATE.md)), and the bundled plugins
+[docs/SUBSTRATE.md](docs/SUBSTRATE.md)), the bundled plugins
 (milestone 4 — the Anthropic provider and the `read`, `write`, `grep`
-and `bash` tools, [plugins/](plugins/)) exist and are exercised by
+and `bash` tools, [plugins/](plugins/)) and the agent loop (milestone 5
+— `gwennol_core::agent::Session`) exist and are exercised by
 integration tests against a real kernel and a stubbed Messages API;
-nothing user-facing runs yet — the agent loop is milestone 5.
+nothing user-facing runs yet — the non-interactive CLI is milestone 6.
 The 0.0.0 release on crates.io is a name reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
