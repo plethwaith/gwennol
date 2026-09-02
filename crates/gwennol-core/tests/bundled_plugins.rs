@@ -213,28 +213,40 @@ event: ping
 data: {"type": "ping"}
 
 event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me "}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Read first."}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"read it."}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-01"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: content_block_start
-data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"read","input":{}}}
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"hel"}}
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Let me "}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"lo.txt\"}"}}
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"read it."}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01","name":"read","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"hel"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"lo.txt\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
 
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":17}}
@@ -247,10 +259,25 @@ data: {"type":"message_stop"}
     .concat()
 }
 
+/// The thinking block the vendor produces before its tool call — the
+/// thing the vendor requires replayed verbatim on the next turn. The
+/// stream builds the same block from its deltas.
+const THINKING_BLOCK: &str =
+    r#"{"type": "thinking", "thinking": "Read first.", "signature": "sig-01"}"#;
+
+fn thinking_block() -> Value {
+    gwead::serde_json::from_str(THINKING_BLOCK).unwrap()
+}
+
+fn opaque_block() -> Value {
+    json!({"type": "opaque", "provider": PROVIDER, "data": thinking_block()})
+}
+
 fn opening_json() -> Value {
     json!({
         "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-fixture",
         "content": [
+            thinking_block(),
             {"type": "text", "text": "Let me read it."},
             {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
         ],
@@ -440,6 +467,77 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
     assert!(err.to_string().contains("path-based"), "{err}");
 }
 
+/// Every step type used by a step list, gathered through every nesting
+/// Gwead's own walker descends: ifs branches, try/catch/finally bodies,
+/// loop bodies, parallel branches (each an array of steps).
+fn step_types(steps: &Value, into: &mut std::collections::BTreeSet<String>) {
+    for step in steps.as_array().into_iter().flatten() {
+        if let Some(t) = step["type"].as_str() {
+            into.insert(t.to_string());
+        }
+        for branch in step["params"]["ifs"].as_array().into_iter().flatten() {
+            step_types(&branch["then"], into);
+        }
+        for key in ["try", "catch", "finally", "steps"] {
+            step_types(&step["params"][key], into);
+        }
+        for branch in step["params"]["branches"].as_array().into_iter().flatten() {
+            step_types(branch, into);
+        }
+    }
+}
+
+/// The walker the grants pin relies on reaches every nesting — pinned
+/// on a synthetic tree, since no bundled manifest yet nests a host
+/// step under `parallel`, `try` or a loop, and a walker arm that never
+/// runs would otherwise be an untested promise.
+#[test]
+fn the_step_walker_reaches_every_nesting() {
+    let tree = json!([
+        {"id": "a", "type": "host_fs.read", "params": {}},
+        {"id": "b", "type": "ifs", "params": {"ifs": [
+            {"test": "true", "then": [{"id": "c", "type": "host_fs.write", "params": {}}]},
+            {"then": [{"id": "d", "type": "return", "params": {}}]}
+        ]}},
+        {"id": "e", "type": "try", "params": {
+            "try": [{"id": "f", "type": "host_process.run", "params": {}}],
+            "catch": [{"id": "g", "type": "host_http.get", "params": {}}],
+            "finally": [{"id": "h", "type": "host_http.post", "params": {}}]
+        }},
+        {"id": "i", "type": "for_each", "params": {"steps": [
+            {"id": "j", "type": "host_fs.list", "params": {}}
+        ]}},
+        {"id": "k", "type": "parallel", "params": {"branches": [
+            [{"id": "l", "type": "invoke", "params": {}}],
+            [{"id": "m", "type": "host_fs.read", "params": {}},
+             {"id": "n", "type": "ifs", "params": {"ifs": [
+                 {"then": [{"id": "o", "type": "script", "params": {}}]}
+             ]}}]
+        ]}}
+    ]);
+    let mut found = std::collections::BTreeSet::new();
+    step_types(&tree, &mut found);
+    let expected: std::collections::BTreeSet<String> = [
+        "host_fs.read",
+        "ifs",
+        "host_fs.write",
+        "return",
+        "try",
+        "host_process.run",
+        "host_http.get",
+        "host_http.post",
+        "for_each",
+        "host_fs.list",
+        "parallel",
+        "invoke",
+        "script",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(found, expected);
+}
+
 /// Every tool manifest declares only the host step types its steps
 /// use, and nothing else — no egress, no invoke, no secrets — so the
 /// manifest is an accurate statement of what the tool can reach. The
@@ -447,25 +545,6 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
 /// included, and compared to the grants as sets.
 #[test]
 fn every_tool_manifest_declares_exactly_the_host_steps_it_uses() {
-    fn step_types(steps: &Value, into: &mut std::collections::BTreeSet<String>) {
-        for step in steps.as_array().into_iter().flatten() {
-            if let Some(t) = step["type"].as_str() {
-                into.insert(t.to_string());
-            }
-            // Every nesting Gwead's own walker descends: ifs branches,
-            // try/catch/finally bodies, loop bodies, parallel branches
-            // (each an array of steps).
-            for branch in step["params"]["ifs"].as_array().into_iter().flatten() {
-                step_types(&branch["then"], into);
-            }
-            for key in ["try", "catch", "finally", "steps"] {
-                step_types(&step["params"][key], into);
-            }
-            for branch in step["params"]["branches"].as_array().into_iter().flatten() {
-                step_types(branch, into);
-            }
-        }
-    }
     let f = fixture();
     let tools: Vec<_> = f.bundled.iter().filter(|p| p.group() == "tools").collect();
     assert_eq!(tools.len(), 4, "read, write, grep, bash");
@@ -529,6 +608,7 @@ async fn the_provider_streams_a_turn() {
     assert_eq!(
         events,
         vec![
+            opaque_block(),
             json!({"type": "text", "text": "Let me "}),
             json!({"type": "text", "text": "read it."}),
             json!({"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}),
@@ -581,6 +661,22 @@ async fn a_trailing_slash_on_base_url_does_not_double_the_path() {
             .collect()
     };
     assert_eq!(paths, vec!["/slashed/v1/messages".to_string()]);
+
+    // The streamed turn goes through the other fetching action and
+    // must land on the same path.
+    let events = f
+        .streamed("/slashed/", opening_input(json!([]), true))
+        .await;
+    assert_eq!(events.last().unwrap()["type"], "end");
+    let paths: Vec<String> = {
+        let requests = f.stub.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(p, _, _)| p.starts_with("/slashed"))
+            .map(|(p, _, _)| p.clone())
+            .collect()
+    };
+    assert_eq!(paths, vec!["/slashed/v1/messages".to_string(); 2]);
 }
 
 /// The buffered form: the same turn as a message.
@@ -594,6 +690,7 @@ async fn the_provider_answers_a_buffered_turn() {
         out,
         json!({
             "message": {"role": "assistant", "content": [
+                opaque_block(),
                 {"type": "text", "text": "Let me read it."},
                 {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
             ]},
@@ -706,6 +803,18 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
     assert_eq!(
         sent[1]["messages"][2]["content"][0]["tool_use_id"],
         "toolu_01"
+    );
+    // The vendor's thinking came back exactly as it was produced, in
+    // front of the tool call it led to — the round trip the vendor
+    // requires, carried by the caller as an opaque block it never read.
+    assert_eq!(opening["message"]["content"][0], opaque_block());
+    assert_eq!(
+        sent[1]["messages"][1]["content"],
+        json!([
+            thinking_block(),
+            {"type": "text", "text": "Let me read it."},
+            {"type": "tool_use", "id": "toolu_01", "name": "read", "input": {"path": "hello.txt"}}
+        ])
     );
 }
 

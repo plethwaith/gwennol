@@ -29,19 +29,17 @@
 //! included, which the provider cannot resume — into a `Failure`, never
 //! into a guess. The vendor's *own* forward-compatibility rule runs the
 //! other way: unknown SSE event types, delta types and content-block
-//! types are documented as safe to ignore, and are. Thinking blocks are
-//! the one known kind ignored on purpose: the contract carries no block
-//! for them (a known exclusion), so a turn that produced them keeps its
-//! text and tool calls and nothing else. The request sends no
-//! `thinking` field unless `$config.thinking` supplies one — absence is
-//! the setting every current model accepts, where an explicit
-//! `disabled` is refused by the models that cannot turn thinking off —
-//! which means thinking is *on* by the vendor's default on current
-//! models, and a later tool-use turn replays a history without the
-//! blocks the vendor produced. Whether the vendor accepts that history
-//! is exactly what the live smoke test the roadmap calls for must
-//! establish; if it refuses, the contract's exclusion is the thing to
-//! reopen, not this default.
+//! types are documented as safe to ignore, and are — each skip is
+//! noted so the glue can log it. Thinking blocks are neither: the
+//! vendor requires a tool-use turn replayed with its thinking intact,
+//! so they travel as the contract's `opaque` block (`LLM_CHAT` 0.3.0),
+//! carried by the consumer, unwrapped back into the vendor block by
+//! [`replay_messages`] on the next request. The request sends no
+//! `thinking` field unless `$config.thinking` (or `$config.extra`)
+//! supplies one — absence is the setting every current model accepts,
+//! where an explicit `disabled` is refused by the models that cannot
+//! turn thinking off — so thinking is on by the vendor's default on
+//! current models, and the opaque round trip is what makes that work.
 
 use std::collections::HashMap;
 
@@ -73,6 +71,67 @@ pub struct Request {
     pub body: Value,
     /// `true` for the contract's `stream: true` form.
     pub stream: bool,
+    /// What was left out of the request, one line each — another
+    /// provider's opaque blocks, say. Nothing here is an error; the
+    /// glue logs each so a later vendor refusal has a breadcrumb.
+    pub dropped: Vec<String>,
+}
+
+/// One vendor block wrapped as the contract's `opaque` block: carried
+/// by the consumer, replayed verbatim, read by this provider alone.
+fn opaque(block: Value) -> Value {
+    json!({ "type": "opaque", "provider": crate::PLUGIN_NAME, "data": block })
+}
+
+/// The contract's `messages` as the vendor must see them: this
+/// provider's `opaque` blocks unwrapped back into the vendor blocks
+/// they carry, in place — a thinking block back in front of the tool
+/// call it led to — and any other provider's dropped, with a note.
+/// Everything else passes through verbatim.
+fn replay_messages(messages: &[Value]) -> (Value, Vec<String>) {
+    let mut dropped = Vec::new();
+    let replayed = messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
+            let Some(Value::Array(blocks)) = message.get("content") else {
+                return message.clone();
+            };
+            if !is_assistant {
+                return message.clone();
+            }
+            let content: Vec<Value> = blocks
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) != Some("opaque") {
+                        return Some(block.clone());
+                    }
+                    let provider = block.get("provider").and_then(Value::as_str);
+                    if provider != Some(crate::PLUGIN_NAME) {
+                        dropped.push(format!(
+                            "message {i}: dropped an opaque block produced by {}",
+                            provider.unwrap_or("an unnamed provider")
+                        ));
+                        return None;
+                    }
+                    match block.get("data") {
+                        Some(data) => Some(data.clone()),
+                        None => {
+                            dropped.push(format!(
+                                "message {i}: dropped an opaque block of ours that carries no data"
+                            ));
+                            None
+                        }
+                    }
+                })
+                .collect();
+            let mut out = message.clone();
+            out["content"] = Value::Array(content);
+            out
+        })
+        .collect();
+    (Value::Array(replayed), dropped)
 }
 
 /// The API origin used when `$config.base_url` is absent.
@@ -91,6 +150,11 @@ pub fn messages_url(config: &Value) -> Result<String, String> {
         Some(other) => return Err(format!("config.base_url must be a string, got {other}")),
     };
     let base = base.trim_end_matches('/');
+    if base.contains('?') || base.contains('#') {
+        return Err(format!(
+            "config.base_url must not carry a query or fragment, got {base:?}"
+        ));
+    }
     if !(base.starts_with("https://") || base.starts_with("http://")) {
         return Err(format!(
             "config.base_url must be an http(s) origin, got {base:?}"
@@ -111,8 +175,8 @@ pub fn messages_url(config: &Value) -> Result<String, String> {
 /// sanctioned place for sampling knobs and vendor features it
 /// deliberately does not carry.
 pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
-    let messages = match input.get("messages") {
-        Some(Value::Array(m)) if !m.is_empty() => Value::Array(m.clone()),
+    let (messages, dropped) = match input.get("messages") {
+        Some(Value::Array(m)) if !m.is_empty() => replay_messages(m),
         Some(Value::Array(_)) => return Err("chat input carries no messages".into()),
         Some(other) => {
             return Err(format!(
@@ -198,6 +262,7 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     Ok(Request {
         body: Value::Object(body),
         stream,
+        dropped,
     })
 }
 
@@ -378,14 +443,24 @@ fn contract_usage(usage: &Map<String, Value>) -> Result<Value, Failure> {
     Ok(Value::Object(usage.clone()))
 }
 
-/// One vendor content block as a contract block, `None` for the kinds
-/// the contract does not carry (thinking) or this crate does not know.
-fn contract_block(block: &Value) -> Result<Option<Value>, Failure> {
+/// What one vendor content block became.
+enum Mapped {
+    /// A contract block.
+    Block(Value),
+    /// Nothing the contract carries; the note says what was skipped.
+    Skipped(String),
+}
+
+/// One vendor content block as a contract block. Thinking blocks — the
+/// ones the vendor requires replayed — travel as `opaque`; a kind this
+/// crate does not know is skipped with a note.
+fn contract_block(block: &Value) -> Result<Mapped, Failure> {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => {
             let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-            Ok(Some(json!({ "type": "text", "text": text })))
+            Ok(Mapped::Block(json!({ "type": "text", "text": text })))
         }
+        Some("thinking") | Some("redacted_thinking") => Ok(Mapped::Block(opaque(block.clone()))),
         Some("tool_use") => {
             let (Some(id), Some(name)) = (
                 block.get("id").and_then(Value::as_str),
@@ -404,11 +479,14 @@ fn contract_block(block: &Value) -> Result<Option<Value>, Failure> {
                     "malformed_tool_input",
                 ));
             };
-            Ok(Some(json!({
+            Ok(Mapped::Block(json!({
                 "type": "tool_use", "id": id, "name": name, "input": input
             })))
         }
-        _ => Ok(None),
+        other => Ok(Mapped::Skipped(format!(
+            "skipped a content block of kind {}",
+            other.unwrap_or("<none>")
+        ))),
     }
 }
 
@@ -417,25 +495,39 @@ fn contract_block(block: &Value) -> Result<Option<Value>, Failure> {
 /// `truncated` is the fetch step's own signal that the body was cut at
 /// the host's cap: a cut JSON document is not a message, and the
 /// failure says so rather than reporting a parse error.
-pub fn buffered_output(status: i64, body: &str, truncated: bool) -> Value {
+pub fn buffered_output(status: i64, body: &str, truncated: bool) -> Translated {
+    let failed = |failure: Failure| Translated {
+        output: failure.into_buffered_output(),
+        notes: Vec::new(),
+    };
     if truncated {
-        return Failure::new(
+        return failed(Failure::new(
             "the vendor's response exceeded the buffered body cap",
             Some(false),
             "response_too_large",
-        )
-        .into_buffered_output();
+        ));
     }
     if !(200..300).contains(&status) {
-        return http_failure(status, body).into_buffered_output();
+        return failed(http_failure(status, body));
     }
-    match translate_message(body) {
-        Ok(output) => output,
-        Err(failure) => failure.into_buffered_output(),
+    let mut notes = Vec::new();
+    match translate_message(body, &mut notes) {
+        Ok(output) => Translated { output, notes },
+        Err(failure) => failed(failure),
     }
 }
 
-fn translate_message(body: &str) -> Result<Value, Failure> {
+/// A buffered turn translated, plus what the translation left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Translated {
+    /// The contract's buffered output: message or failure.
+    pub output: Value,
+    /// Vendor content the contract does not carry, one line each — for
+    /// the glue to log; never an error.
+    pub notes: Vec<String>,
+}
+
+fn translate_message(body: &str, notes: &mut Vec<String>) -> Result<Value, Failure> {
     let document: Value = serde_json::from_str(body).map_err(|e| {
         Failure::new(
             format!("the vendor's response is not JSON: {e}"),
@@ -449,8 +541,9 @@ fn translate_message(body: &str) -> Result<Value, Failure> {
     let mut content = Vec::new();
     if let Some(blocks) = document.get("content").and_then(Value::as_array) {
         for block in blocks {
-            if let Some(mapped) = contract_block(block)? {
-                content.push(mapped);
+            match contract_block(block)? {
+                Mapped::Block(mapped) => content.push(mapped),
+                Mapped::Skipped(note) => notes.push(note),
             }
         }
     }
@@ -485,8 +578,13 @@ enum Block {
         name: String,
         partial_json: String,
     },
-    /// Thinking, or a kind this crate does not know: its deltas are
-    /// consumed and dropped.
+    /// A thinking block, rebuilt as the vendor shapes it — the block
+    /// as started, its `thinking` text appended from deltas, its
+    /// `signature` set by the signature delta — and emitted whole as
+    /// `opaque` when it stops. (`redacted_thinking` arrives complete.)
+    Opaque(Map<String, Value>),
+    /// A kind this crate does not know: its deltas are consumed and
+    /// dropped, and the skip was noted when the block started.
     Ignored,
 }
 
@@ -505,11 +603,19 @@ pub struct StreamTranslator {
     /// when `max_tokens` cut it and fails the turn otherwise.
     broken_call: Option<String>,
     finished: bool,
+    /// Vendor content the contract does not carry, one line each.
+    notes: Vec<String>,
 }
 
 impl StreamTranslator {
     pub fn new() -> StreamTranslator {
         StreamTranslator::default()
+    }
+
+    /// Drain the notes accumulated so far — what the vendor sent that
+    /// the contract does not carry — for the glue to log.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Fold one vendor event.
@@ -595,7 +701,17 @@ impl StreamTranslator {
                     partial_json: String::new(),
                 }
             }
-            _ => Block::Ignored,
+            Some("thinking") | Some("redacted_thinking") => match block {
+                Some(Value::Object(initial)) => Block::Opaque(initial.clone()),
+                _ => Block::Ignored,
+            },
+            other => {
+                self.notes.push(format!(
+                    "skipped a content block of kind {}",
+                    other.unwrap_or("<none>")
+                ));
+                Block::Ignored
+            }
         };
         self.blocks.insert(index, started);
         Vec::new()
@@ -622,6 +738,26 @@ impl StreamTranslator {
                     .and_then(Value::as_str)
                 {
                     partial_json.push_str(fragment);
+                }
+                Vec::new()
+            }
+            (Some(Block::Opaque(block)), Some("thinking_delta")) => {
+                if let Some(fragment) = delta
+                    .and_then(|d| d.get("thinking"))
+                    .and_then(Value::as_str)
+                {
+                    match block.get_mut("thinking") {
+                        Some(Value::String(text)) => text.push_str(fragment),
+                        _ => {
+                            block.insert("thinking".into(), Value::String(fragment.to_string()));
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            (Some(Block::Opaque(block)), Some("signature_delta")) => {
+                if let Some(signature) = delta.and_then(|d| d.get("signature")) {
+                    block.insert("signature".into(), signature.clone());
                 }
                 Vec::new()
             }
@@ -662,6 +798,7 @@ impl StreamTranslator {
                     }
                 }
             }
+            Some(Block::Opaque(block)) => vec![Emitted::Event(opaque(Value::Object(block)))],
             _ => Vec::new(),
         }
     }
@@ -753,6 +890,14 @@ mod tests {
             r.body["temperature"], 0.2,
             "an extra the provider did not set"
         );
+        // With no `thinking` in config the provider sets no such key, so
+        // `extra.thinking` fills it — the same knob by another route.
+        let r = build_request(
+            &input(false),
+            &json!({"extra": {"thinking": {"type": "adaptive"}}}),
+        )
+        .unwrap();
+        assert_eq!(r.body["thinking"], json!({"type": "adaptive"}));
         assert_eq!(
             r.body["messages"],
             input(false)["messages"],
@@ -783,6 +928,13 @@ mod tests {
         );
         let err = messages_url(&json!({"base_url": "api.anthropic.com"})).unwrap_err();
         assert!(err.contains("http(s)"), "{err}");
+        for bad in [
+            "https://api.anthropic.com/?x=1",
+            "https://api.anthropic.com/#frag",
+        ] {
+            let err = messages_url(&json!({"base_url": bad})).unwrap_err();
+            assert!(err.contains("query or fragment"), "{bad}: {err}");
+        }
         let err = messages_url(&json!({"base_url": 7})).unwrap_err();
         assert!(err.contains("config.base_url"), "{err}");
     }
@@ -835,6 +987,11 @@ mod tests {
         );
         assert_eq!(f.retryable, Some(true));
 
+        // 409 is contention, worth a retry — the shared classifier's
+        // answer, pinned here against the provider's own use of it.
+        let f = http_failure(409, "");
+        assert_eq!(f.retryable, Some(true));
+
         let f = http_failure(502, "<html>bad gateway</html>");
         assert_eq!(f.retryable, Some(true));
         assert_eq!(f.kind.as_deref(), Some("http_502"));
@@ -881,18 +1038,75 @@ mod tests {
     }"#;
 
     #[test]
-    fn a_buffered_message_maps_to_the_contract_dropping_thinking() {
+    fn a_buffered_message_maps_to_the_contract_carrying_thinking_opaquely() {
         let out = buffered_output(200, HAPPY_MESSAGE, false);
         assert_eq!(
-            out,
+            out.output,
             json!({
                 "message": {"role": "assistant", "content": [
+                    {"type": "opaque", "provider": crate::PLUGIN_NAME,
+                     "data": {"type": "thinking", "thinking": "", "signature": "sig"}},
                     {"type": "text", "text": "Reading it."},
                     {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.rs"}}
                 ]},
                 "stop_reason": "tool_use",
                 "usage": {"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 3}
             })
+        );
+        assert!(out.notes.is_empty(), "nothing was dropped: {:?}", out.notes);
+
+        // An unknown block kind is skipped and noted, never fatal.
+        let out = buffered_output(
+            200,
+            r#"{"content": [{"type": "server_tool_use", "id": "x"}, {"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}"#,
+            false,
+        );
+        assert_eq!(
+            out.output["message"]["content"],
+            json!([{"type": "text", "text": "ok"}])
+        );
+        assert_eq!(
+            out.notes,
+            vec!["skipped a content block of kind server_tool_use"]
+        );
+    }
+
+    /// The round trip the vendor requires: the opaque block the buffered
+    /// answer carried comes back in the next request as the vendor
+    /// block it wrapped, in place — while another provider's opaque
+    /// blocks are dropped with a note and never reach the wire.
+    #[test]
+    fn opaque_blocks_replay_as_the_vendor_blocks_they_carry() {
+        let thinking = json!({"type": "thinking", "thinking": "plan", "signature": "sig"});
+        let mut input = input(false);
+        input["messages"] = json!([
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [
+                {"type": "opaque", "provider": crate::PLUGIN_NAME, "data": thinking},
+                {"type": "opaque", "provider": "provider-other", "data": {"foreign": true}},
+                {"type": "text", "text": "Reading."},
+                {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "a"}}
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}
+        ]);
+        let r = build_request(&input, &json!({})).unwrap();
+        assert_eq!(
+            r.body["messages"][1]["content"],
+            json!([
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                {"type": "text", "text": "Reading."},
+                {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "a"}}
+            ]),
+            "ours unwrapped in place, theirs gone"
+        );
+        assert_eq!(
+            r.body["messages"][2], input["messages"][2],
+            "user messages verbatim"
+        );
+        assert_eq!(
+            r.dropped,
+            vec!["message 1: dropped an opaque block produced by provider-other"]
         );
     }
 
@@ -904,44 +1118,47 @@ mod tests {
             )
         };
         assert_eq!(
-            buffered_output(200, &with("stop_sequence"), false)["stop_reason"],
+            buffered_output(200, &with("stop_sequence"), false).output["stop_reason"],
             "end_turn"
         );
         assert_eq!(
-            buffered_output(200, &with("refusal"), false)["stop_reason"],
+            buffered_output(200, &with("refusal"), false).output["stop_reason"],
             "refusal"
         );
         assert_eq!(
-            buffered_output(200, &with("max_tokens"), false)["message"]["content"],
+            buffered_output(200, &with("max_tokens"), false).output["message"]["content"],
             json!([])
         );
-        let paused = buffered_output(200, &with("pause_turn"), false);
+        let paused = buffered_output(200, &with("pause_turn"), false).output;
         assert_eq!(paused["error"]["kind"], "pause_turn");
         assert_eq!(paused["error"]["retryable"], false);
-        let novel = buffered_output(200, &with("something_new"), false);
+        let novel = buffered_output(200, &with("something_new"), false).output;
         assert_eq!(novel["error"]["kind"], "unknown_stop_reason");
     }
 
     #[test]
     fn a_buffered_answer_without_usage_or_with_an_error_document_is_a_failure() {
-        let out = buffered_output(200, r#"{"content": [], "stop_reason": "end_turn"}"#, false);
+        let out =
+            buffered_output(200, r#"{"content": [], "stop_reason": "end_turn"}"#, false).output;
         assert_eq!(out["error"]["kind"], "missing_usage");
         let out = buffered_output(
             200,
             r#"{"type":"error","error":{"type":"api_error","message":"hiccup"}}"#,
             false,
-        );
+        )
+        .output;
         assert_eq!(out["error"]["kind"], "api_error");
         assert_eq!(out["error"]["retryable"], true);
-        let out = buffered_output(200, "not json", false);
+        let out = buffered_output(200, "not json", false).output;
         assert_eq!(out["error"]["kind"], "malformed_response");
-        let out = buffered_output(200, HAPPY_MESSAGE, true);
+        let out = buffered_output(200, HAPPY_MESSAGE, true).output;
         assert_eq!(out["error"]["kind"], "response_too_large");
         let out = buffered_output(
             529,
             r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
             false,
-        );
+        )
+        .output;
         assert_eq!(out["error"]["retryable"], true);
     }
 
@@ -1028,6 +1245,8 @@ mod tests {
         assert_eq!(
             out,
             vec![
+                Emitted::Event(json!({"type": "opaque", "provider": crate::PLUGIN_NAME,
+                    "data": {"type": "thinking", "thinking": "hmm", "signature": "s"}})),
                 Emitted::Event(json!({"type": "text", "text": "Hel"})),
                 Emitted::Event(json!({"type": "text", "text": "lo"})),
                 Emitted::Event(
@@ -1036,7 +1255,34 @@ mod tests {
                 Emitted::Terminal(json!({"type": "end", "stop_reason": "tool_use",
                     "usage": {"input_tokens": 10, "output_tokens": 25, "cache_read_input_tokens": 4}})),
             ],
-            "thinking dropped, pings dropped, the straggler after message_stop dropped"
+            "thinking rebuilt and carried opaquely in front of the call, pings dropped, \
+             the straggler after message_stop dropped"
+        );
+        assert!(t.take_notes().is_empty(), "nothing was skipped");
+    }
+
+    #[test]
+    fn a_redacted_thinking_block_is_carried_as_it_arrived() {
+        let mut t = StreamTranslator::new();
+        let out = feed(
+            &mut t,
+            &[
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "redacted_thinking", "data": "EmwKAhgB"}}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![Emitted::Event(
+                json!({"type": "opaque", "provider": crate::PLUGIN_NAME,
+                "data": {"type": "redacted_thinking", "data": "EmwKAhgB"}})
+            )]
         );
     }
 

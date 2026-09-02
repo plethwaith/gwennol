@@ -28,7 +28,7 @@
 
 use gwennol_guest::sse::SseParser;
 use gwennol_guest::{
-    Args, Delivery, Stream, Target, cancelled, entrypoints, invoke, invoke_streaming,
+    Args, Delivery, Level, Stream, Target, cancelled, entrypoints, invoke, invoke_streaming, log,
 };
 use serde_json::{Value, json};
 
@@ -68,6 +68,11 @@ const ERROR_BODY_CAP: usize = 4096;
 /// `chat` — the plain action's entry point.
 fn chat(args: Args) -> Result<Value, String> {
     let request = wire::build_request(args.raw(), args.config())?;
+    // Anything left out of the request is logged, so a vendor refusal
+    // of the replayed history has a breadcrumb in the host's tracing.
+    for dropped in &request.dropped {
+        log(Level::Warn, dropped);
+    }
     // The endpoint is computed here (trailing slashes and proxy path
     // prefixes normalised) and handed to the fetching action as input;
     // which host it may reach is the manifest's egress grant, not this.
@@ -99,7 +104,11 @@ fn chat(args: Args) -> Result<Value, String> {
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    Ok(wire::buffered_output(status, body, truncated))
+    let translated = wire::buffered_output(status, body, truncated);
+    for note in &translated.notes {
+        log(Level::Warn, note);
+    }
+    Ok(translated.output)
 }
 
 /// `relay_sse` — the `long_running` dataflow step's entry point.
@@ -157,7 +166,11 @@ fn relay_sse(args: Args) -> Result<Value, String> {
         // line and event caps) fails the step; the consumer sees early
         // end-of-stream, as for any relay failure.
         for event in parser.feed(&buf[..n])? {
-            for emitted in translator.accept(&event.event, &event.data) {
+            let emitted = translator.accept(&event.event, &event.data);
+            for note in translator.take_notes() {
+                log(Level::Warn, &note);
+            }
+            for emitted in emitted {
                 let (value, terminal) = match emitted {
                     Emitted::Event(v) => (v, false),
                     Emitted::Terminal(v) => (v, true),

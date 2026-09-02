@@ -182,12 +182,12 @@ written, and it must be settled before a provider exists.
 - **Settled: outcomes are data.** Every `host_fs` step reports the
   answers a model can act on — `not_found`, `is_directory`,
   `not_a_directory`, `permission_denied`, a write's `is_symlink` — as a
-  result whose `outcome`
-  names them, with a one-line `message`; a miss is still approved first,
-  under the path canonical to its deepest existing ancestor. The four
-  tools are declarative — one host step and a branch on its outcome —
-  and a test pins that no tool uses `try` and that each manifest's
-  grants equal the host steps its steps use.
+  result whose `outcome` names them, with a one-line `message`; a miss
+  is still approved first, under the path canonical to its deepest
+  canonicalisable ancestor. The four tools are declarative — one host
+  step and a branch on its outcome — and a test pins that no tool uses
+  `try` and that each manifest's grants equal the host steps its steps
+  use.
 - **Settled: truncation is data too.** A tool reports `truncated: true`
   (`TOOL` 0.2.0) and never composes a marker; `spi::tool::render_content`
   appends the one shared marker before the model sees the result.
@@ -199,16 +199,19 @@ written, and it must be settled before a provider exists.
   `{"path": "crates/<name>"}`, a form the kernel refuses; `cargo xtask
   bundle` compiles the crate and fills the slot, the integration suite
   bundles through the same code, and no blob is ever committed.
-- **Provider notes.** `provider-anthropic` sends no `thinking` field
-  unless `$config.thinking` supplies one: absence is the setting every
-  current model accepts, where an explicit `disabled` is refused by the
-  models that cannot turn thinking off. The contract carries no thinking
-  blocks (a known exclusion), so a turn that produced them keeps its
-  text and tool calls and drops the rest — and whether the vendor
-  accepts the replayed history without them is what the live smoke test
-  must establish before the loop relies on tool use; if it refuses, the
-  exclusion is what to reopen. `pause_turn`, unknown stop reasons and
-  missing usage counters are failures, never guesses.
+- **Settled: thinking travels as an `opaque` block** (`LLM_CHAT`
+  0.3.0). The milestone-2 exclusion was reopened here rather than left
+  to a smoke test: the vendor's documentation is explicit that a
+  tool-use turn must come back with its thinking blocks intact, and
+  `provider-anthropic` sends no `thinking` field unless `$config`
+  supplies one (absence is the setting every current model accepts;
+  an explicit `disabled` is refused by the models that cannot turn
+  thinking off), so thinking is on by the vendor's default. The
+  provider carries each thinking block out as `opaque` and replays its
+  own blocks verbatim; a consumer keeps them in place and never reads
+  them. Anything it does drop — a block kind it does not know, another
+  provider's opaque blocks — it logs. `pause_turn`, unknown stop
+  reasons and missing usage counters are failures, never guesses.
 
 ### 5. Agent loop
 
@@ -224,6 +227,11 @@ written, and it must be settled before a provider exists.
   reader-gone wind-down — the relay treating a closed output as a
   graceful stop, not a failed step — which milestone 3 could verify
   only by inspection.
+- **Owed to milestone 4:** the assistant message the loop rebuilds from
+  a stream and replays is the events in order — adjacent text coalesced,
+  `tool_use` and `opaque` blocks whole and in place — and the loop
+  renders tool results through `spi::tool::render_content`. Both are
+  contract rules the loop is the first consumer of.
 - **Not in scope:** any frontend beyond a test `Operator`.
 
 ### 6. Non-interactive CLI

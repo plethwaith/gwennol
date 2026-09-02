@@ -52,6 +52,17 @@ blocks:
 | `text` | `text` | either role |
 | `tool_use` | `id`, `name`, `input` | `assistant` |
 | `tool_result` | `tool_use_id`, `content`, `is_error?` | `user` |
+| `opaque` | `provider`, `data` | `assistant` |
+
+An `opaque` block is provider state the consumer carries but never
+reads — a vendor's thinking block, which the vendor requires replayed
+verbatim in a later tool-use turn, is the case it exists for. Produced
+only by a provider, consumed only by a provider: a consumer keeps it in
+its position in the assistant message and replays it unchanged — never
+rendered, altered, reordered, or dropped — and assumes nothing about the
+shape of `data`. `provider` names the producing plugin, so a provider
+ignores blocks another produced (a conversation that changes provider
+mid-way loses only what the new provider could not have used).
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
@@ -76,6 +87,10 @@ are contract here:
   blocks.
 - `id` values are opaque and unique within a conversation. The loop
   echoes them; it never parses or fabricates them.
+- The assistant message that asked for the tools is replayed exactly as
+  the provider produced it, `opaque` blocks in place. A vendor that
+  reasons before calling a tool checks that its reasoning came back
+  with the call, and refuses the turn when it did not.
 - A streamed turn that hits `max_tokens` while a tool call is still
   being generated drops the partial call: the provider emits no
   `tool_use` event for it and ends with `stop_reason: "max_tokens"`. A
@@ -119,10 +134,9 @@ What stays a step error is exactly what the provider could not classify
 without reading error text: the transport failed before any answer
 arrived, the operator denied the egress, the kernel refused the step. A
 step error from a provider is uniformly fatal to the turn — the loop
-must not retry it, and **must not** infer meaning from its message.
-That is the same line the `TOOL` contract draws below: an outcome the
-caller should react to arrives as data, or it is an error nobody should
-parse.
+must not retry it, and **must not** infer meaning from its message. That
+is the same line the `TOOL` contract draws below: an outcome the caller
+should react to arrives as data, or it is an error nobody should parse.
 
 ### Response, streamed
 
@@ -146,6 +160,15 @@ The stream yields UTF-8 newline-delimited JSON, one event per line
   the call whole: arguments are machine-consumed, so incremental display
   buys nothing and every consumer would otherwise reassemble JSON
   fragments.
+- `{"type": "opaque", "provider": "…", "data": …}` — a complete
+  `opaque` block, emitted whole in its position among the turn's
+  blocks.
+
+The assistant message a consumer rebuilds from the stream — to replay
+on the next turn — is the events in order: adjacent `text` events
+coalesced into one text block, `tool_use` and `opaque` events kept
+whole and in place. That is what keeps a vendor's reasoning in front of
+the tool call it led to.
 - `{"type": "end", "stop_reason": "…", "usage": { … }}` — the final event
   of every successful stream, followed by end-of-stream.
 - `{"type": "error", "message": "…", "retryable": …, "kind": "…"}` — the
@@ -303,9 +326,11 @@ Doors closed on purpose for the MVP, listed so they read as decisions
 rather than oversights. Each would be a contract change; none blocks
 milestones 3–7.
 
-- **Thinking blocks.** The assistant block set is text and `tool_use`
-  only. Extended-thinking models need their thinking blocks replayed in
-  multi-turn tool use, which is a new block type when it comes.
+- **Thinking, as content.** A vendor's thinking travels only as an
+  `opaque` block (above, settled in milestone 4): replayed, never
+  shown. Surfacing reasoning to the operator — a summary the frontend
+  could display — would be a block the consumer *reads*, and is not on
+  this wire.
 - **Prompt caching, request side.** There is no `cache_control` or
   equivalent; a provider may cache however its API allows, and the open
   `usage` object lets it report the effect, but the contract offers no
