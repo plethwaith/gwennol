@@ -34,7 +34,13 @@
 //! host spells a path: its deepest existing ancestor canonical, the
 //! rest as written. `write:/tmp/**` means what `/tmp` resolves to, and
 //! `write:link/new/**` means the link's target plus `new`, whether or
-//! not `new` exists yet.
+//! not `new` exists yet. One exception mirrors the host's: a fully
+//! literal `write` pattern naming a symlink means the link itself,
+//! under its parent's canonical name, because that is how the host
+//! approves a write to a symlink — which it then refuses to write
+//! through. `..` folds lexically before any of this, as the host folds
+//! it before asking; a `..` after a glob component can never match and
+//! is refused, as is a space inside an `http` URL.
 //!
 //! For `spawn` and `http` the pattern matches the whole subject and `*`
 //! matches anything, so it swallows what follows: `spawn:bash -c cargo
@@ -43,7 +49,9 @@
 //! its arguments, not what a shell does with them. A spawn that
 //! carries stdin, or runs anywhere but the workspace root, matches no
 //! `spawn` rule at all — nothing in the grammar can judge those, so
-//! only `any` admits them. An `http` pattern names the method first —
+//! only `any` reaches them, in either direction: `deny spawn:*` does
+//! not stop such a spawn that a later `allow any` admits, and the rule
+//! that withholds it is `deny any`. An `http` pattern names the method first —
 //! `http:POST https://api.anthropic.com/*`, or `http:* https://…` for
 //! any method — because a URL that may be fetched is not one that may
 //! be posted to.
@@ -304,33 +312,26 @@ impl Rule {
         &self.spec
     }
 
-    fn matches(&self, request: &ApprovalRequest, root: &Path) -> bool {
+    /// Whether this rule matches. `unjudgeable` is the policy's verdict
+    /// on whether any rule short of `any` can judge the request at
+    /// all (see [`Unjudgeable`]), computed once per judgement.
+    fn matches(&self, request: &ApprovalRequest, unjudgeable: Option<Unjudgeable>) -> bool {
         if let Some(plugin) = &self.spec.plugin
             && plugin != &request.plugin
         {
             return false;
         }
-        let Some(kind) = Kind::of(&request.access) else {
-            return false;
-        };
         if self.kind == Kind::Any {
             return true;
         }
-        if self.kind != kind {
+        if unjudgeable.is_some() || Kind::of(&request.access) != Some(self.kind) {
             return false;
         }
         match &request.access {
             Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
                 self.matcher.is_match(p)
             }
-            Access::Spawn { argv, cwd, stdin } => {
-                // Neither is expressible in a spawn rule, so neither
-                // is admitted by one.
-                if stdin.is_some() || !is_workspace(cwd, root) {
-                    return false;
-                }
-                self.matcher.is_match(argv.join(" "))
-            }
+            Access::Spawn { argv, .. } => self.matcher.is_match(argv.join(" ")),
             Access::Http { method, url } => self.matcher.is_match(format!("{method} {url}")),
             _ => false,
         }
@@ -353,11 +354,12 @@ fn has_method_prefix(pattern: &str) -> bool {
     method_ok && !url.is_empty() && !url.contains(' ')
 }
 
-/// Whether `cwd` is the workspace root, spelled canonically before
-/// comparing: the root is canonical, and a plugin may name the same
-/// directory through a link.
+/// Whether `cwd` is the workspace root, spelled by the host's walk
+/// before comparing: the root is canonical, and a plugin may name the
+/// same directory through a link. A walk that fails is warned about
+/// and compared as written, which cannot admit more.
 fn is_workspace(cwd: &Path, root: &Path) -> bool {
-    deepest_canonical(cwd).as_deref().unwrap_or(cwd) == root
+    walk(cwd) == root
 }
 
 /// A glob over a whole subject line, `*` crossing everything.
@@ -515,10 +517,13 @@ impl Policy {
 
     /// Judge a request: the first matching rule, or the default denial.
     pub fn judge(&self, request: &ApprovalRequest) -> Judgement<'_> {
+        // Decided once: it costs a walk for a spawn, and every rule
+        // consults it.
+        let unjudgeable = self.unjudgeable(&request.access);
         match self
             .rules
             .iter()
-            .find(|rule| rule.matches(request, &self.root))
+            .find(|rule| rule.matches(request, unjudgeable))
         {
             Some(rule) => Judgement {
                 decision: rule.spec.decision,
@@ -528,12 +533,12 @@ impl Policy {
             None => Judgement {
                 decision: Decision::Deny,
                 rule: None,
-                unjudgeable: self.unjudgeable(&request.access),
+                unjudgeable,
             },
         }
     }
 
-    /// What, if anything, kept every rule but `any` from applying.
+    /// What, if anything, keeps every rule but `any` from applying.
     fn unjudgeable(&self, access: &Access) -> Option<Unjudgeable> {
         match access {
             Access::Spawn { stdin: Some(_), .. } => Some(Unjudgeable::SpawnWithStdin),
@@ -888,6 +893,39 @@ mod tests {
             },
         );
         assert_eq!(p.judge(&via_alias).decision, Decision::Allow);
+        // And with nothing to admit it, the denial does not claim the
+        // spawn was outside the workspace.
+        let none = Policy::compile(vec![], &root).unwrap();
+        let j = none.judge(&via_alias);
+        assert_eq!(j.decision, Decision::Deny);
+        assert_eq!(j.to_string(), "denied: no rule matched");
+    }
+
+    #[test]
+    fn only_any_reaches_what_no_spawn_rule_can_judge_in_either_direction() {
+        // The consequence of "no spawn rule judges stdin": a deny
+        // spelled as a spawn rule does not stop it either. The rule
+        // that withholds it is `deny any`.
+        let with_stdin = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: PathBuf::from("/ws"),
+                stdin: Some("exit\n".into()),
+            },
+        );
+        let p = policy(vec![
+            flag(Decision::Deny, "spawn:*"),
+            flag(Decision::Allow, "any"),
+        ]);
+        let j = p.judge(&with_stdin);
+        assert_eq!(j.decision, Decision::Allow);
+        assert_eq!(j.to_string(), r#"allowed by --allow "any""#);
+        let p = policy(vec![
+            flag(Decision::Deny, "any"),
+            flag(Decision::Allow, "any"),
+        ]);
+        assert_eq!(p.judge(&with_stdin).decision, Decision::Deny);
     }
 
     #[test]

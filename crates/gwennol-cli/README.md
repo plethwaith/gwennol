@@ -97,7 +97,9 @@ shell does with them**: `spawn:bash -c cargo *` admits
 nothing; a real restriction names a program that is not a shell
 (`spawn:grep *`). A spawn that carries stdin or runs anywhere but the
 workspace root matches no `spawn` rule at all, since the grammar cannot
-judge those; only `any` admits them, and the trace says so. An `http`
+judge those; only `any` reaches them, in either direction — a
+`deny spawn:*` does not stop such a spawn that a later `allow any`
+admits; `deny any` does — and the trace says so. An `http`
 pattern names the method first — `http:POST …`, upper-case, one space,
 or `http:* …` for any method — because a URL that may be fetched is
 not one that may be posted to; a method that could never match is
