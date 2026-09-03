@@ -44,13 +44,39 @@ tokio::task_local! {
     static EVENTS: Arc<Mutex<Vec<Event>>>;
 }
 
+/// The events of one session, as the harness records them.
+type Sink = Arc<Mutex<Vec<Event>>>;
+
 /// Run `fut` with an event sink, returning its output and the events
 /// emitted while it ran.
 async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
-    let sink = Arc::new(Mutex::new(Vec::new()));
-    let out = EVENTS.scope(sink.clone(), fut).await;
+    let sink = Sink::default();
+    let out = with_sink(sink.clone(), fut).await;
     let events = sink.lock().unwrap().clone();
     (out, events)
+}
+
+/// Run `fut` recording into `sink` — a sink the test keeps, so it can
+/// watch the session's events from outside the task running it.
+async fn with_sink<T>(sink: Sink, fut: impl Future<Output = T>) -> T {
+    EVENTS.scope(sink, fut).await
+}
+
+/// Wait until `sink` holds an event `wanted` accepts: the way a test
+/// acts *at* a point in a running session — after the first tick has
+/// been shown, once a tool call has started — rather than after a
+/// clock has run, which under load is a different point.
+async fn wait_for(sink: &Sink, wanted: impl Fn(&Event) -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if sink.lock().unwrap().iter().any(&wanted) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the awaited event never came");
 }
 
 /// Approves everything except plugins named `denied*`; holds approvals
@@ -1233,19 +1259,22 @@ async fn a_new_turn_joins_the_trailing_user_message_after_a_failed_one() {
 async fn cancelling_mid_stream_tears_the_turn_down() {
     let mut s = session("/slow");
     let cancel = CancellationToken::new();
+    let sink = Sink::default();
     let handle = tokio::spawn({
-        let cancel = cancel.clone();
+        let (cancel, sink) = (cancel.clone(), sink.clone());
         async move {
-            let (outcome, events) = with_events(async { s.turn("stream", &cancel).await }).await;
-            (s, outcome, events)
+            let outcome = with_sink(sink, async { s.turn("stream", &cancel).await }).await;
+            (s, outcome)
         }
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Mid-stream means after something has been shown.
+    wait_for(&sink, |e| matches!(e, Event::Text(_))).await;
     cancel.cancel();
-    let (s, outcome, events) = tokio::time::timeout(Duration::from_secs(5), handle)
+    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("cancellation ends the turn promptly")
         .unwrap();
+    let events = sink.lock().unwrap().clone();
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
     assert!(
         events.iter().all(|e| matches!(e, Event::Text(_))) && !events.is_empty(),
@@ -1262,19 +1291,22 @@ async fn cancelling_mid_stream_tears_the_turn_down() {
 async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
     let mut s = session("/slow-tool");
     let cancel = CancellationToken::new();
+    let sink = Sink::default();
     let handle = tokio::spawn({
-        let cancel = cancel.clone();
+        let (cancel, sink) = (cancel.clone(), sink.clone());
         async move {
-            let (outcome, events) = with_events(async { s.turn("sleep", &cancel).await }).await;
-            (s, outcome, events)
+            let outcome = with_sink(sink, async { s.turn("sleep", &cancel).await }).await;
+            (s, outcome)
         }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // During the call means once the frontend has been told it started.
+    wait_for(&sink, |e| matches!(e, Event::ToolCall(_))).await;
     cancel.cancel();
-    let (s, outcome, events) = tokio::time::timeout(Duration::from_secs(5), handle)
+    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("cancellation ends the tool step promptly")
         .unwrap();
+    let events = sink.lock().unwrap().clone();
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
     let slow = tool_call("c1", "slow", json!({}));
     assert_eq!(
