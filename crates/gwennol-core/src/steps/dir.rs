@@ -281,7 +281,12 @@ impl Dir {
         }
     }
 
-    /// What `name` is inside this directory, without following it.
+    /// What `name` is inside this directory, without following it. A
+    /// name the filesystem will not take is `InvalidFilename`
+    /// (`ENAMETOOLONG`), which is how a caller finds out what "too
+    /// long" is here — APFS counts UTF-16 units where `NAME_MAX` says
+    /// bytes. On the path fallback the `stat` names the whole path, so
+    /// a path too long is laid at the name's door as well.
     pub fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
         #[cfg(dir_handles)]
         {
@@ -386,25 +391,6 @@ impl Dir {
         #[cfg(not(dir_handles))]
         {
             std::fs::remove_file(self.path.join(name))
-        }
-    }
-
-    /// Whether the filesystem refuses `name` as too long — asked of the
-    /// kernel, by a `stat` of the one name under this directory, since
-    /// only the filesystem knows its own measure (APFS counts UTF-16
-    /// units where `NAME_MAX` says bytes). Any other answer, a missing
-    /// name included, means the length is fine. A target that cannot
-    /// say refuses nothing.
-    pub fn refuses_name(&self, name: &OsStr) -> bool {
-        #[cfg(unix)]
-        {
-            self.lstat(name)
-                .is_err_and(|e| e.raw_os_error() == Some(nix::libc::ENAMETOOLONG))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = name;
-            false
         }
     }
 

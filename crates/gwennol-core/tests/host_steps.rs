@@ -2027,7 +2027,7 @@ async fn fs_write_fails_a_name_too_long_before_asking() {
         eprintln!("skipping: this filesystem takes a 256-byte name");
         return;
     }
-    // The host's own words, not the OS's after an approval as before.
+    // The host's own words, not the OS's.
     let refused = format!("file name too long: {name}");
     let err = run("plain_writer", json!({"path": &name, "content": "x"}))
         .await
@@ -2092,7 +2092,62 @@ async fn fs_write_defers_to_the_filesystem_on_what_a_long_name_is() {
                 .ends_with(&format!("file name too long: {name}")),
             "{err}"
         );
+        assert!(
+            !f.requests_for("plain_writer")
+                .contains(&Access::WriteFile(f.workspace.join(&name))),
+            "the operator was asked about a write that could not happen"
+        );
     }
+}
+
+/// A temporary that someone else removes between its creation and the
+/// rename is the write's loss, and the step says so: not `not_found`
+/// for a destination that was never the problem, with the bytes gone
+/// silently.
+#[tokio::test]
+async fn a_temporary_stolen_before_the_rename_is_the_writes_loss() {
+    let f = fixture();
+    let dir = f.workspace.join("thief");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The thief: removes the temporary the moment it appears. The
+    // write is big enough that its fill and fsync outlast the poll.
+    let thief = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".gwennol-tmp")
+                        && std::fs::remove_file(entry.path()).is_ok()
+                    {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            false
+        }
+    });
+    let content = "x".repeat(2 << 20);
+    let err = run(
+        "plain_writer",
+        json!({"path": "thief/loot.txt", "content": content}),
+    )
+    .await
+    .expect_err("a step error");
+    assert!(thief.join().unwrap(), "the thief never saw a temporary");
+    assert!(
+        err.to_string()
+            .contains("could not be found where it was made"),
+        "{err}"
+    );
+    assert!(
+        !dir.join("loot.txt").exists(),
+        "the destination was written"
+    );
 }
 
 /// A drop box — a directory the agent's user may search and write but
