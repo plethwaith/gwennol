@@ -270,15 +270,9 @@ fn split_at_existing(path: &Path) -> std::io::Result<(&Path, PathBuf, Vec<OsStri
             // way a missing one does: what lies below it cannot be
             // canonicalised, only spelled — and the step is about to
             // report the outcome as data, so the approval must not be
-            // the thing that turns it back into an error.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::NotADirectory
-                        | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
+            // the thing that turns it back into an error. The set is
+            // [`Outcome::classify`]'s: the answers a model can act on.
+            Err(e) if Outcome::classify(&e).is_some() => {
                 below.push(
                     existing
                         .file_name()
@@ -377,18 +371,29 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
     let (existing, walked, mut below) = split_at_existing(parent)?;
     let (dir, anchor) = match Dir::open_canonical(existing, Hold::Search) {
         Ok((dir, canonical)) => (Ok(dir), canonical),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotADirectory
-                    | std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            (Err(e), walked)
-        }
+        // An answer the model can act on — a file, unsearchable, gone —
+        // is kept for after the approval.
+        Err(e) if Outcome::classify(&e).is_some() => (Err(e), walked),
         Err(e) => return Err(e),
     };
+    // A name longer than the anchor's filesystem takes is nobody's
+    // answer to act on — not the model's, not the operator's — and no
+    // `stat` finds it out for a name whose parent does not exist yet.
+    // Every name below the anchor, the destination's included, is
+    // measured against the filesystem's own limit before anything is
+    // asked or made. (A filesystem that does not say has no check.)
+    if let Ok(dir) = &dir
+        && let Some(max) = dir.name_max().ok().flatten()
+        && let Some(long) = below
+            .iter()
+            .chain(std::iter::once(&name))
+            .find(|c| c.len() > max)
+    {
+        return Err(std::io::Error::other(format!(
+            "file name too long: {}",
+            long.to_string_lossy()
+        )));
+    }
     // Only a destination whose parent is the anchor can exist at all.
     // One that does is approved under the name the path canonicalises
     // to — on a case-insensitive filesystem the name on disk, not the
@@ -417,16 +422,14 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
                 }
             }
             // Missing — or unanswerable through the handle (unsearchable,
-            // say), which is answered as data once the approval is given.
-            // Anything else — a name too long, an I/O error — is nobody's
-            // to act on, and fails the step before the operator is asked.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::NotADirectory
-                        | std::io::ErrorKind::PermissionDenied
-                ) => {}
+            // say), which is answered as data once the approval is given:
+            // the same set the walk keeps, [`Outcome::classify`]'s.
+            // Anything else — an I/O error, a stale handle — is nobody's
+            // to act on, and fails the step before the operator is
+            // asked; a transient one is not retried after the approval
+            // as it once was, by choice: a destination that cannot be
+            // looked at is not one to ask about.
+            Err(e) if Outcome::classify(&e).is_some() => {}
             Err(e) => return Err(e),
         }
     }
@@ -488,6 +491,9 @@ fn vouched_name(
 /// be, if it is being replaced.
 struct Prepared {
     dir: Dir,
+    /// Where `dir` was when it was held — the canonical directory the
+    /// temporary lives in, for a message about it.
+    in_dir: PathBuf,
     name: OsString,
     tmp: OsString,
     file: std::fs::File,
@@ -542,17 +548,18 @@ fn prepare(
         }
         Ok(stat) => Some(replacement_permissions(stat.permissions)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(destination_answer("write", &at, path, e)),
+        Err(e) => return Err(destination_answer("write", &at.join(&name), path, e)),
     };
     let (file, tmp) = match create_temp_in(&dir, &name, dest_perms.is_some()) {
         Ok(created) => created,
         // The directory is not writable, or something the classification
         // above could not see: the destination's answer, reported as
         // such.
-        Err(e) => return Err(destination_answer("write", &at, path, e)),
+        Err(e) => return Err(destination_answer("write", &at.join(&name), path, e)),
     };
     Ok(Prepared {
         dir,
+        in_dir: at,
         name,
         tmp,
         file,
@@ -606,14 +613,18 @@ fn create_temp_in(
 
 /// Remove a temporary the write will not use. A failure is logged and
 /// not returned — the step's answer is whatever made the temporary
-/// unwanted — so a `.gwennol-tmp` file left behind at least has a trace.
-fn discard_temp(dir: &Dir, tmp: &OsStr) {
-    if let Err(e) = dir.unlink(tmp) {
-        tracing::warn!(
-            temporary = %tmp.to_string_lossy(),
+/// unwanted — so a `.gwennol-tmp` file left behind at least has a
+/// trace, with the directory it is in; one already gone is not left
+/// behind at all.
+fn discard_temp(dir: &Dir, in_dir: &Path, tmp: &OsStr) {
+    match dir.unlink(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %in_dir.join(tmp).display(),
             error = %e,
             "could not remove a temporary file; it is left behind"
-        );
+        ),
     }
 }
 
@@ -728,6 +739,7 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         };
         let Prepared {
             dir,
+            in_dir,
             name,
             tmp,
             file,
@@ -740,13 +752,21 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         let filled = or_cancelled(&cancel, fill_temp(file, &content, dest_perms)).await;
         let cancelled_after_fill = cancel.is_cancelled();
         if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
-            let _ = blocking(move || discard_temp(&dir, &tmp)).await;
+            let leftover = in_dir.join(&tmp);
+            if let Err(e) = blocking(move || discard_temp(&dir, &in_dir, &tmp)).await {
+                // The pool's own failure: the temporary's fate is unknown.
+                tracing::warn!(
+                    path = %leftover.display(),
+                    error = %e,
+                    "could not remove a temporary file; it may be left behind"
+                );
+            }
             filled?.map_err(failed)?;
             return Err(cancelled());
         }
         let renamed = blocking(move || {
             dir.rename(&tmp, &name)
-                .inspect_err(|_| discard_temp(&dir, &tmp))
+                .inspect_err(|_| discard_temp(&dir, &in_dir, &tmp))
         })
         .await
         .map_err(failed)?;

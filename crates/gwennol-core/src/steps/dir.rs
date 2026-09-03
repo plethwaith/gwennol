@@ -389,6 +389,27 @@ impl Dir {
         }
     }
 
+    /// The longest name this directory's filesystem takes (`NAME_MAX`,
+    /// by `fpathconf`), if it says: a name longer than that can be
+    /// refused before anything is asked or made — including one whose
+    /// parent does not exist yet, which no `stat` could reach.
+    pub fn name_max(&self) -> io::Result<Option<usize>> {
+        #[cfg(dir_handles)]
+        {
+            let max = nix::unistd::fpathconf(&self.fd, nix::unistd::PathconfVar::NAME_MAX)?;
+            Ok(max.and_then(|n| usize::try_from(n).ok()))
+        }
+        #[cfg(all(unix, not(dir_handles)))]
+        {
+            let max = nix::unistd::pathconf(&self.path, nix::unistd::PathconfVar::NAME_MAX)?;
+            Ok(max.and_then(|n| usize::try_from(n).ok()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Read this directory's entries — at most `max`, in whatever order
     /// the directory yields them, with `.` and `..` left out — and
     /// whether it held more. Needs a [`Hold::Read`] handle; the entries

@@ -2020,14 +2020,35 @@ async fn fs_write_takes_a_name_as_long_as_names_go() {
 async fn fs_write_fails_a_name_too_long_before_asking() {
     let f = fixture();
     let name = "t".repeat(256);
+    if std::fs::write(f.workspace.join(&name), "probe").is_ok() {
+        std::fs::remove_file(f.workspace.join(&name)).unwrap();
+        eprintln!("skipping: this filesystem takes a 256-byte name");
+        return;
+    }
     let err = run("plain_writer", json!({"path": name, "content": "x"}))
         .await
         .expect_err("a step error");
-    assert!(err.to_string().contains("write "), "{err}");
+    assert!(err.to_string().contains("name too long"), "{err}");
     assert!(
         !f.requests_for("plain_writer")
             .contains(&Access::WriteFile(f.workspace.join(&name))),
         "the operator was asked about a write that could not happen"
+    );
+    // Under a parent that does not exist yet no `stat` could have found
+    // it out; the name is measured, not looked up — and nothing is made.
+    let below = format!("unmade/{name}");
+    let err = run("writer", json!({"path": below, "content": "x", "dir": "."}))
+        .await
+        .expect_err("a step error");
+    assert!(err.to_string().contains("name too long"), "{err}");
+    assert!(
+        !f.requests_for("writer")
+            .contains(&Access::WriteFile(f.workspace.join(&below))),
+        "the operator was asked about a write that could not happen"
+    );
+    assert!(
+        !f.workspace.join("unmade").exists(),
+        "a directory was made for it"
     );
 }
 
