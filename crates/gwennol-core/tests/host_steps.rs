@@ -236,6 +236,11 @@ fn fixture_plugins() -> Vec<Value> {
             json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
         ),
         plugin(
+            "gated_lister",
+            &["step_type:host_fs.list"],
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}}]),
+        ),
+        plugin(
             "gated_runner",
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
@@ -1826,6 +1831,99 @@ async fn a_symlink_planted_where_a_directory_was_approved_is_not_followed() {
         std::fs::read_dir(&outside).unwrap().next().is_none(),
         "something landed through the link"
     );
+}
+
+/// The listing's version of the same race: the operator approves
+/// `lswap/dir`, and before it is read the directory is renamed away
+/// and a symlink to somewhere else put in its place. What comes back is
+/// the directory that was approved, not what the link points at.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_swapped_after_the_approval_is_not_what_gets_listed() {
+    let f = fixture();
+    let dir = f.workspace.join("lswap/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inside"), "x").unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    std::fs::write(outside.join("elsewhere"), "y").unwrap();
+    let out = with_the_prompt_held("gated_lister", json!({"dir": "lswap/dir"}), || {
+        std::fs::rename(&dir, f.workspace.join("lswap/moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+    })
+    .await
+    .expect("not a step error");
+    assert_eq!(out["l"]["outcome"], "ok", "{out}");
+    assert_eq!(f.requests_for("gated_lister"), vec![Access::ListDir(dir)]);
+    let names: Vec<_> = out["l"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["inside".to_string()],
+        "listed through the swapped-in link"
+    );
+}
+
+/// A symlink at a component below the deepest existing ancestor is not
+/// followed whether it was planted after the approval or was always
+/// there: a dangling link is `not_a_directory` naming it, with or
+/// without `create_dirs`, and the approval spells the link as given.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_reports_a_dangling_link_in_the_path_as_not_a_directory() {
+    let f = fixture();
+    std::os::unix::fs::symlink("nowhere", f.workspace.join("dangle")).unwrap();
+    for plugin in ["plain_writer", "writer"] {
+        let out = run(
+            plugin,
+            json!({"path": "dangle/x.txt", "content": "z", "dir": "."}),
+        )
+        .await
+        .expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "not_a_directory", "{plugin}: {out}");
+        assert!(
+            out["w"]["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(&f.workspace.join("dangle").display().to_string()),
+            "{plugin}: {out}"
+        );
+        assert!(
+            f.requests_for(plugin)
+                .contains(&Access::WriteFile(f.workspace.join("dangle/x.txt"))),
+            "{plugin}: asked before answering"
+        );
+    }
+    assert!(!f.workspace.join("nowhere").exists());
+}
+
+/// An existing destination is approved under the name the path
+/// canonicalises to, which is what `deepest_canonical` spells for it
+/// and so what a frontend's patterns match — on a case-insensitive
+/// filesystem the name on disk, not the one spelled — and is written
+/// under that name.
+#[tokio::test]
+async fn fs_write_approves_an_existing_file_as_deepest_canonical_spells_it() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("Cased.txt"), "before").unwrap();
+    let asked_for = f.workspace.join("cased.txt");
+    let spelled = gwennol_core::steps::fs::deepest_canonical(&asked_for).unwrap();
+    let out = run(
+        "plain_writer",
+        json!({"path": "cased.txt", "content": "after"}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert!(
+        f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(spelled.clone())),
+        "approved under a name the walk would not spell"
+    );
+    assert_eq!(std::fs::read_to_string(&spelled).unwrap(), "after");
 }
 
 /// A spawn withdrawn at its prompt never runs the program.

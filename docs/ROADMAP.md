@@ -98,7 +98,9 @@ opens sockets.
   existing ancestor is held open before the approval, verified to be
   what the approved path names, and everything after the approval —
   the directories `create_dirs` makes, the temporary, the rename — is
-  relative to that handle, following no symlink below it.
+  relative to that handle, following no symlink below it. `host_fs.list`
+  holds the directory it lists the same way, so a directory swapped
+  after its approval is not what gets listed.
 
 ### 2. SPI contracts
 
@@ -354,8 +356,9 @@ prompt exists to paper over it.
   write that closes the parent-swap race the milestone-1 approval
   tolerated under interactive review. It is a `gwennol-core` change,
   not a frontend one, and landed as its own change after this
-  milestone (`steps::dir`), pinned by a write whose parent is swapped
-  for a symlink while its approval is held open.
+  milestone (`steps::dir`, which `host_fs.list` shares), pinned by a
+  write and a listing whose directory is swapped for a symlink while
+  the approval is held open.
 
 ### 7. TUI
 

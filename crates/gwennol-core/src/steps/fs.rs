@@ -26,7 +26,7 @@ use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::dir::{Dir, Kind};
+use super::dir::{Dir, Hold, Kind};
 use super::{
     StepFuture, bool_param, cancelled, capped, lossy_capped, or_cancelled, resolve, str_param,
     u64_param,
@@ -202,15 +202,11 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let named = tokio::fs::metadata(&canonical)
+            let (named, held) = (canonical.clone(), (meta.dev(), meta.ino()));
+            blocking(move || super::dir::verify_named(&named, held))
                 .await
-                .map_err(|e| StepError::Failed(format!("read {}: {e}", canonical.display())))?;
-            if (named.dev(), named.ino()) != (meta.dev(), meta.ino()) {
-                return Err(StepError::Failed(format!(
-                    "{} changed while being opened",
-                    path.display()
-                )));
-            }
+                .and_then(|verified| verified)
+                .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
         }
         let ask = approval(&*ex, Access::ReadFile(canonical));
         approve(ask).await?;
@@ -305,33 +301,55 @@ fn split_at_existing(path: &Path) -> std::io::Result<(&Path, PathBuf, Vec<OsStri
 /// hop instead of one per component.
 async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || deepest_canonical(&path))
-        .await
-        .map_err(std::io::Error::other)?
+    blocking(move || deepest_canonical(&path)).await?
 }
 
 /// Run `work` on the blocking pool: a few syscalls that must not park
 /// a runtime worker, in one hop.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, StepError> {
+) -> std::io::Result<T> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| StepError::Failed(format!("blocking work failed: {e}")))
+        .map_err(std::io::Error::other)
+}
+
+/// A destination's answer to an error met at `component` on the way to
+/// it. `not_a_directory` names the component that is not one; every
+/// other outcome names the destination that was asked for — the same
+/// answer whichever ancestor a platform's handle happened to catch it
+/// at (`O_PATH` holds an unsearchable directory that `O_SEARCH` refuses,
+/// so one state is met a level apart on Linux and macOS). What is not
+/// an outcome is an error, naming the component.
+fn destination_answer(
+    what: &str,
+    component: &Path,
+    path: &Path,
+    e: std::io::Error,
+) -> Result<StepOutput, StepError> {
+    match Outcome::classify(&e) {
+        Some(Outcome::NotADirectory) => Ok(Outcome::NotADirectory.result(component)),
+        Some(outcome) => Ok(outcome.result(path)),
+        None => Err(StepError::Failed(format!(
+            "{what} {}: {e}",
+            component.display()
+        ))),
+    }
 }
 
 /// Where a write is anchored: the path the operator judges, the handle
 /// on its deepest existing ancestor, and the names below.
 struct Anchored {
-    /// The approved path — the anchor canonical, the rest as spelled:
-    /// [`deepest_canonical`] of the parent, plus the destination's name.
+    /// The approved path: what [`deepest_canonical`] spells for the
+    /// destination.
     approved: PathBuf,
     /// The anchor as canonicalised — a prefix of `approved`, and the
     /// path a message about the ancestor itself names.
     anchor: PathBuf,
     /// The handle on the anchor, or why it could not be held: it is a
-    /// file (`NotADirectory`) or the agent's user may not search it
-    /// (`PermissionDenied`) — the destination's answer, given after the
+    /// file (`NotADirectory`), the agent's user may not search it
+    /// (`PermissionDenied`), or it went away since the walk found it
+    /// (`NotFound`) — the destination's answer, given after the
     /// approval as data like any other.
     dir: std::io::Result<Dir>,
     /// The names below the anchor in order, the last the destination's
@@ -351,33 +369,56 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
-    let name = path
+    let mut name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no file name"))?
         .to_os_string();
     let (existing, walked, mut below) = split_at_existing(parent)?;
-    below.push(name.clone());
-    let (dir, anchor) = match Dir::open_canonical(existing) {
+    let (dir, anchor) = match Dir::open_canonical(existing, Hold::Search) {
         Ok((dir, canonical)) => (Ok(dir), canonical),
         Err(e)
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::PermissionDenied
+                std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::NotFound
             ) =>
         {
             (Err(e), walked)
         }
         Err(e) => return Err(e),
     };
-    // Only a destination whose parent is the anchor can exist at all —
-    // and an unanswerable `lstat` here (unsearchable through the
-    // handle, say) is answered as data once the approval is given.
-    let dest_is_symlink = below.len() == 1
-        && dir
-            .as_ref()
-            .ok()
-            .and_then(|dir| dir.lstat(&name).ok())
-            .is_some_and(|stat| stat.kind == Kind::Symlink);
+    // Only a destination whose parent is the anchor can exist at all.
+    // One that does is approved under the name the path canonicalises
+    // to — on a case-insensitive filesystem the name on disk, not the
+    // one spelled — because that is what `deepest_canonical` spells for
+    // it and so what a frontend's patterns match; and it is written
+    // under that name too. The canonical path is checked to lie in the
+    // anchor, so a link that turned up meanwhile is refused rather than
+    // have its target approved under the anchor's name.
+    let mut dest_is_symlink = false;
+    if below.is_empty()
+        && let Ok(dir) = &dir
+    {
+        match dir.lstat(&name) {
+            Ok(stat) if stat.kind == Kind::Symlink => dest_is_symlink = true,
+            Ok(_) => match std::fs::canonicalize(path) {
+                Ok(canonical) if canonical.parent() == Some(&anchor) => {
+                    if let Some(on_disk) = canonical.file_name() {
+                        name = on_disk.to_os_string();
+                    }
+                }
+                Ok(_) => dest_is_symlink = true,
+                // Gone by now: spelled, as a missing file is.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            },
+            // Missing — or unanswerable through the handle (unsearchable,
+            // say), which is answered as data once the approval is given.
+            Err(_) => {}
+        }
+    }
+    below.push(name);
     let mut approved = anchor.clone();
     approved.extend(&below);
     Ok(Anchored {
@@ -411,13 +452,11 @@ fn prepare(
     mut at: PathBuf,
     mut below: Vec<OsString>,
     create_dirs: bool,
-    approved: &Path,
     path: &Path,
 ) -> Result<Prepared, Result<StepOutput, StepError>> {
     let Some(name) = below.pop() else {
         return Err(Err(StepError::Failed("path has no file name".into())));
     };
-    let what = if create_dirs { "mkdir" } else { "write" };
     for component in below {
         at.push(&component);
         if create_dirs {
@@ -426,25 +465,17 @@ fn prepare(
                 // Made meanwhile by someone else — or something else is
                 // in the way, which the descent reports.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(outcome_or_error(what, &at, e)),
+                Err(e) => return Err(destination_answer("mkdir", &at, path, e)),
             }
         }
         dir = match dir.open_child(&component) {
             Ok(dir) => dir,
-            // A file — or a symlink, which the descent does not follow
-            // whatever it points at: the operator approved a directory
-            // to be made here, not a link to be followed.
-            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
-                return Err(Ok(Outcome::NotADirectory.result(&at)));
-            }
-            // Still missing (and `create_dirs` not asked for): the
-            // destination's answer, under the path that was asked for.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Ok(Outcome::NotFound.result(path)));
-            }
-            // Not searchable, say — the handle on the ancestor may be
-            // held without the permission the descent needs.
-            Err(e) => return Err(outcome_or_error(what, &at, e)),
+            // A file, or a symlink — however long it has been there,
+            // whatever it points at — which the descent does not
+            // follow: `not_a_directory`, naming it. Still missing, with
+            // `create_dirs` not asked for: `not_found`. Not searchable
+            // through the handle: `permission_denied`.
+            Err(e) => return Err(destination_answer("write", &at, path, e)),
         };
     }
     // Whether this replaces an existing file decides both the
@@ -459,14 +490,14 @@ fn prepare(
         }
         Ok(stat) => Some(replacement_permissions(stat.permissions)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(outcome_or_error("write", approved, e)),
+        Err(e) => return Err(destination_answer("write", &at, path, e)),
     };
     let (file, tmp) = match create_temp_in(&dir, &name, dest_perms.is_some()) {
         Ok(created) => created,
         // The directory is not writable, or something the classification
         // above could not see: the destination's answer, reported as
         // such.
-        Err(e) => return Err(outcome_or_error("write", path, e)),
+        Err(e) => return Err(destination_answer("write", &at, path, e)),
     };
     Ok(Prepared {
         dir,
@@ -543,27 +574,31 @@ async fn fill_temp(
 /// take the file (a missing parent without `create_dirs`, a directory or
 /// a non-directory in the way, permission denied, a symlink).
 ///
-/// The approved path is canonical up to its deepest existing ancestor
-/// ([`deepest_canonical`]), so the operator judges where the bytes will
-/// actually land, not an alias — and that ancestor is *held open* before
-/// the approval, verified to be what the canonical path names, and is
-/// what every operation after the approval is relative to: the
-/// directories `create_dirs` makes, the temporary, the rename that makes
-/// it the destination. A parent swapped after the approval cannot
-/// redirect the write, because nothing after the approval resolves the
-/// parent by name again; the bytes land in the directory the operator
-/// approved, wherever its name has gone meanwhile. Below the anchor no
-/// symlink is followed. See [`super::dir`].
+/// The approved path is what [`deepest_canonical`] spells for the
+/// destination — canonical up to its deepest existing ancestor, so the
+/// operator judges where the bytes will actually land, not an alias —
+/// and that ancestor is *held open* before the approval, verified to be
+/// what the canonical path names, and is what every operation after the
+/// approval is relative to: the directories `create_dirs` makes, the
+/// temporary, the rename that makes it the destination. A parent
+/// swapped after the approval cannot redirect the write, because nothing
+/// after the approval resolves the parent by name again; the bytes land
+/// in the directory the operator approved, wherever its name has gone
+/// meanwhile. See [`super::dir`].
 ///
-/// A symlink destination is never written through or replaced — the
-/// outcome is `is_symlink`, approved as a probe under the link's own
-/// name with its parent canonical: resolving the link would show the
-/// operator a write to the target that is precisely what will not
-/// happen. A link planted at the destination's name after the approval
-/// gets the same answer; one planted between that check and the rename
-/// is replaced by the rename, in the approved directory under the
-/// approved name — the bytes still land where the operator was told,
-/// and only the link is lost.
+/// Below the anchor no symlink is followed, however long it has been
+/// there: a link at a component the operator was shown as "to be
+/// created" — a dangling one that was always there, or one planted
+/// after the approval — is `not_a_directory`, naming it. A symlink
+/// destination is never written through or replaced — the outcome is
+/// `is_symlink`, approved as a probe under the link's own name with its
+/// parent canonical: resolving the link would show the operator a write
+/// to the target that is precisely what will not happen. A link planted
+/// at the destination's name after the approval gets the same answer;
+/// one planted between that check and the rename is replaced by the
+/// rename, in the approved directory under the approved name — the
+/// bytes still land where the operator was told, and only the link is
+/// lost.
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
@@ -582,6 +617,8 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         };
         let create_dirs = bool_param(&p, "create_dirs", false)?;
         let cancel = ex.cancel_token();
+        let failed =
+            |e: std::io::Error| StepError::Failed(format!("write {}: {e}", path.display()));
         // The anchor is found and held before the approval, so the
         // approval can name the very directory the handle holds — the
         // module's documented exception to validate → approve → work,
@@ -589,9 +626,10 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // effect: raced against cancellation, and abandoned if it wins.
         let anchored = {
             let path = path.clone();
-            or_cancelled(&cancel, blocking(move || anchor(&path))).await??
+            or_cancelled(&cancel, blocking(move || anchor(&path))).await?
         }
-        .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
+        .and_then(|found| found)
+        .map_err(failed)?;
         let Anchored {
             approved,
             anchor,
@@ -603,9 +641,9 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         approve(ask).await?;
         let dir = match dir {
             Ok(dir) => dir,
-            // The ancestor is a file, or may not be searched: the
-            // destination's answer, reported as such.
-            Err(e) => return outcome_or_error("write", &anchor, e),
+            // The ancestor is a file, may not be searched, or is gone:
+            // the destination's answer, reported as such.
+            Err(e) => return destination_answer("write", &anchor, &path, e),
         };
         if dest_is_symlink {
             return Ok(Outcome::IsSymlink.result(&path));
@@ -616,8 +654,10 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // cancelled write either leaves the destination untouched with the
         // temporary removed, or — once the rename begins — completes.
         let prepared = {
-            let (approved, path) = (approved.clone(), path.clone());
-            blocking(move || prepare(dir, anchor, below, create_dirs, &approved, &path)).await?
+            let path = path.clone();
+            blocking(move || prepare(dir, anchor, below, create_dirs, &path))
+                .await
+                .map_err(failed)?
         };
         let Prepared {
             dir,
@@ -634,7 +674,7 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         let cancelled_after_fill = cancel.is_cancelled();
         if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
             let _ = blocking(move || dir.unlink(&tmp)).await;
-            filled?.map_err(|e| StepError::Failed(format!("write {}: {e}", approved.display())))?;
+            filled?.map_err(failed)?;
             return Err(cancelled());
         }
         let renamed = blocking(move || {
@@ -642,7 +682,8 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 let _ = dir.unlink(&tmp);
             })
         })
-        .await?;
+        .await
+        .map_err(failed)?;
         if let Err(e) = renamed {
             return outcome_or_error("write", &approved, e);
         }
@@ -654,14 +695,17 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// [{name, kind, size}], truncated}`, or `{outcome, message}` when there
 /// is no directory to list.
 ///
-/// The operator is shown, and the step lists, the canonical directory —
-/// symlinks resolved. One level only — recursion is a tool's decision to
-/// make, one approved listing at a time — and at most `max_entries`
-/// entries come back, with `truncated` saying whether the directory held
-/// more. A truncated listing is whatever the directory yielded first,
-/// sorted for presentation — not the lexicographically first entries,
-/// which would require reading the whole directory the cap exists to
-/// avoid.
+/// The operator is shown the canonical directory — symlinks resolved —
+/// and the step lists the very directory that was shown: it is held
+/// open before the approval, verified to be what the canonical path
+/// names, and read through that handle, so a directory swapped after
+/// the approval is not what gets listed. See [`super::dir`]. One level
+/// only — recursion is a tool's decision to make, one approved listing
+/// at a time — and at most `max_entries` entries come back, with
+/// `truncated` saying whether the directory held more. A truncated
+/// listing is whatever the directory yielded first, sorted for
+/// presentation — not the lexicographically first entries, which would
+/// require reading the whole directory the cap exists to avoid.
 pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -671,53 +715,63 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             LIST_ENTRIES_CEILING,
         );
         let cancel = ex.cancel_token();
-        let canonical = match or_cancelled(&cancel, tokio::fs::canonicalize(&path)).await? {
-            Ok(canonical) => canonical,
-            // Nothing to list — approved as a probe of the deepest
-            // existing ancestor plus the spelled remainder, then
-            // answered as data.
+        let failed = |e: std::io::Error| StepError::Failed(format!("list {}: {e}", path.display()));
+        // Held — for reading, which is what a listing needs — before the
+        // approval, so the approval names the very directory the handle
+        // holds: the module's exception, shared by all three steps.
+        let opened = {
+            let path = path.clone();
+            or_cancelled(
+                &cancel,
+                blocking(move || Dir::open_canonical(&path, Hold::Read)),
+            )
+            .await?
+        }
+        .and_then(|opened| opened);
+        let (dir, canonical) = match opened {
+            Ok(opened) => opened,
+            // Nothing to list, or nothing this user may — approved as a
+            // probe of the deepest existing ancestor plus the spelled
+            // remainder, then answered as data.
             Err(e) => {
                 let Some(outcome) = Outcome::classify(&e) else {
-                    return Err(StepError::Failed(format!("list {}: {e}", path.display())));
+                    return Err(failed(e));
                 };
                 let probed = or_cancelled(&cancel, canonicalize_missing(&path))
                     .await?
-                    .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
+                    .map_err(failed)?;
                 let ask = approval(&*ex, Access::ListDir(probed));
                 approve(ask).await?;
                 return Ok(outcome.result(&path));
             }
         };
-        let ask = approval(&*ex, Access::ListDir(canonical.clone()));
+        let ask = approval(&*ex, Access::ListDir(canonical));
         approve(ask).await?;
-        let mut rd = match tokio::fs::read_dir(&canonical).await {
-            Ok(rd) => rd,
-            Err(e) => return outcome_or_error("list", &path, e),
-        };
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        loop {
-            let next = or_cancelled(&cancel, rd.next_entry())
-                .await?
-                .map_err(|e| StepError::Failed(format!("list {}: {e}", path.display())))?;
-            let Some(entry) = next else { break };
-            if entries.len() >= max {
-                truncated = true;
-                break;
-            }
-            let meta = entry.metadata().await.ok();
-            let kind = match meta.as_ref().map(|m| m.file_type()) {
-                Some(t) if t.is_dir() => "dir",
-                Some(t) if t.is_symlink() => "symlink",
-                Some(_) => "file",
-                None => "unknown",
-            };
-            entries.push(json!({
-                "name": entry.file_name().to_string_lossy(),
-                "kind": kind,
-                "size": meta.as_ref().map(|m| m.len()),
-            }));
+        // Bounded by the cap, so one blocking hop; cancellation is
+        // consulted after it rather than between entries.
+        let (entries, truncated) = blocking(move || dir.list(max))
+            .await
+            .and_then(|listed| listed)
+            .map_err(failed)?;
+        if cancel.is_cancelled() {
+            return Err(cancelled());
         }
+        let mut entries: Vec<Value> = entries
+            .into_iter()
+            .map(|entry| {
+                let kind = match entry.stat.as_ref().map(|s| s.kind) {
+                    Some(Kind::Directory) => "dir",
+                    Some(Kind::Symlink) => "symlink",
+                    Some(Kind::Other) => "file",
+                    None => "unknown",
+                };
+                json!({
+                    "name": entry.name.to_string_lossy(),
+                    "kind": kind,
+                    "size": entry.stat.as_ref().map(|s| s.size),
+                })
+            })
+            .collect();
         entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(json!({"outcome": OUTCOME_OK, "entries": entries, "truncated": truncated}).into())
     })
@@ -732,7 +786,7 @@ mod tests {
     fn a_restricted_temporary_is_born_0600_not_chmodded_down_later() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
-        let dir = Dir::open(tmp.path()).unwrap();
+        let dir = Dir::open(tmp.path(), Hold::Search).unwrap();
         let (file, name) = create_temp_in(&dir, OsStr::new("private.txt"), true).unwrap();
         // The mode must hold from the instant of creation — before any
         // write, sync, or chmod — or an opener in the gap keeps an fd no
