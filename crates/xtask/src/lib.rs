@@ -86,12 +86,27 @@ pub enum BundleError {
     },
 }
 
-/// The workspace root this crate was built from.
+/// The workspace root of the crate cargo is running: the directory two
+/// levels above `CARGO_MANIFEST_DIR` as cargo sets it for this process
+/// — the xtask crate's under `cargo xtask`, the crate under test's in a
+/// test binary; every crate here sits two levels below the root. Read
+/// at run time, not baked in at compile time: a compiled-in path names
+/// where the rlib was *built*, and two worktrees sharing a target
+/// directory would hand each other a path that no longer exists. Off
+/// cargo, the compile-time path is the only one there is.
 pub fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    manifest_dir
         .join("../..")
         .canonicalize()
-        .expect("the xtask crate sits two levels below the workspace root")
+        .unwrap_or_else(|e| {
+            panic!(
+                "no workspace root two levels above {}: {e}",
+                manifest_dir.display()
+            )
+        })
 }
 
 /// The cargo running this process, or `cargo` off the path.
@@ -282,4 +297,24 @@ pub fn write_bundle(
         written.push(dest);
     }
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_root;
+
+    /// The root is found from where cargo runs this process, so a
+    /// worktree sharing a target directory with another checkout finds
+    /// its own root, not the one the rlib was built in.
+    #[test]
+    fn the_workspace_root_is_found_at_run_time() {
+        let root = workspace_root();
+        assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+        assert!(root.join("crates/xtask/Cargo.toml").is_file());
+        let from_cargo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(root, from_cargo);
+    }
 }
