@@ -243,8 +243,7 @@ fn fixture_plugins() -> Vec<Value> {
         plugin(
             "gated_lister_cancel",
             &["step_type:host_fs.list"],
-            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}},
-                   {"id": "after", "type": "let", "params": {"value": "ran"}}]),
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}}]),
         ),
         plugin(
             "gated_runner",
@@ -2034,10 +2033,20 @@ async fn fs_write_into_a_drop_box_needs_no_read_permission() {
     )
     .await;
     let dropped = std::fs::read_to_string(dir.join("dropped.txt"));
+    // Listing it is another matter: that needs read permission, and
+    // the directory's refusal is data — on both builds.
+    let listed = run("lister", json!({"dir": "dropbox", "max": 10})).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = out.expect("not a step error");
     assert_eq!(out["w"]["outcome"], "ok", "{out}");
     assert_eq!(dropped.unwrap(), "in");
+    let listed = listed.expect("not a step error");
+    assert_eq!(listed["l"]["outcome"], "permission_denied", "{listed}");
+    assert!(
+        f.requests_for("lister")
+            .contains(&Access::ListDir(dir.clone())),
+        "the listing was not approved as a probe first"
+    );
 }
 
 /// A spawn withdrawn at its prompt never runs the program.

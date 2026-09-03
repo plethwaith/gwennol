@@ -59,9 +59,10 @@ pub enum Outcome {
     /// The path names a directory where a file was expected.
     IsDirectory,
     /// A component of the path — or the path itself, for a listing —
-    /// is not a directory. For a write, also a symlink at a component
-    /// below the deepest canonicalisable ancestor, which the descent
-    /// does not follow whatever it points at.
+    /// is not a directory. For a write, also a symlink at an
+    /// intermediate component below the deepest canonicalisable
+    /// ancestor, which the descent does not follow whatever it points
+    /// at (a symlink at the destination itself is [`Outcome::IsSymlink`]).
     NotADirectory,
     /// The agent's user may not do this.
     PermissionDenied,
@@ -843,8 +844,9 @@ mod tests {
     }
 
     /// The case-fold lookup's decisions, with the by-path resolution
-    /// under the test's control so each race is deterministic.
-    #[cfg(dir_handles)]
+    /// under the test's control so each race is deterministic. Only the
+    /// replaced-file pin needs a real identity; the rest is path logic
+    /// the fallback shares.
     mod vouched {
         use super::super::*;
         use std::ffi::OsStr;
@@ -870,6 +872,7 @@ mod tests {
             assert_eq!(named, Some(OsString::from("Cased")));
         }
 
+        #[cfg(dir_handles)]
         #[test]
         fn a_file_replaced_in_the_window_is_the_race_not_a_symlink() {
             let (_tmp, anchor, dir, spelled) = setup();

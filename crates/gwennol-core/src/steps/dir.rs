@@ -82,8 +82,9 @@ pub enum Hold {
     /// checks search permission; `O_PATH` gives one and checks nothing
     /// on the directory itself, leaving the descent to meet a refusal.
     /// One or the other is used on every target where nix exposes it;
-    /// elsewhere a read-only open is the closest thing, and a drop box
-    /// is refused there.
+    /// on any other target with handles a read-only open is the closest
+    /// thing, and it refuses a drop box. (The path fallback opens
+    /// nothing for a search hold, and takes one.)
     Search,
     /// A handle whose entries will be read, which needs read permission
     /// as `opendir` does.
@@ -523,7 +524,8 @@ mod tests {
         // stream over one — an owning iterator closes without rewinding
         // — and a listing must still start from the beginning.
         let exhausted = nix::dir::Dir::from_fd(dir.fd.try_clone().unwrap()).unwrap();
-        assert!(exhausted.into_iter().count() >= 2);
+        let read: Vec<_> = exhausted.into_iter().collect::<Result<_, _>>().unwrap();
+        assert!(read.len() >= 2);
         let (again, _) = dir.list(10).unwrap();
         assert_eq!(
             again.len(),
