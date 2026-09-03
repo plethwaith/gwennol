@@ -91,7 +91,8 @@ async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
 
 /// Wait for a condition the world outside the session shows — a file
 /// the child touched, the stub's log — by polling it: the one poller,
-/// for the waits that have no notification to await.
+/// for the waits that have no notification to await. `what` names what
+/// is waited for, as "waiting for `what`" reads.
 async fn until(what: &str, holds: impl Fn() -> bool) {
     for _ in 0..500 {
         if holds() {
@@ -99,7 +100,7 @@ async fn until(what: &str, holds: impl Fn() -> bool) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("{what} never happened");
+    panic!("timed out waiting for {what}");
 }
 
 /// Run a turn on `route` in its own task, cancel it once `ready` —
@@ -130,7 +131,7 @@ async fn cancelled_at<F: Future<Output = ()>>(
             () = ready(sink.clone()) => cancel.cancel(),
             early = &mut running => panic!(
                 "the turn ended before the point to cancel at: {:?}",
-                early.map(|(_, outcome)| outcome.map(|_| ()))
+                early.map(|(_, outcome)| outcome)
             ),
         }
     })
@@ -643,7 +644,7 @@ fn slow_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
 async fn wait_for_hangup(path: &str) {
     let f = fixture();
     until(
-        &format!("the stub saw the client hang up on {path}"),
+        &format!("the stub to see the client hang up on {path}"),
         || f.stub.hangups.lock().unwrap().iter().any(|p| p == path),
     )
     .await;
@@ -1345,10 +1346,17 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
     // event and the approval both come before the spawn, and a cancel
     // there is "before this call started", not this pin. The slow tool
     // leaves a mark the moment it runs.
+    // The one workspace is shared by every test in this binary, and
+    // only this pin runs the slow tool, so the mark is its own.
     let marker = fixture().workspace.join("slow-started");
-    let _ = std::fs::remove_file(&marker);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("a stale mark could not be removed: {e}"),
+    }
+    assert!(!marker.exists());
     let (s, outcome, events) = cancelled_at("/slow-tool", "sleep", |_| {
-        until("the slow tool's child started", move || marker.exists())
+        until("the slow tool's child to start", move || marker.exists())
     })
     .await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
@@ -1390,25 +1398,13 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
 /// turn ends without the operator ever answering.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_at_an_open_approval_withdraws_it() {
-    let f = fixture();
-    let gate = f.harness.gates.gate("gated_tool");
-    let mut s = session("/gated-tool");
-    let cancel = CancellationToken::new();
-    let handle = tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            let (outcome, events) = with_events(async { s.turn("ask", &cancel).await }).await;
-            (s, outcome, events)
-        }
-    });
-    tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
-        .await
-        .expect("the tool asked the operator");
-    cancel.cancel();
-    let (s, outcome, events) = tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("the withdrawn approval does not hold the turn")
-        .unwrap();
+    let gate = fixture().harness.gates.gate("gated_tool");
+    // At the open approval means once the operator has been asked.
+    let asked = gate.clone();
+    let (s, outcome, events) = cancelled_at("/gated-tool", "ask", move |_| async move {
+        asked.arrived.notified().await
+    })
+    .await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
     // The host step said it was withdrawn at the approval, so the model
     // is told nothing ran — not the cautious "may have run".

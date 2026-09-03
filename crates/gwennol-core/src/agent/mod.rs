@@ -691,6 +691,13 @@ impl Session {
         loop {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
+                // The turn's token is the authority once it has fired:
+                // a stream that ends or fails then is the cut arriving,
+                // not a vendor hanging up. The http step's body guard
+                // ends the body the instant the step's token fires, and
+                // which the reader sees first — the token, or the body
+                // ending because of it — is a race the token settles.
+                Ok(None) | Err(_) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Ok(None) => return Err(TurnError::StreamEnded),
                 Err(e) => return Err(stream_read_failure(e)),
             };
