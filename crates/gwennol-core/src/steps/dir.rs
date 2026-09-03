@@ -281,7 +281,12 @@ impl Dir {
         }
     }
 
-    /// What `name` is inside this directory, without following it.
+    /// What `name` is inside this directory, without following it. A
+    /// name the filesystem will not take is `InvalidFilename`
+    /// (`ENAMETOOLONG`), which is how a caller finds out what "too
+    /// long" is here — APFS counts UTF-16 units where `NAME_MAX` says
+    /// bytes. On the path fallback the `stat` names the whole path, so
+    /// a path too long is laid at the name's door as well.
     pub fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
         #[cfg(dir_handles)]
         {

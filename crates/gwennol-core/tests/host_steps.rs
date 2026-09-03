@@ -2012,6 +2012,210 @@ async fn fs_write_takes_a_name_as_long_as_names_go() {
     );
 }
 
+/// A destination whose name is longer than a name may be is nobody's
+/// answer to act on — not the model's, not the operator's: the step
+/// fails before anyone is asked, rather than approve a write that
+/// cannot happen. What "longer than a name may be" is, the filesystem
+/// says — APFS takes a 255-character name of two-byte characters that
+/// `NAME_MAX` would refuse — so the pin asks it too.
+#[tokio::test]
+async fn fs_write_fails_a_name_too_long_before_asking() {
+    let f = fixture();
+    let name = "t".repeat(256);
+    if std::fs::write(f.workspace.join(&name), "probe").is_ok() {
+        std::fs::remove_file(f.workspace.join(&name)).unwrap();
+        eprintln!("skipping: this filesystem takes a 256-byte name");
+        return;
+    }
+    // The host's own words, not the OS's.
+    let refused = format!("file name too long: {name}");
+    let err = run("plain_writer", json!({"path": &name, "content": "x"}))
+        .await
+        .expect_err("a step error");
+    assert!(err.to_string().ends_with(&refused), "{err}");
+    assert!(
+        !f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(f.workspace.join(&name))),
+        "the operator was asked about a write that could not happen"
+    );
+    // Under a parent that does not exist yet a `stat` of the destination
+    // could not have found it out; each name is put to the filesystem
+    // on its own — and nothing is made. The same for a directory to be
+    // made whose own name is too long.
+    for (below, made) in [
+        (format!("unmade/{name}"), "unmade"),
+        (format!("gap/{name}/x.txt"), "gap"),
+    ] {
+        let err = run(
+            "writer",
+            json!({"path": &below, "content": "x", "dir": "."}),
+        )
+        .await
+        .expect_err("a step error");
+        assert!(err.to_string().ends_with(&refused), "{below}: {err}");
+        assert!(
+            !f.requests_for("writer")
+                .contains(&Access::WriteFile(f.workspace.join(&below))),
+            "{below}: the operator was asked about a write that could not happen"
+        );
+        assert!(
+            !f.workspace.join(made).exists(),
+            "{below}: a directory was made for it"
+        );
+    }
+}
+
+/// The filesystem's measure of a name is the filesystem's, not
+/// `NAME_MAX`'s: a name the filesystem takes is written, however many
+/// bytes it is — APFS takes 255 two-byte characters, ext4 does not, and
+/// the step defers to whichever it is on.
+#[tokio::test]
+async fn fs_write_defers_to_the_filesystem_on_what_a_long_name_is() {
+    let f = fixture();
+    let name = "é".repeat(200);
+    let taken = std::fs::write(f.workspace.join(&name), "probe").is_ok();
+    if taken {
+        std::fs::remove_file(f.workspace.join(&name)).unwrap();
+    }
+    let out = run("plain_writer", json!({"path": &name, "content": "wide"})).await;
+    if taken {
+        let out = out.expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "ok", "{out}");
+        assert_eq!(
+            std::fs::read_to_string(f.workspace.join(&name)).unwrap(),
+            "wide"
+        );
+    } else {
+        let err = out.expect_err("a step error");
+        assert!(
+            err.to_string()
+                .ends_with(&format!("file name too long: {name}")),
+            "{err}"
+        );
+        assert!(
+            !f.requests_for("plain_writer")
+                .contains(&Access::WriteFile(f.workspace.join(&name))),
+            "the operator was asked about a write that could not happen"
+        );
+    }
+}
+
+/// The thief's sibling: someone renames the directory mid-fill. With
+/// the directory held the write does not notice — the bytes land in
+/// the directory that was approved, under its new name, the mid-fill
+/// half of the parent-swap guarantee. On the path fallback the rename
+/// by spelled path finds nothing, and the step says the temporary
+/// could not be found where it was made, as its doc promises.
+#[tokio::test]
+async fn a_directory_moved_mid_fill_keeps_the_write_where_it_was_approved() {
+    let f = fixture();
+    let dir = f.workspace.join("mover");
+    let moved = f.workspace.join("mover-moved");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&moved);
+    let mover = std::thread::spawn({
+        let (dir, moved) = (dir.clone(), moved.clone());
+        move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                let temp_seen = std::fs::read_dir(&dir).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|e| e.file_name().to_string_lossy().ends_with(".gwennol-tmp"))
+                });
+                if temp_seen {
+                    return std::fs::rename(&dir, &moved).is_ok();
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            false
+        }
+    });
+    let content = "y".repeat(2 << 20);
+    let out = run(
+        "plain_writer",
+        json!({"path": "mover/kept.txt", "content": content}),
+    )
+    .await;
+    assert!(mover.join().unwrap(), "the mover never saw a temporary");
+    #[cfg(dir_handles)]
+    {
+        let out = out.expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "ok", "{out}");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("kept.txt"))
+                .unwrap()
+                .len(),
+            2 << 20,
+            "the bytes did not land in the approved directory under its new name"
+        );
+        assert!(!dir.exists());
+    }
+    #[cfg(not(dir_handles))]
+    {
+        let err = out.expect_err("a step error");
+        assert!(
+            err.to_string()
+                .contains("could not be found where it was made"),
+            "{err}"
+        );
+        assert!(
+            !moved.join("kept.txt").exists(),
+            "the destination was written"
+        );
+    }
+}
+
+/// A temporary that someone else removes between its creation and the
+/// rename is the write's loss, and the step says so: not `not_found`
+/// for a destination that was never the problem, with the bytes gone
+/// silently.
+#[tokio::test]
+async fn a_temporary_stolen_before_the_rename_is_the_writes_loss() {
+    let f = fixture();
+    let dir = f.workspace.join("thief");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The thief: removes the temporary the moment it appears. The
+    // write is big enough that its fill and fsync outlast the poll.
+    let thief = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".gwennol-tmp")
+                        && std::fs::remove_file(entry.path()).is_ok()
+                    {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            false
+        }
+    });
+    let content = "x".repeat(2 << 20);
+    let err = run(
+        "plain_writer",
+        json!({"path": "thief/loot.txt", "content": content}),
+    )
+    .await
+    .expect_err("a step error");
+    assert!(thief.join().unwrap(), "the thief never saw a temporary");
+    assert!(
+        err.to_string()
+            .contains("could not be found where it was made"),
+        "{err}"
+    );
+    assert!(
+        !dir.join("loot.txt").exists(),
+        "the destination was written"
+    );
+}
+
 /// A drop box — a directory the agent's user may search and write but
 /// not read — takes a write: the hold needs no read permission.
 #[cfg(unix)]
