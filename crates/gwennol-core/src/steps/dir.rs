@@ -104,12 +104,7 @@ fn flags(hold: Hold) -> nix::fcntl::OFlag {
     use nix::fcntl::OFlag;
     let access = match hold {
         Hold::Search => {
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "redox",
-                target_os = "fuchsia"
-            ))]
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
             let search = OFlag::O_PATH;
             #[cfg(any(
                 target_vendor = "apple",
@@ -123,7 +118,6 @@ fn flags(hold: Hold) -> nix::fcntl::OFlag {
             #[cfg(not(any(
                 target_os = "linux",
                 target_os = "android",
-                target_os = "redox",
                 target_os = "fuchsia",
                 target_vendor = "apple",
                 target_os = "freebsd",
@@ -191,9 +185,14 @@ impl Dir {
         }
         #[cfg(not(dir_handles))]
         {
-            let _ = hold;
             if !std::fs::metadata(path)?.is_dir() {
                 return Err(io::Error::from(io::ErrorKind::NotADirectory));
+            }
+            // The hold's permission, checked as the handle's open would
+            // check it: a listing of a directory that cannot be read is
+            // the directory's answer, not a failure of the listing.
+            if hold == Hold::Read {
+                std::fs::read_dir(path)?;
             }
             Ok(Dir {
                 path: path.to_path_buf(),
@@ -324,8 +323,9 @@ impl Dir {
 
     /// Create the file `name` inside this directory, exclusively — it
     /// must not exist, and a symlink at that name makes creation fail
-    /// rather than redirect it — born with `mode` (less the umask), open
-    /// for writing.
+    /// rather than redirect it — open for writing, and on unix born
+    /// with `mode` (less the umask); a non-unix target has no birth
+    /// mode to set, and the fallback creates with its default.
     pub fn create_new(&self, name: &OsStr, mode: u32) -> io::Result<std::fs::File> {
         #[cfg(dir_handles)]
         {
@@ -519,6 +519,17 @@ mod tests {
         let (cut, truncated) = dir.list(1).unwrap();
         assert_eq!(cut.len(), 1);
         assert!(truncated);
+        // The handle's offset is shared with every duplicate. Exhaust a
+        // stream over one — an owning iterator closes without rewinding
+        // — and a listing must still start from the beginning.
+        let exhausted = nix::dir::Dir::from_fd(dir.fd.try_clone().unwrap()).unwrap();
+        assert!(exhausted.into_iter().count() >= 2);
+        let (again, _) = dir.list(10).unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "the listing began where the last stream stopped"
+        );
     }
 
     #[cfg(unix)]
@@ -559,10 +570,15 @@ mod tests {
         std::fs::write(tmp.path().join("one"), "x").unwrap();
         std::fs::write(tmp.path().join("two"), "x").unwrap();
         std::fs::hard_link(tmp.path().join("one"), tmp.path().join("also-one")).unwrap();
+        std::fs::write(tmp.path().join("three"), "x").unwrap();
         let one = dir.lstat(OsStr::new("one")).unwrap().identity;
         assert!(one.is_some());
         assert_eq!(one, dir.lstat(OsStr::new("also-one")).unwrap().identity);
-        assert_ne!(one, dir.lstat(OsStr::new("two")).unwrap().identity);
+        let two = dir.lstat(OsStr::new("two")).unwrap().identity;
+        assert_ne!(one, two);
+        // Two lone files differ too — an identity that were the link
+        // count would call them the same.
+        assert_ne!(two, dir.lstat(OsStr::new("three")).unwrap().identity);
     }
 
     #[test]

@@ -20,8 +20,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      # The path-based directory fallback (non-unix, Redox) has no
-      # runner here; it is at least type-checked and linted.
+      # The path-based directory fallback's Redox shape, linted (see the
+      # Tests job for what running it covers).
       - run: cargo clippy --locked -p gwennol-core --all-targets -- -D warnings
         env:
           GWENNOL_NO_DIR_HANDLES: "1"
@@ -39,8 +39,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
       # The path-based directory fallback (non-unix, Redox) has no runner
-      # here; it runs on this one with its cfg forced off, less the pins
-      # of the guarantees only handles make.
+      # here; forcing its cfg off on this one runs its Redox shape (unix
+      # without handles), less the pins of the guarantees only handles
+      # make. The non-unix arms still compile nowhere in CI.
       - run: cargo test --locked -p gwennol-core
         env:
           GWENNOL_NO_DIR_HANDLES: "1"

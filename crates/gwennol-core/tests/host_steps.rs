@@ -241,6 +241,12 @@ fn fixture_plugins() -> Vec<Value> {
             json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}}]),
         ),
         plugin(
+            "gated_lister_cancel",
+            &["step_type:host_fs.list"],
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}},
+                   {"id": "after", "type": "let", "params": {"value": "ran"}}]),
+        ),
+        plugin(
             "gated_runner",
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
@@ -1940,6 +1946,98 @@ async fn fs_write_approves_an_existing_file_as_deepest_canonical_spells_it() {
         "approved under a name the walk would not spell"
     );
     assert_eq!(std::fs::read_to_string(&spelled).unwrap(), "after");
+}
+
+/// A listing withdrawn at its prompt lists nothing: the directory is
+/// held, but not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_withdrawn_at_its_prompt_lists_nothing() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("unlisted")).unwrap();
+    std::fs::write(f.workspace.join("unlisted/secret"), "x").unwrap();
+    cancel_at_the_prompt("gated_lister_cancel", json!({"dir": "unlisted"})).await;
+    assert_eq!(
+        f.requests_for("gated_lister_cancel"),
+        vec![Access::ListDir(f.workspace.join("unlisted"))]
+    );
+}
+
+/// A listing names what each entry is, without following a link.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_list_names_the_kind_of_each_entry() {
+    let f = fixture();
+    let dir = f.workspace.join("kinds");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("plain"), "abc").unwrap();
+    std::os::unix::fs::symlink("sub", dir.join("to-sub")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+    let out = run("lister", json!({"dir": "kinds", "max": 10}))
+        .await
+        .expect("not a step error");
+    let kinds: Vec<(String, String)> = out["l"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().into(),
+                e["kind"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("dangling".into(), "symlink".into()),
+            ("plain".into(), "file".into()),
+            ("sub".into(), "dir".into()),
+            ("to-sub".into(), "symlink".into()),
+        ]
+    );
+}
+
+/// A destination whose name is as long as a name may be still leaves
+/// room for the temporary beside it.
+#[tokio::test]
+async fn fs_write_takes_a_name_as_long_as_names_go() {
+    let f = fixture();
+    let name = "n".repeat(255);
+    let out = run("plain_writer", json!({"path": name, "content": "long"}))
+        .await
+        .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join(&name)).unwrap(),
+        "long"
+    );
+}
+
+/// A drop box — a directory the agent's user may search and write but
+/// not read — takes a write: the hold needs no read permission.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_into_a_drop_box_needs_no_read_permission() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let dir = f.workspace.join("dropbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o311)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: this user (root?) reads a mode-311 directory anyway");
+        return;
+    }
+    let out = run(
+        "plain_writer",
+        json!({"path": "dropbox/dropped.txt", "content": "in"}),
+    )
+    .await;
+    let dropped = std::fs::read_to_string(dir.join("dropped.txt"));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = out.expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(dropped.unwrap(), "in");
 }
 
 /// A spawn withdrawn at its prompt never runs the program.

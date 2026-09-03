@@ -4,8 +4,11 @@
 //! and every non-unix target get the path-based fallback.
 //!
 //! `GWENNOL_NO_DIR_HANDLES=1` turns the cfg off on a target that has it,
-//! so the fallback can be compiled where CI runs; the race pins are
-//! not expected to pass that way, and CI only type-checks it.
+//! so the fallback can be built and tested where CI runs: its tests
+//! run that way on Linux, less the pins of the guarantees only handles
+//! make, which are gated on the cfg. That is the Redox shape of the
+//! fallback (unix without handles); the non-unix arms compile nowhere
+//! in CI.
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(dir_handles)");

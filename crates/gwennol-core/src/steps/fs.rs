@@ -59,7 +59,9 @@ pub enum Outcome {
     /// The path names a directory where a file was expected.
     IsDirectory,
     /// A component of the path — or the path itself, for a listing —
-    /// is not a directory.
+    /// is not a directory. For a write, also a symlink at a component
+    /// below the deepest canonicalisable ancestor, which the descent
+    /// does not follow whatever it points at.
     NotADirectory,
     /// The agent's user may not do this.
     PermissionDenied,
@@ -237,8 +239,10 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
 /// leads; a component that is a file, or that may not be searched, ends
 /// the walk like a missing one — and the remainder is appended as
 /// spelled.
-/// This is the path a write approval names, and the path a miss is
-/// approved under; a frontend that judges those paths by pattern must
+/// This is the path a write approval names — except a symlink
+/// destination, approved under its own name with its parent canonical
+/// — and the path a miss is approved under; a frontend that judges
+/// those paths by pattern must
 /// spell its patterns the same way, which is why this is public and
 /// synchronous — the one walk, for the host and for whoever needs to
 /// agree with it by construction.
@@ -404,30 +408,13 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
     {
         match dir.lstat(&name) {
             Ok(stat) if stat.kind == Kind::Symlink => dest_is_symlink = true,
-            Ok(spelled) => match std::fs::canonicalize(path) {
-                Ok(canonical) if canonical.parent() == Some(&anchor) => {
-                    let on_disk = canonical
-                        .file_name()
-                        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
-                    match dir.lstat(on_disk) {
-                        Ok(named) => match (spelled.identity, named.identity) {
-                            (Some(a), Some(b)) if a != b => {
-                                return Err(std::io::Error::other("changed while being opened"));
-                            }
-                            // Equal — or the path fallback, which closes
-                            // no race.
-                            _ => name = on_disk.to_os_string(),
-                        },
-                        // Gone by now: spelled, as a missing file is.
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
+            Ok(spelled) => {
+                if let Some(on_disk) =
+                    vouched_name(dir, &anchor, &spelled, || std::fs::canonicalize(path))?
+                {
+                    name = on_disk;
                 }
-                Ok(_) => dest_is_symlink = true,
-                // Gone by now: spelled, as a missing file is.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            },
+            }
             // Missing — or unanswerable through the handle (unsearchable,
             // say), which is answered as data once the approval is given.
             Err(_) => {}
@@ -443,6 +430,46 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
         below,
         dest_is_symlink,
     })
+}
+
+/// The on-disk name of an existing destination, vouched for by the
+/// handle. `resolve` canonicalises the destination by path — the one
+/// step after the handle is held that nothing has yet vouched for — and
+/// the name it yields must lie in `anchor` and be the very file
+/// `spelled` was, by device and inode. `None`: the destination is gone
+/// since `spelled` looked, and the spelled name stands, as for a
+/// missing file. A name that resolves elsewhere, or to another file, is
+/// the race it is — "changed while being opened" — and not a symlink: a
+/// link at the destination's name was answered before this ran, and a
+/// fresh regular file (an editor's save landing in the window) is no
+/// link either.
+fn vouched_name(
+    dir: &Dir,
+    anchor: &Path,
+    spelled: &super::dir::Stat,
+    resolve: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<Option<OsString>> {
+    let changed = || std::io::Error::other("changed while being opened");
+    let canonical = match resolve() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if canonical.parent() != Some(anchor) {
+        return Err(changed());
+    }
+    let on_disk = canonical
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    match dir.lstat(on_disk) {
+        Ok(named) => match (spelled.identity, named.identity) {
+            (Some(a), Some(b)) if a != b => Err(changed()),
+            // Equal — or the path fallback, which closes no race.
+            _ => Ok(Some(on_disk.to_os_string())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// What a write holds once its approval is given and its ground is
@@ -545,7 +572,8 @@ fn replacement_permissions(perms: std::fs::Permissions) -> std::fs::Permissions 
 /// (used when replacing an existing file) the temporary is born 0600,
 /// so its content is never readable beyond what the destination
 /// allowed — there is no create-then-chmod gap in which another opener
-/// can grab a readable fd.
+/// can grab a readable fd. (A birth mode is a unix notion; on another
+/// target the fallback creates with the platform's default.)
 fn create_temp_in(
     dir: &Dir,
     dest: &OsStr,
@@ -812,6 +840,85 @@ mod tests {
         // A replacement keeps permission bits and nothing else.
         let kept = replacement_permissions(std::fs::Permissions::from_mode(0o4755));
         assert_eq!(kept.mode() & 0o7777, 0o755);
+    }
+
+    /// The case-fold lookup's decisions, with the by-path resolution
+    /// under the test's control so each race is deterministic.
+    #[cfg(dir_handles)]
+    mod vouched {
+        use super::super::*;
+        use std::ffi::OsStr;
+
+        fn setup() -> (
+            tempfile::TempDir,
+            PathBuf,
+            Dir,
+            super::super::super::dir::Stat,
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let anchor = tmp.path().canonicalize().unwrap();
+            std::fs::write(anchor.join("Cased"), "x").unwrap();
+            let dir = Dir::open(&anchor, Hold::Search).unwrap();
+            let spelled = dir.lstat(OsStr::new("Cased")).unwrap();
+            (tmp, anchor, dir, spelled)
+        }
+
+        #[test]
+        fn the_name_on_disk_is_vouched_for_when_it_is_the_same_file() {
+            let (_tmp, anchor, dir, spelled) = setup();
+            let named = vouched_name(&dir, &anchor, &spelled, || Ok(anchor.join("Cased"))).unwrap();
+            assert_eq!(named, Some(OsString::from("Cased")));
+        }
+
+        #[test]
+        fn a_file_replaced_in_the_window_is_the_race_not_a_symlink() {
+            let (_tmp, anchor, dir, spelled) = setup();
+            let e = vouched_name(&dir, &anchor, &spelled, || {
+                // An editor's atomic save: the replacement is a new
+                // file while the old one still exists, then renamed over
+                // it — same name, fresh inode. (Unlinking first would let
+                // the filesystem hand the new file the old inode.)
+                std::fs::write(anchor.join(".Cased.saving"), "y").unwrap();
+                std::fs::rename(anchor.join(".Cased.saving"), anchor.join("Cased")).unwrap();
+                Ok(anchor.join("Cased"))
+            })
+            .unwrap_err();
+            assert!(e.to_string().contains("changed while being opened"), "{e}");
+        }
+
+        #[test]
+        fn a_name_that_resolves_outside_the_anchor_is_the_race_too() {
+            let (_tmp, anchor, dir, spelled) = setup();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let e = vouched_name(&dir, &anchor, &spelled, || {
+                Ok(elsewhere.path().canonicalize().unwrap().join("Cased"))
+            })
+            .unwrap_err();
+            assert!(e.to_string().contains("changed while being opened"), "{e}");
+        }
+
+        #[test]
+        fn a_destination_gone_by_now_leaves_the_spelled_name() {
+            let (_tmp, anchor, dir, spelled) = setup();
+            let gone = vouched_name(&dir, &anchor, &spelled, || {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+            .unwrap();
+            assert_eq!(gone, None);
+            // Resolved, then gone before the handle could look.
+            let gone = vouched_name(&dir, &anchor, &spelled, || {
+                std::fs::remove_file(anchor.join("Cased")).unwrap();
+                Ok(anchor.join("Cased"))
+            })
+            .unwrap();
+            assert_eq!(gone, None);
+            // Any other failure to resolve is nobody's to swallow.
+            let e = vouched_name(&dir, &anchor, &spelled, || {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+            .unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        }
     }
 
     #[test]
