@@ -571,8 +571,15 @@ impl Session {
             .unwrap_or(&self.no_config)
     }
 
-    /// The `chat` input for the next round.
-    fn chat_input(&self) -> Value {
+    /// The `chat` input the next round would send: the conversation as
+    /// the provider sees it, whole — the system prompt, the tools as
+    /// harvested, every message so far, and the generation settings —
+    /// rather than the messages alone ([`Self::transcript`]). This is
+    /// the builder the loop itself dispatches with, so what a frontend
+    /// records from here is exactly what the provider was handed on the
+    /// last round plus the round's own answer; a saved copy is a
+    /// reviewable, reproducible request.
+    pub fn chat_input(&self) -> Value {
         let mut input = Map::new();
         if let Some(system) = &self.config.system {
             input.insert("system".into(), Value::String(system.clone()));

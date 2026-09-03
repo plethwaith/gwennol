@@ -210,8 +210,11 @@ closed, and the process exits 130 once the exchange is stored. A second
 Ctrl-C exits at once.
 
 `--transcript FILE` writes the conversation as the provider saw it —
-contract messages, thinking carried as `opaque` blocks — at the end,
-after a failure too. The outcome line comes first; a transcript that
+the whole chat input: the system prompt, the tools as harvested from
+the manifests, every message with thinking carried as `opaque` blocks,
+and the generation settings — at the end, after a failure too. It is
+what the provider was handed on the last round plus that round's
+answer, so the file can be read or replayed as a request. The outcome line comes first; a transcript that
 cannot be written is reported after it and makes a completed turn
 exit 2, while a failed or cancelled turn keeps its own status.
 

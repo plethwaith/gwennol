@@ -527,14 +527,40 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
             .contains(&f.workspace.display().to_string())
     );
 
-    // The transcript file is the conversation as the provider saw it,
-    // with the thinking carried as the contract's opaque block.
-    let saved: Vec<Value> =
+    // The transcript file is the conversation as the provider saw it:
+    // the whole chat input — system prompt, tools, settings — with the
+    // thinking carried as the contract's opaque block, not the
+    // messages alone.
+    let saved: Value =
         serde_json::from_str(&std::fs::read_to_string(&transcript).unwrap()).unwrap();
-    assert_eq!(saved.len(), 4);
-    assert_eq!(saved[1]["content"][0]["type"], "opaque");
-    assert_eq!(saved[1]["content"][0]["data"], thinking_block());
-    assert_eq!(saved[3]["role"], "assistant");
+    assert_eq!(saved["system"], follow_up["system"]);
+    assert_eq!(saved["tools"], follow_up["tools"]);
+    assert_eq!(saved["stream"], true);
+    let tools: Vec<&str> = saved["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["bash", "grep", "read", "write"]);
+    let messages = saved["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1]["content"][0]["type"], "opaque");
+    assert_eq!(messages[1]["content"][0]["data"], thinking_block());
+    assert_eq!(messages[3]["role"], "assistant");
+    // Everything but the final answer is the request the stub received
+    // on the last round — in contract form: the one difference is the
+    // thinking block, which the file holds as `opaque` and the provider
+    // unwrapped to the vendor's own block on the wire.
+    let wire = follow_up["messages"].as_array().unwrap();
+    assert_eq!(messages[0], wire[0]);
+    assert_eq!(messages[2], wire[2]);
+    assert_eq!(messages[1]["role"], wire[1]["role"]);
+    assert_eq!(
+        messages[1]["content"].as_array().unwrap()[1..],
+        wire[1]["content"].as_array().unwrap()[1..]
+    );
+    assert_eq!(wire[1]["content"][0], thinking_block());
 }
 
 #[test]
