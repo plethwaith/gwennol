@@ -686,6 +686,13 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
         "the harvest, sorted"
     );
     assert_eq!(s.transcript().len(), 8);
+    // What the session reports as its chat input is what the provider
+    // was sent on the last round, with that round's answer appended —
+    // system, tools and settings included, not the messages alone.
+    let mut expected = sent[3].clone();
+    expected["messages"] = Value::Array(s.transcript().to_vec());
+    assert_eq!(s.chat_input(), expected);
+    assert_eq!(s.chat_input()["messages"].as_array().unwrap().len(), 8);
 }
 
 /// The same conversation on the buffered form, with text emitted per

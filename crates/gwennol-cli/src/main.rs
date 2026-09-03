@@ -130,8 +130,9 @@ struct Cli {
     #[arg(long)]
     no_stream: bool,
 
-    /// Write the transcript, as the provider saw it, to FILE at the
-    /// end — after a failure too.
+    /// Write the conversation as the provider saw it — system prompt,
+    /// tools, messages and settings, the whole chat input — to FILE at
+    /// the end, after a failure too.
     #[arg(long, value_name = "FILE")]
     transcript: Option<PathBuf>,
 
@@ -427,7 +428,7 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
     // is the more important fact, and a wrapper keying on that status
     // must keep seeing it.
     if let Some(path) = &cli.transcript
-        && let Err(Fatal(message)) = write_transcript(path, session.transcript())
+        && let Err(Fatal(message)) = write_transcript(path, &session.chat_input())
     {
         eprintln!("gwennol: {message}");
         if code == ExitCode::SUCCESS {
@@ -494,8 +495,11 @@ fn default_system_prompt(workspace: &Path) -> String {
     )
 }
 
-fn write_transcript(path: &Path, transcript: &[Value]) -> Result<(), Fatal> {
-    let text = serde_json::to_string_pretty(transcript).expect("a Value serialises");
+/// The whole chat input, pretty-printed: what the provider was handed
+/// on the last round plus its answer, so the file is a request someone
+/// can read or replay, not just the messages.
+fn write_transcript(path: &Path, chat_input: &Value) -> Result<(), Fatal> {
+    let text = serde_json::to_string_pretty(chat_input).expect("a Value serialises");
     std::fs::write(path, text).map_err(|e| Fatal(format!("transcript {}: {e}", path.display())))
 }
 
