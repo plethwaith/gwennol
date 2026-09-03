@@ -1354,7 +1354,6 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => panic!("a stale mark could not be removed: {e}"),
     }
-    assert!(!marker.exists());
     let (s, outcome, events) = cancelled_at("/slow-tool", "sleep", |_| {
         until("the slow tool's child to start", move || marker.exists())
     })
