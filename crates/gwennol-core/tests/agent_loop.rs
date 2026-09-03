@@ -28,7 +28,7 @@ use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
     Access, ApprovalRequest, Decision, Event, Operator, Session, SessionConfig, SessionError,
-    StopReason, ToolCall, Turn, TurnError, spi,
+    StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
 };
 
 mod common;
@@ -41,42 +41,106 @@ tokio::task_local! {
     /// the current task. Tests in this binary share one operator (the
     /// host is a process singleton), so events are kept per task and
     /// a test reads back only what its own session emitted.
-    static EVENTS: Arc<Mutex<Vec<Event>>>;
+    static EVENTS: Arc<Sink>;
 }
 
-/// The events of one session, as the harness records them.
-type Sink = Arc<Mutex<Vec<Event>>>;
+/// The events of one session, as the harness records them, and a
+/// notification for whoever waits on the next one — the clock-free
+/// idiom `common::Gate` uses, for a test that acts *at* a point in a
+/// running session rather than after a clock has run, which under load
+/// is a different point.
+#[derive(Default)]
+struct Sink {
+    events: Mutex<Vec<Event>>,
+    changed: tokio::sync::Notify,
+}
+
+impl Sink {
+    fn record(&self, event: Event) {
+        self.events.lock().unwrap().push(event);
+        self.changed.notify_waiters();
+    }
+
+    fn snapshot(&self) -> Vec<Event> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Resolve once an event `wanted` accepts has been recorded.
+    async fn wait_for(&self, wanted: impl Fn(&Event) -> bool) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Armed before the check, so a record landing between the
+            // check and the wait is not missed.
+            changed.as_mut().enable();
+            if self.events.lock().unwrap().iter().any(&wanted) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
 
 /// Run `fut` with an event sink, returning its output and the events
 /// emitted while it ran.
 async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
-    let sink = Sink::default();
-    let out = with_sink(sink.clone(), fut).await;
-    let events = sink.lock().unwrap().clone();
-    (out, events)
+    let sink = Arc::new(Sink::default());
+    let out = EVENTS.scope(sink.clone(), fut).await;
+    (out, sink.snapshot())
 }
 
-/// Run `fut` recording into `sink` — a sink the test keeps, so it can
-/// watch the session's events from outside the task running it.
-async fn with_sink<T>(sink: Sink, fut: impl Future<Output = T>) -> T {
-    EVENTS.scope(sink, fut).await
+/// Wait for a condition the world outside the session shows — a file
+/// the child touched, the stub's log — by polling it: the one poller,
+/// for the waits that have no notification to await.
+async fn until(what: &str, holds: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if holds() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{what} never happened");
 }
 
-/// Wait until `sink` holds an event `wanted` accepts: the way a test
-/// acts *at* a point in a running session — after the first tick has
-/// been shown, once a tool call has started — rather than after a
-/// clock has run, which under load is a different point.
-async fn wait_for(sink: &Sink, wanted: impl Fn(&Event) -> bool) {
+/// Run a turn on `route` in its own task, cancel it once `ready` —
+/// given the session's sink, so it can be one of the session's own
+/// events — resolves, and return the session, the turn's outcome and
+/// its events: the choreography the mid-turn cancellation pins share.
+/// A turn that ends before then has failed the pin, and says how,
+/// rather than leaving a wait to time out.
+async fn cancelled_at<F: Future<Output = ()>>(
+    route: &str,
+    input: &'static str,
+    ready: impl FnOnce(Arc<Sink>) -> F,
+) -> (Session, Result<TurnOutcome, TurnError>, Vec<Event>) {
+    let mut s = session(route);
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(Sink::default());
+    let mut running = tokio::spawn({
+        let (cancel, sink) = (cancel.clone(), sink.clone());
+        async move {
+            let outcome = EVENTS
+                .scope(sink, async { s.turn(input, &cancel).await })
+                .await;
+            (s, outcome)
+        }
+    });
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if sink.lock().unwrap().iter().any(&wanted) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::select! {
+            () = ready(sink.clone()) => cancel.cancel(),
+            early = &mut running => panic!(
+                "the turn ended before the point to cancel at: {:?}",
+                early.map(|(_, outcome)| outcome.map(|_| ()))
+            ),
         }
     })
     .await
-    .expect("the awaited event never came");
+    .expect("the point to cancel at never came");
+    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("cancellation ends the turn promptly")
+        .unwrap();
+    (s, outcome, sink.snapshot())
 }
 
 /// Approves everything except plugins named `denied*`; holds approvals
@@ -120,7 +184,7 @@ impl Operator for Harness {
     fn emit(&self, event: Event) {
         // A session driven outside `with_events` (none here) would
         // simply not be recorded.
-        let _ = EVENTS.try_with(|sink| sink.lock().unwrap().push(event));
+        let _ = EVENTS.try_with(|sink| sink.record(event));
     }
     async fn input(&self) -> Option<Turn> {
         self.inputs
@@ -320,8 +384,11 @@ fn fixture_plugins() -> Vec<Value> {
             "slow",
             &["step_type:host_process.run"],
             json!([
+                // Leaves a mark the moment it runs, so a test can act
+                // once the child exists rather than once a clock says so.
                 {"id": "p", "type": "host_process.run", "params": {
-                    "argv": ["sleep", "30"], "timeout_ms": 60000, "max_output_bytes": 1024}},
+                    "argv": ["sh", "-c", "touch slow-started && exec sleep 30"],
+                    "timeout_ms": 60000, "max_output_bytes": 1024}},
                 {"id": "out", "type": "return", "params": {"value": {"content": "slept", "is_error": false}}}
             ]),
         ),
@@ -575,13 +642,11 @@ fn slow_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
 /// Wait for the stub to record a hangup on `path`.
 async fn wait_for_hangup(path: &str) {
     let f = fixture();
-    for _ in 0..250 {
-        if f.stub.hangups.lock().unwrap().iter().any(|p| p == path) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the stub never saw the client hang up on {path}");
+    until(
+        &format!("the stub saw the client hang up on {path}"),
+        || f.stub.hangups.lock().unwrap().iter().any(|p| p == path),
+    )
+    .await;
 }
 
 fn user(text: &str) -> Value {
@@ -1257,24 +1322,11 @@ async fn a_new_turn_joins_the_trailing_user_message_after_a_failed_one() {
 /// the vendor sees the hangup, and the next turn is unaffected.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_mid_stream_tears_the_turn_down() {
-    let mut s = session("/slow");
-    let cancel = CancellationToken::new();
-    let sink = Sink::default();
-    let handle = tokio::spawn({
-        let (cancel, sink) = (cancel.clone(), sink.clone());
-        async move {
-            let outcome = with_sink(sink, async { s.turn("stream", &cancel).await }).await;
-            (s, outcome)
-        }
-    });
     // Mid-stream means after something has been shown.
-    wait_for(&sink, |e| matches!(e, Event::Text(_))).await;
-    cancel.cancel();
-    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("cancellation ends the turn promptly")
-        .unwrap();
-    let events = sink.lock().unwrap().clone();
+    let (s, outcome, events) = cancelled_at("/slow", "stream", |sink| async move {
+        sink.wait_for(|e| matches!(e, Event::Text(_))).await
+    })
+    .await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
     assert!(
         events.iter().all(|e| matches!(e, Event::Text(_))) && !events.is_empty(),
@@ -1289,24 +1341,16 @@ async fn cancelling_mid_stream_tears_the_turn_down() {
 /// exchange is kept whole, and the turn ends as cancelled.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
-    let mut s = session("/slow-tool");
-    let cancel = CancellationToken::new();
-    let sink = Sink::default();
-    let handle = tokio::spawn({
-        let (cancel, sink) = (cancel.clone(), sink.clone());
-        async move {
-            let outcome = with_sink(sink, async { s.turn("sleep", &cancel).await }).await;
-            (s, outcome)
-        }
-    });
-    // During the call means once the frontend has been told it started.
-    wait_for(&sink, |e| matches!(e, Event::ToolCall(_))).await;
-    cancel.cancel();
-    let (s, outcome) = tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("cancellation ends the tool step promptly")
-        .unwrap();
-    let events = sink.lock().unwrap().clone();
+    // While the call runs means once its child exists: the `ToolCall`
+    // event and the approval both come before the spawn, and a cancel
+    // there is "before this call started", not this pin. The slow tool
+    // leaves a mark the moment it runs.
+    let marker = fixture().workspace.join("slow-started");
+    let _ = std::fs::remove_file(&marker);
+    let (s, outcome, events) = cancelled_at("/slow-tool", "sleep", |_| {
+        until("the slow tool's child started", move || marker.exists())
+    })
+    .await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
     let slow = tool_call("c1", "slow", json!({}));
     assert_eq!(
