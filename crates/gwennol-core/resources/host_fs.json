@@ -64,7 +64,7 @@
           {
             "type": "object",
             "required": ["outcome", "message"],
-            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, permission denied, or a symlink (never written through or replaced). Nothing was written. Approved first like every probe — a symlink under the link's own name with its parent canonical, the rest under the path canonical to its deepest canonicalisable ancestor.",
+            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, permission denied, or a symlink (never written through; refused rather than replaced). Nothing was written. Approved first like every probe — a symlink under the link's own name with its parent canonical, the rest under the path canonical to its deepest canonicalisable ancestor.",
             "properties": {
               "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied", "is_symlink"] },
               "message": { "type": "string" }

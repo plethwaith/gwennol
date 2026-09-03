@@ -90,7 +90,7 @@ opens sockets.
   operator that canonical path, and reads from that same handle — a symlink
   into `~/.ssh` is judged as `~/.ssh`, and the bytes provably come from the
   approved file. `host_fs.write` refuses a symlink destination outright and
-  canonicalises the deepest existing ancestor, so the approved path is
+  canonicalises the deepest canonicalisable ancestor, so the approved path is
   where the bytes will land; `host_fs.list` lists the canonical directory.
   The residual race — a parent directory swapped between approval and
   rename — was tolerable under interactive review and is closed after

@@ -20,15 +20,17 @@
 //! at a name the operator approved as "to be created" is refused, not
 //! followed.
 //!
-//! On a target without the `openat` family the same interface is
-//! provided over paths — the milestone-1 behaviour the handle-based one
+//! On a target without the `openat` family and `fdopendir` — non-unix,
+//! and Redox, where nix has no `dir` module — the same interface is
+//! provided over paths (`cfg(dir_handles)`, from the build script,
+//! draws the line): the milestone-1 behaviour the handle-based one
 //! replaces, with the race it does not close.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(dir_handles)]
 use std::os::fd::OwnedFd;
 
 /// What a name inside a directory is, without following it.
@@ -53,6 +55,9 @@ pub struct Stat {
     pub size: u64,
     /// Its permissions, every bit.
     pub permissions: std::fs::Permissions,
+    /// Device and inode: what makes two names the same file. `None`
+    /// where the path-based fallback cannot say.
+    pub identity: Option<(u64, u64)>,
 }
 
 /// One entry of a listing: the name and what [`Dir::lstat`] said of it,
@@ -61,8 +66,10 @@ pub struct Stat {
 pub struct Entry {
     /// The entry's name, as the directory spells it.
     pub name: OsString,
-    /// Its metadata, or `None` where the entry vanished between being
-    /// listed and being asked about.
+    /// Its metadata, or `None` where the entry could not be asked about:
+    /// it vanished between being listed and being asked, or the
+    /// directory is readable but not searchable, so every entry is a
+    /// name and nothing more.
     pub stat: Option<Stat>,
 }
 
@@ -84,13 +91,13 @@ pub enum Hold {
 /// An open directory.
 #[derive(Debug)]
 pub struct Dir {
-    #[cfg(unix)]
+    #[cfg(dir_handles)]
     fd: OwnedFd,
-    #[cfg(not(unix))]
+    #[cfg(not(dir_handles))]
     path: PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(dir_handles)]
 fn flags(hold: Hold) -> nix::fcntl::OFlag {
     use nix::fcntl::OFlag;
     let access = match hold {
@@ -147,10 +154,18 @@ pub fn verify_named(canonical: &Path, held: (u64, u64)) -> io::Result<()> {
 }
 
 /// A symlink reached with `O_NOFOLLOW`, as each platform reports it.
-#[cfg(unix)]
+#[cfg(dir_handles)]
 fn is_nofollow_refusal(e: nix::errno::Errno) -> bool {
     use nix::errno::Errno;
-    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "hurd",
+        target_os = "cygwin"
+    ))]
     if e == Errno::EFTYPE {
         return true;
     }
@@ -161,15 +176,18 @@ impl Dir {
     /// Hold the directory at `path` open, following symlinks on the way
     /// — the caller canonicalises and verifies afterwards, through
     /// [`Dir::open_canonical`]. A path that is not a directory is
-    /// `NotADirectory`; one the agent's user may not search (or, for
-    /// [`Hold::Read`], read) is `PermissionDenied`.
+    /// `NotADirectory`; one the agent's user lacks the hold's permission
+    /// on is `PermissionDenied` — read, for [`Hold::Read`]; search, for
+    /// [`Hold::Search`] where the open checks it (`O_SEARCH` does;
+    /// `O_PATH` checks nothing on the directory itself, and the descent
+    /// meets the refusal instead).
     pub fn open(path: &Path, hold: Hold) -> io::Result<Dir> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             let fd = nix::fcntl::open(path, flags(hold), nix::sys::stat::Mode::empty())?;
             Ok(Dir { fd })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             let _ = hold;
             if !std::fs::metadata(path)?.is_dir() {
@@ -188,7 +206,7 @@ impl Dir {
     pub fn open_canonical(path: &Path, hold: Hold) -> io::Result<(Dir, PathBuf)> {
         let dir = Dir::open(path, hold)?;
         let canonical = std::fs::canonicalize(path)?;
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             let held = nix::sys::stat::fstat(&dir.fd)?;
             #[allow(clippy::unnecessary_cast)] // dev_t and ino_t vary by platform
@@ -201,7 +219,7 @@ impl Dir {
     /// symlink: a link at that name — whatever it points at — is
     /// `NotADirectory`, as a file is.
     pub fn open_child(&self, name: &OsStr) -> io::Result<Dir> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             let fd = nix::fcntl::openat(
                 &self.fd,
@@ -210,8 +228,8 @@ impl Dir {
                 nix::sys::stat::Mode::empty(),
             )
             .map_err(|e| {
-                // `O_NOFOLLOW` reports a link as ELOOP (EMLINK or EFTYPE
-                // on the BSDs), except where `O_PATH` lets the open reach
+                // `O_NOFOLLOW` reports a link as ELOOP (EMLINK on
+                // FreeBSD and DragonFly, EFTYPE on NetBSD), except where `O_PATH` lets the open reach
                 // the link itself and `O_DIRECTORY` then refuses it — one
                 // answer either way.
                 if is_nofollow_refusal(e) {
@@ -225,7 +243,7 @@ impl Dir {
             })?;
             Ok(Dir { fd })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             let path = self.path.join(name);
             let meta = std::fs::symlink_metadata(&path)?;
@@ -245,7 +263,7 @@ impl Dir {
     /// Make the directory `name` inside this one (mode `0o777`, less
     /// the umask). `AlreadyExists` if anything is at that name.
     pub fn mkdir(&self, name: &OsStr) -> io::Result<()> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             nix::sys::stat::mkdirat(
                 &self.fd,
@@ -254,7 +272,7 @@ impl Dir {
             )?;
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             std::fs::create_dir(self.path.join(name))
         }
@@ -262,7 +280,7 @@ impl Dir {
 
     /// What `name` is inside this directory, without following it.
     pub fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             use nix::sys::stat::SFlag;
             use std::os::unix::fs::PermissionsExt as _;
@@ -273,14 +291,15 @@ impl Dir {
                 SFlag::S_IFLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
-            #[allow(clippy::unnecessary_cast)] // mode_t and off_t vary by platform
+            #[allow(clippy::unnecessary_cast)] // mode_t, off_t, dev_t, ino_t vary by platform
             Ok(Stat {
                 kind,
                 size: st.st_size as u64,
                 permissions: std::fs::Permissions::from_mode((st.st_mode as u32) & 0o7777),
+                identity: Some((st.st_dev as u64, st.st_ino as u64)),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             let meta = std::fs::symlink_metadata(self.path.join(name))?;
             let t = meta.file_type();
@@ -295,6 +314,7 @@ impl Dir {
                 kind,
                 size: meta.len(),
                 permissions: meta.permissions(),
+                identity: None,
             })
         }
     }
@@ -304,7 +324,7 @@ impl Dir {
     /// rather than redirect it — born with `mode` (less the umask), open
     /// for writing.
     pub fn create_new(&self, name: &OsStr, mode: u32) -> io::Result<std::fs::File> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             use nix::fcntl::OFlag;
             let fd = nix::fcntl::openat(
@@ -320,7 +340,7 @@ impl Dir {
             )?;
             Ok(std::fs::File::from(fd))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             let _ = mode;
             std::fs::OpenOptions::new()
@@ -333,12 +353,12 @@ impl Dir {
     /// Rename `from` to `to`, both inside this directory: atomic, and
     /// replacing whatever entry is at `to`.
     pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             nix::fcntl::renameat(&self.fd, from, &self.fd, to)?;
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             std::fs::rename(self.path.join(from), self.path.join(to))
         }
@@ -346,12 +366,12 @@ impl Dir {
 
     /// Remove the file `name` from this directory.
     pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             nix::unistd::unlinkat(&self.fd, name, nix::unistd::UnlinkatFlags::NoRemoveDir)?;
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             std::fs::remove_file(self.path.join(name))
         }
@@ -364,7 +384,7 @@ impl Dir {
     pub fn list(&self, max: usize) -> io::Result<(Vec<Entry>, bool)> {
         let mut entries = Vec::new();
         let mut truncated = false;
-        #[cfg(unix)]
+        #[cfg(dir_handles)]
         {
             use std::os::unix::ffi::OsStrExt as _;
             // `fdopendir` takes the descriptor over, and a `Dir` may
@@ -386,7 +406,7 @@ impl Dir {
                 });
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(dir_handles))]
         {
             for entry in std::fs::read_dir(&self.path)? {
                 let entry = entry?;
@@ -420,7 +440,7 @@ pub fn temp_name(beside: &OsStr, nonce: u64) -> OsString {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(dir_handles)]
     #[test]
     fn a_descent_follows_no_symlink_whatever_it_points_at() {
         let tmp = tempfile::tempdir().unwrap();
@@ -447,7 +467,7 @@ mod tests {
         assert_eq!(plain.size, 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(dir_handles)]
     #[test]
     fn the_handle_outlives_its_name() {
         let tmp = tempfile::tempdir().unwrap();
@@ -462,7 +482,7 @@ mod tests {
         assert!(!tmp.path().join("here").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(dir_handles)]
     #[test]
     fn a_listing_comes_from_the_handle_and_leaves_out_the_dots() {
         let tmp = tempfile::tempdir().unwrap();
@@ -484,7 +504,7 @@ mod tests {
         assert!(truncated);
     }
 
-    #[cfg(unix)]
+    #[cfg(dir_handles)]
     #[test]
     fn a_created_file_is_born_with_its_mode() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -518,10 +538,11 @@ mod tests {
         let name = temp_name(OsStr::new(&long), 7);
         assert!(name.len() < 64, "{}", name.len());
         assert!(name.to_string_lossy().ends_with(".gwennol-tmp"));
-        // Cut on a character boundary, not inside one.
-        let multibyte = "é".repeat(40);
+        // Cut on a character boundary, not inside one: byte 24 falls
+        // inside the eighth euro sign, so the cut backs up to 22.
+        let multibyte = format!("a{}", "€".repeat(10));
         let name = temp_name(OsStr::new(&multibyte), 7).into_string().unwrap();
-        assert!(name.starts_with(".éééé"));
+        assert!(name.starts_with(".a€€€€€€€."), "{name}");
         assert_ne!(temp_name(OsStr::new("a"), 1), temp_name(OsStr::new("a"), 2));
     }
 }

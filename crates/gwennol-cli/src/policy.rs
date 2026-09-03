@@ -31,7 +31,7 @@
 //! workspace, `list:.` the workspace root alone. The host judges
 //! canonical paths, so the literal prefix of a pattern — every
 //! component before the first glob character — is spelled the way the
-//! host spells a path: its deepest existing ancestor canonical, the
+//! host spells a path: its deepest canonicalisable ancestor canonical, the
 //! rest as written. `write:/tmp/**` means what `/tmp` resolves to, and
 //! `write:link/new/**` means the link's target plus `new`, whether or
 //! not `new` exists yet. One exception mirrors the host's: a fully
@@ -393,7 +393,7 @@ fn is_glob_component(component: &str) -> bool {
 /// A path pattern as the host would spell the paths it matches: rooted
 /// at the workspace when relative, and with its literal prefix — every
 /// leading component that is a plain name — spelled by the host's own
-/// walk ([`deepest_canonical`]): the deepest existing ancestor
+/// walk ([`deepest_canonical`]): the deepest canonicalisable ancestor
 /// canonical, the rest as written. `..` folds lexically before the
 /// walk, as the host's path resolution folds it before asking; one
 /// that arrives after a glob component cannot fold and is refused
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn the_prefix_walks_back_to_the_deepest_existing_ancestor() {
-        // The host approves a write under the deepest existing
+        // The host approves a write under the deepest canonicalisable
         // ancestor canonical plus the rest as spelled; a pattern through
         // a symlink to a directory that does not exist yet must spell
         // the same path — canonicalising all or nothing would fall

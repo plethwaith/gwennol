@@ -14,7 +14,7 @@
 //! file — read-only, side-effect free, non-blocking — *before* asking, so
 //! the approval can be verified to name the very file the handle holds;
 //! `host_fs.write` and `host_fs.list` likewise hold their directory —
-//! the destination's deepest existing ancestor, the directory to be
+//! the destination's deepest canonicalisable ancestor, the directory to be
 //! listed — open before asking, verified the same way, and do everything
 //! after the approval relative to that handle ([`dir`]).
 //!

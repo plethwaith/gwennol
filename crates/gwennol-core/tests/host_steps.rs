@@ -716,6 +716,16 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let made = made.expect("not a step error");
     assert_eq!(made["w"]["outcome"], "permission_denied");
+    // The destination as asked for, whichever ancestor the platform's
+    // handle caught the refusal at (`O_PATH` holds the sealed directory
+    // and meets it a level down; `O_SEARCH` refuses the hold).
+    assert_eq!(
+        made["w"]["message"],
+        format!(
+            "permission denied: {}",
+            dir.join("inner/deeper/new.txt").display()
+        )
+    );
     assert!(!dir.join("inner/deeper").exists(), "nothing was created");
     assert!(
         f.requests_for("writer")
@@ -731,6 +741,10 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
     );
     let written = written.expect("not a step error");
     assert_eq!(written["w"]["outcome"], "permission_denied");
+    assert_eq!(
+        written["w"]["message"],
+        format!("permission denied: {}", dir.join("inner/new.txt").display())
+    );
     assert!(
         f.requests_for("plain_writer")
             .contains(&Access::WriteFile(dir.join("inner/new.txt"))),
@@ -828,7 +842,7 @@ async fn fs_steps_name_their_outcome_on_success() {
 }
 
 /// A read of a missing file is a `not_found` result — and the operator
-/// was asked first, about the path canonical up to its deepest existing
+/// was asked first, about the path canonical up to its deepest canonicalisable
 /// ancestor, so a plugin cannot learn what exists without every probe
 /// crossing the approval surface.
 #[tokio::test]
@@ -1867,7 +1881,7 @@ async fn a_directory_swapped_after_the_approval_is_not_what_gets_listed() {
     );
 }
 
-/// A symlink at a component below the deepest existing ancestor is not
+/// A symlink at a component below the deepest canonicalisable ancestor is not
 /// followed whether it was planted after the approval or was always
 /// there: a dangling link is `not_a_directory` naming it, with or
 /// without `create_dirs`, and the approval spells the link as given.

@@ -14,7 +14,7 @@
 //! I/O errors nobody can act on.
 //!
 //! Every miss is still approved first. The operator sees the path the
-//! plugin probed — canonical up to its deepest existing ancestor, since a
+//! plugin probed — canonical up to its deepest canonicalisable ancestor, since a
 //! missing file has no canonical path of its own — before the plugin
 //! learns that nothing is there.
 
@@ -110,15 +110,6 @@ impl Outcome {
     }
 }
 
-/// Turn an I/O error at `path` into either a data outcome or a step
-/// error. `what` names the operation for the error message.
-fn outcome_or_error(what: &str, path: &Path, e: std::io::Error) -> Result<StepOutput, StepError> {
-    match Outcome::classify(&e) {
-        Some(outcome) => Ok(outcome.result(path)),
-        None => Err(StepError::Failed(format!("{what} {}: {e}", path.display()))),
-    }
-}
-
 /// `host_fs.read`: `{path, max_bytes?}` → `{outcome: "ok", content,
 /// truncated, size}`, or `{outcome, message}` for a miss.
 ///
@@ -181,7 +172,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             Ok(opened) => opened,
             // No handle to bind an approval to — but the operator still
             // sees the probe before the plugin learns its answer. The
-            // path is approved canonical up to its deepest existing
+            // path is approved canonical up to its deepest canonicalisable
             // ancestor, the closest thing a missing file has to a
             // canonical path.
             Err(e) => {
@@ -241,9 +232,11 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
     })
 }
 
-/// Resolve a path that need not exist: the deepest existing ancestor is
-/// canonicalised — a symlinked directory resolves to where it really
-/// leads — and the not-yet-existing remainder is appended as spelled.
+/// Resolve a path that need not exist: the deepest ancestor that
+/// canonicalises — a symlinked directory resolves to where it really
+/// leads; a component that is a file, or that may not be searched, ends
+/// the walk like a missing one — and the remainder is appended as
+/// spelled.
 /// This is the path a write approval names, and the path a miss is
 /// approved under; a frontend that judges those paths by pattern must
 /// spell its patterns the same way, which is why this is public and
@@ -338,10 +331,11 @@ fn destination_answer(
 }
 
 /// Where a write is anchored: the path the operator judges, the handle
-/// on its deepest existing ancestor, and the names below.
+/// on its deepest canonicalisable ancestor, and the names below.
 struct Anchored {
     /// The approved path: what [`deepest_canonical`] spells for the
-    /// destination.
+    /// destination — except a symlink destination, approved under its
+    /// own name with its parent canonical.
     approved: PathBuf,
     /// The anchor as canonicalised — a prefix of `approved`, and the
     /// path a message about the ancestor itself names.
@@ -393,19 +387,35 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
     // to — on a case-insensitive filesystem the name on disk, not the
     // one spelled — because that is what `deepest_canonical` spells for
     // it and so what a frontend's patterns match; and it is written
-    // under that name too. The canonical path is checked to lie in the
-    // anchor, so a link that turned up meanwhile is refused rather than
-    // have its target approved under the anchor's name.
+    // under that name too. The canonicalisation is by path, the one
+    // step here that is, so what it names is checked through the
+    // handle: the name on disk must lie in the anchor *and* be the very
+    // file the spelled name was (by device and inode), or a link that
+    // turned up meanwhile — to a sibling, say — is refused rather than
+    // have its target approved and replaced.
     let mut dest_is_symlink = false;
     if below.is_empty()
         && let Ok(dir) = &dir
     {
         match dir.lstat(&name) {
             Ok(stat) if stat.kind == Kind::Symlink => dest_is_symlink = true,
-            Ok(_) => match std::fs::canonicalize(path) {
+            Ok(spelled) => match std::fs::canonicalize(path) {
                 Ok(canonical) if canonical.parent() == Some(&anchor) => {
-                    if let Some(on_disk) = canonical.file_name() {
+                    let on_disk = canonical
+                        .file_name()
+                        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+                    let same = match dir.lstat(on_disk) {
+                        Ok(named) => match (spelled.identity, named.identity) {
+                            (Some(a), Some(b)) => a == b,
+                            // The path fallback closes no race.
+                            _ => true,
+                        },
+                        Err(_) => false,
+                    };
+                    if same {
                         name = on_disk.to_os_string();
+                    } else {
+                        dest_is_symlink = true;
                     }
                 }
                 Ok(_) => dest_is_symlink = true,
@@ -575,7 +585,7 @@ async fn fill_temp(
 /// a non-directory in the way, permission denied, a symlink).
 ///
 /// The approved path is what [`deepest_canonical`] spells for the
-/// destination — canonical up to its deepest existing ancestor, so the
+/// destination — canonical up to its deepest canonicalisable ancestor, so the
 /// operator judges where the bytes will actually land, not an alias —
 /// and that ancestor is *held open* before the approval, verified to be
 /// what the canonical path names, and is what every operation after the
@@ -685,7 +695,7 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         .await
         .map_err(failed)?;
         if let Err(e) = renamed {
-            return outcome_or_error("write", &approved, e);
+            return destination_answer("write", &approved, &path, e);
         }
         Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into())
     })
@@ -731,7 +741,7 @@ pub fn fs_list<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
         let (dir, canonical) = match opened {
             Ok(opened) => opened,
             // Nothing to list, or nothing this user may — approved as a
-            // probe of the deepest existing ancestor plus the spelled
+            // probe of the deepest canonicalisable ancestor plus the spelled
             // remainder, then answered as data.
             Err(e) => {
                 let Some(outcome) = Outcome::classify(&e) else {
