@@ -17,7 +17,9 @@
 //!   reason, an unknown stream event, a block the closed schemas do not
 //!   admit: the turn fails as [`TurnError::Contract`] rather than being
 //!   guessed at. A stream that ends without its `end` event is a failed
-//!   turn ([`TurnError::StreamEnded`]), never a short answer.
+//!   turn ([`TurnError::StreamEnded`]), never a short answer — unless
+//!   the turn's token has fired, in which case it is the cut arriving
+//!   ([`TurnError::Cancelled`]).
 //! - **A streamed assistant message is rebuilt** as the events in
 //!   order — adjacent text coalesced, `tool_use` and `opaque` blocks
 //!   whole and in place — and replayed verbatim on the next round. The
@@ -691,6 +693,24 @@ impl Session {
         loop {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
+                // The turn's token is the authority once it has fired:
+                // a stream that ends then, or fails on the read itself
+                // with the relay's own I/O error, is the cut arriving,
+                // not a vendor hanging up. The http step's body guard
+                // ends the body the instant the step's token fires;
+                // whether the reader sees the token or the ended body
+                // first is a race, and the token settles it. The error
+                // it folds goes to the log, as at the other two sites.
+                // A contract violation coinciding with the cut — a
+                // line that is not JSON, a code the loop's own table
+                // does not carry — is still a contract violation.
+                Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
+                Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
+                    if cancel.is_cancelled() =>
+                {
+                    tracing::info!(error = %e, "stream ended by the turn's cancellation");
+                    return Err(TurnError::Cancelled);
+                }
                 Ok(None) => return Err(TurnError::StreamEnded),
                 Err(e) => return Err(stream_read_failure(e)),
             };
