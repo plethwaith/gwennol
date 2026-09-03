@@ -90,11 +90,17 @@ opens sockets.
   operator that canonical path, and reads from that same handle — a symlink
   into `~/.ssh` is judged as `~/.ssh`, and the bytes provably come from the
   approved file. `host_fs.write` refuses a symlink destination outright and
-  canonicalises the deepest existing ancestor, so the approved path is
+  canonicalises the deepest canonicalisable ancestor, so the approved path is
   where the bytes will land; `host_fs.list` lists the canonical directory.
   The residual race — a parent directory swapped between approval and
-  rename — is tolerable under interactive review; the milestone-6 policy
-  file should close it with directory-handle (`openat`-family) I/O.
+  rename — was tolerable under interactive review and is closed after
+  milestone 6 with directory-handle (`openat`-family) I/O: the deepest
+  canonicalisable ancestor is held open before the approval, verified to be
+  what the approved path names, and everything after the approval —
+  the directories `create_dirs` makes, the temporary, the rename — is
+  relative to that handle, following no symlink below it. `host_fs.list`
+  holds the directory it lists the same way, so a directory swapped
+  after its approval is not what gets listed.
 
 ### 2. SPI contracts
 
@@ -349,7 +355,10 @@ prompt exists to paper over it.
 - **Owed to milestone 1:** the directory-handle (`openat`-family)
   write that closes the parent-swap race the milestone-1 approval
   tolerated under interactive review. It is a `gwennol-core` change,
-  not a frontend one, and follows as its own change.
+  not a frontend one, and landed as its own change after this
+  milestone (`steps::dir`, which `host_fs.list` shares), pinned by a
+  write and a listing whose directory is swapped for a symlink while
+  the approval is held open.
 
 ### 7. TUI
 

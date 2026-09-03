@@ -223,6 +223,28 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_fs.write"],
             json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
         ),
+        // Two more held writers, one per swap pin: the gate is per
+        // plugin name and the pins run in parallel.
+        plugin(
+            "gated_writer_swap",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
+        ),
+        plugin(
+            "gated_writer_plant",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
+        ),
+        plugin(
+            "gated_lister",
+            &["step_type:host_fs.list"],
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}}]),
+        ),
+        plugin(
+            "gated_lister_cancel",
+            &["step_type:host_fs.list"],
+            json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": 10}}]),
+        ),
         plugin(
             "gated_runner",
             &["step_type:host_process.run"],
@@ -699,6 +721,16 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let made = made.expect("not a step error");
     assert_eq!(made["w"]["outcome"], "permission_denied");
+    // The destination as asked for, whichever ancestor the platform's
+    // handle caught the refusal at (`O_PATH` holds the sealed directory
+    // and meets it a level down; `O_SEARCH` refuses the hold).
+    assert_eq!(
+        made["w"]["message"],
+        format!(
+            "permission denied: {}",
+            dir.join("inner/deeper/new.txt").display()
+        )
+    );
     assert!(!dir.join("inner/deeper").exists(), "nothing was created");
     assert!(
         f.requests_for("writer")
@@ -714,6 +746,10 @@ async fn fs_list_and_write_report_an_unsearchable_ancestor_as_permission_denied(
     );
     let written = written.expect("not a step error");
     assert_eq!(written["w"]["outcome"], "permission_denied");
+    assert_eq!(
+        written["w"]["message"],
+        format!("permission denied: {}", dir.join("inner/new.txt").display())
+    );
     assert!(
         f.requests_for("plain_writer")
             .contains(&Access::WriteFile(dir.join("inner/new.txt"))),
@@ -811,7 +847,7 @@ async fn fs_steps_name_their_outcome_on_success() {
 }
 
 /// A read of a missing file is a `not_found` result — and the operator
-/// was asked first, about the path canonical up to its deepest existing
+/// was asked first, about the path canonical up to its deepest canonicalisable
 /// ancestor, so a plugin cannot learn what exists without every probe
 /// crossing the approval surface.
 #[tokio::test]
@@ -1696,6 +1732,320 @@ async fn a_write_withdrawn_at_its_prompt_leaves_nothing_behind() {
     assert!(
         !f.workspace.join("gated-out").exists(),
         "nothing was created before the approval"
+    );
+}
+
+/// Run `plugin` with its approval held open, do `meanwhile` while it
+/// is, then let the answer through and return the invocation's result:
+/// the harness for what a write does when the world changes between
+/// the approval and the work. Its pins are the directory-handle
+/// guarantees, which the path-based fallback does not make.
+#[cfg(dir_handles)]
+async fn with_the_prompt_held(
+    plugin: &'static str,
+    input: Value,
+    meanwhile: impl FnOnce(),
+) -> Result<Value, KernelError> {
+    let f = fixture();
+    let gate = f.operator.gates.gate(plugin);
+    let running = tokio::spawn(async move {
+        fixture()
+            .kernel
+            .execute(plugin, "go", input)
+            .with_config(&json!({}))
+            .run()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{plugin} never asked the operator"));
+    meanwhile();
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap_or_else(|_| panic!("{plugin}: the write never finished"))
+        .unwrap()
+        .map(|r| Value::Object(r.step_results.into_iter().collect()))
+}
+
+/// The parent-swap race the milestone-1 approval tolerated: the operator
+/// approves `swap/dir/t.txt`, and before the write happens `swap/dir`
+/// is renamed away and a symlink to somewhere else put in its place.
+/// The bytes land in the directory that was approved — wherever its
+/// name has gone — and never where the link points, because nothing
+/// after the approval resolves the parent by name again.
+#[cfg(dir_handles)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_swapped_after_the_approval_cannot_redirect_the_write() {
+    let f = fixture();
+    let dir = f.workspace.join("swap/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    let out = with_the_prompt_held(
+        "gated_writer_swap",
+        json!({"path": "swap/dir/t.txt", "content": "landed"}),
+        || {
+            std::fs::rename(&dir, f.workspace.join("swap/moved")).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        },
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(
+        f.requests_for("gated_writer_swap"),
+        vec![Access::WriteFile(dir.join("t.txt"))]
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("swap/moved/t.txt")).unwrap(),
+        "landed",
+        "the bytes did not land in the approved directory"
+    );
+    assert!(
+        !outside.join("t.txt").exists(),
+        "the write followed the swapped-in link"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("swap/moved"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+/// The same race one level down: a directory the operator approved as
+/// "to be created" turns up as a symlink by the time `create_dirs`
+/// reaches it. The descent follows no link, so the answer is
+/// `not_a_directory` for that component, as data, and nothing lands
+/// where the link points.
+#[cfg(dir_handles)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_planted_where_a_directory_was_approved_is_not_followed() {
+    let f = fixture();
+    let base = f.workspace.join("plant");
+    std::fs::create_dir_all(&base).unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    let out = with_the_prompt_held(
+        "gated_writer_plant",
+        json!({"path": "plant/made/t.txt", "content": "never"}),
+        || std::os::unix::fs::symlink(&outside, base.join("made")).unwrap(),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "not_a_directory", "{out}");
+    assert!(
+        out["w"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(&base.join("made").display().to_string()),
+        "the message names the component in the way: {out}"
+    );
+    assert_eq!(
+        f.requests_for("gated_writer_plant"),
+        vec![Access::WriteFile(base.join("made/t.txt"))]
+    );
+    assert!(
+        !outside.join("t.txt").exists(),
+        "the write followed the planted link"
+    );
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "something landed through the link"
+    );
+}
+
+/// The listing's version of the same race: the operator approves
+/// `lswap/dir`, and before it is read the directory is renamed away
+/// and a symlink to somewhere else put in its place. What comes back is
+/// the directory that was approved, not what the link points at.
+#[cfg(dir_handles)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_swapped_after_the_approval_is_not_what_gets_listed() {
+    let f = fixture();
+    let dir = f.workspace.join("lswap/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inside"), "x").unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    std::fs::write(outside.join("elsewhere"), "y").unwrap();
+    let out = with_the_prompt_held("gated_lister", json!({"dir": "lswap/dir"}), || {
+        std::fs::rename(&dir, f.workspace.join("lswap/moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+    })
+    .await
+    .expect("not a step error");
+    assert_eq!(out["l"]["outcome"], "ok", "{out}");
+    assert_eq!(f.requests_for("gated_lister"), vec![Access::ListDir(dir)]);
+    let names: Vec<_> = out["l"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["inside".to_string()],
+        "listed through the swapped-in link"
+    );
+}
+
+/// A symlink at a component below the deepest canonicalisable ancestor is not
+/// followed whether it was planted after the approval or was always
+/// there: a dangling link is `not_a_directory` naming it, with or
+/// without `create_dirs`, and the approval spells the link as given.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_reports_a_dangling_link_in_the_path_as_not_a_directory() {
+    let f = fixture();
+    std::os::unix::fs::symlink("nowhere", f.workspace.join("dangle")).unwrap();
+    for plugin in ["plain_writer", "writer"] {
+        let out = run(
+            plugin,
+            json!({"path": "dangle/x.txt", "content": "z", "dir": "."}),
+        )
+        .await
+        .expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "not_a_directory", "{plugin}: {out}");
+        assert!(
+            out["w"]["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(&f.workspace.join("dangle").display().to_string()),
+            "{plugin}: {out}"
+        );
+        assert!(
+            f.requests_for(plugin)
+                .contains(&Access::WriteFile(f.workspace.join("dangle/x.txt"))),
+            "{plugin}: asked before answering"
+        );
+    }
+    assert!(!f.workspace.join("nowhere").exists());
+}
+
+/// An existing destination is approved under the name the path
+/// canonicalises to, which is what `deepest_canonical` spells for it
+/// and so what a frontend's patterns match — on a case-insensitive
+/// filesystem the name on disk, not the one spelled — and is written
+/// under that name.
+#[tokio::test]
+async fn fs_write_approves_an_existing_file_as_deepest_canonical_spells_it() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("Cased.txt"), "before").unwrap();
+    let asked_for = f.workspace.join("cased.txt");
+    let spelled = gwennol_core::steps::fs::deepest_canonical(&asked_for).unwrap();
+    let out = run(
+        "plain_writer",
+        json!({"path": "cased.txt", "content": "after"}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert!(
+        f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(spelled.clone())),
+        "approved under a name the walk would not spell"
+    );
+    assert_eq!(std::fs::read_to_string(&spelled).unwrap(), "after");
+}
+
+/// A listing withdrawn at its prompt lists nothing: the directory is
+/// held, but not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_withdrawn_at_its_prompt_lists_nothing() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("unlisted")).unwrap();
+    std::fs::write(f.workspace.join("unlisted/secret"), "x").unwrap();
+    cancel_at_the_prompt("gated_lister_cancel", json!({"dir": "unlisted"})).await;
+    assert_eq!(
+        f.requests_for("gated_lister_cancel"),
+        vec![Access::ListDir(f.workspace.join("unlisted"))]
+    );
+}
+
+/// A listing names what each entry is, without following a link.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_list_names_the_kind_of_each_entry() {
+    let f = fixture();
+    let dir = f.workspace.join("kinds");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("plain"), "abc").unwrap();
+    std::os::unix::fs::symlink("sub", dir.join("to-sub")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+    let out = run("lister", json!({"dir": "kinds", "max": 10}))
+        .await
+        .expect("not a step error");
+    let kinds: Vec<(String, String)> = out["l"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().into(),
+                e["kind"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("dangling".into(), "symlink".into()),
+            ("plain".into(), "file".into()),
+            ("sub".into(), "dir".into()),
+            ("to-sub".into(), "symlink".into()),
+        ]
+    );
+}
+
+/// A destination whose name is as long as a name may be still leaves
+/// room for the temporary beside it.
+#[tokio::test]
+async fn fs_write_takes_a_name_as_long_as_names_go() {
+    let f = fixture();
+    let name = "n".repeat(255);
+    let out = run("plain_writer", json!({"path": name, "content": "long"}))
+        .await
+        .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join(&name)).unwrap(),
+        "long"
+    );
+}
+
+/// A drop box — a directory the agent's user may search and write but
+/// not read — takes a write: the hold needs no read permission.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_into_a_drop_box_needs_no_read_permission() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let dir = f.workspace.join("dropbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o311)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: this user (root?) reads a mode-311 directory anyway");
+        return;
+    }
+    let out = run(
+        "plain_writer",
+        json!({"path": "dropbox/dropped.txt", "content": "in"}),
+    )
+    .await;
+    let dropped = std::fs::read_to_string(dir.join("dropped.txt"));
+    // Listing it is another matter: that needs read permission, and
+    // the directory's refusal is data — on both builds.
+    let listed = run("lister", json!({"dir": "dropbox", "max": 10})).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = out.expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(dropped.unwrap(), "in");
+    let listed = listed.expect("not a step error");
+    assert_eq!(listed["l"]["outcome"], "permission_denied", "{listed}");
+    assert!(
+        f.requests_for("lister")
+            .contains(&Access::ListDir(dir.clone())),
+        "the listing was not approved as a probe first"
     );
 }
 

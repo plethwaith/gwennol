@@ -20,6 +20,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The path-based directory fallback's Redox shape, linted (see the
+      # Tests job for what running it covers).
+      - run: cargo clippy --locked -p gwennol-core --all-targets -- -D warnings
+        env:
+          GWENNOL_NO_DIR_HANDLES: "1"
 
   test:
     name: Tests
@@ -33,6 +38,13 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
+      # The path-based directory fallback (non-unix, Redox) has no runner
+      # here; forcing its cfg off on this one runs its Redox shape (unix
+      # without handles), less the pins of the guarantees only handles
+      # make. The non-unix arms still compile nowhere in CI.
+      - run: cargo test --locked -p gwennol-core
+        env:
+          GWENNOL_NO_DIR_HANDLES: "1"
       # The documented bundling command, as a user would run it: the
       # committed manifests plus compiled guests, into target/bundle.
       - run: cargo xtask bundle
@@ -40,6 +52,22 @@ jobs:
       # else) reaching outside the crate directory, which builds from the
       # repo but not from the packaged tarball.
       - run: cargo package -p gwennol-core --locked
+
+  test-macos:
+    # The other platform the host steps' directory handles have a
+    # distinct branch on: `O_SEARCH` where Linux has `O_PATH`, and a
+    # case-insensitive default filesystem. (The BSD errnos for a refused
+    # `O_NOFOLLOW` run nowhere here; macOS returns ELOOP like Linux.)
+    # The substrate's wasm build is the same on both.
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace
 
   msrv:
     name: MSRV (1.94)

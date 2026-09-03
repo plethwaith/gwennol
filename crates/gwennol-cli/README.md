@@ -78,7 +78,7 @@ workspace, `read:/**` every file anywhere, `list:**` every directory
 under the workspace and the workspace, `list:.` the workspace root
 alone. The host judges canonical paths, so a pattern's literal prefix
 — the components before the first glob character — is spelled the way
-the host spells a path: its deepest existing ancestor canonical, the
+the host spells a path: its deepest canonicalisable ancestor canonical, the
 rest as written. `write:/tmp/**` means what `/tmp` resolves to (on
 macOS, `/private/tmp`), and `write:link/new/**` the link's target
 plus `new`, whether or not `new` exists yet. One exception mirrors the
