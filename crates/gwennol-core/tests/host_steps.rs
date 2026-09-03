@@ -223,6 +223,18 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_fs.write"],
             json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
         ),
+        // Two more held writers, one per swap pin: the gate is per
+        // plugin name and the pins run in parallel.
+        plugin(
+            "gated_writer_swap",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
+        ),
+        plugin(
+            "gated_writer_plant",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "create_dirs": true}}]),
+        ),
         plugin(
             "gated_runner",
             &["step_type:host_process.run"],
@@ -1696,6 +1708,123 @@ async fn a_write_withdrawn_at_its_prompt_leaves_nothing_behind() {
     assert!(
         !f.workspace.join("gated-out").exists(),
         "nothing was created before the approval"
+    );
+}
+
+/// Run `plugin` with its approval held open, do `meanwhile` while it
+/// is, then let the answer through and return the invocation's result:
+/// the harness for what a write does when the world changes between
+/// the approval and the work.
+async fn with_the_prompt_held(
+    plugin: &'static str,
+    input: Value,
+    meanwhile: impl FnOnce(),
+) -> Result<Value, KernelError> {
+    let f = fixture();
+    let gate = f.operator.gates.gate(plugin);
+    let running = tokio::spawn(async move {
+        fixture()
+            .kernel
+            .execute(plugin, "go", input)
+            .with_config(&json!({}))
+            .run()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{plugin} never asked the operator"));
+    meanwhile();
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap_or_else(|_| panic!("{plugin}: the write never finished"))
+        .unwrap()
+        .map(|r| Value::Object(r.step_results.into_iter().collect()))
+}
+
+/// The parent-swap race the milestone-1 approval tolerated: the operator
+/// approves `swap/dir/t.txt`, and before the write happens `swap/dir`
+/// is renamed away and a symlink to somewhere else put in its place.
+/// The bytes land in the directory that was approved — wherever its
+/// name has gone — and never where the link points, because nothing
+/// after the approval resolves the parent by name again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_swapped_after_the_approval_cannot_redirect_the_write() {
+    let f = fixture();
+    let dir = f.workspace.join("swap/dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    let out = with_the_prompt_held(
+        "gated_writer_swap",
+        json!({"path": "swap/dir/t.txt", "content": "landed"}),
+        || {
+            std::fs::rename(&dir, f.workspace.join("swap/moved")).unwrap();
+            std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        },
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "ok", "{out}");
+    assert_eq!(
+        f.requests_for("gated_writer_swap"),
+        vec![Access::WriteFile(dir.join("t.txt"))]
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("swap/moved/t.txt")).unwrap(),
+        "landed",
+        "the bytes did not land in the approved directory"
+    );
+    assert!(
+        !outside.join("t.txt").exists(),
+        "the write followed the swapped-in link"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("swap/moved"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+/// The same race one level down: a directory the operator approved as
+/// "to be created" turns up as a symlink by the time `create_dirs`
+/// reaches it. The descent follows no link, so the answer is
+/// `not_a_directory` for that component, as data, and nothing lands
+/// where the link points.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_planted_where_a_directory_was_approved_is_not_followed() {
+    let f = fixture();
+    let base = f.workspace.join("plant");
+    std::fs::create_dir_all(&base).unwrap();
+    let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    let out = with_the_prompt_held(
+        "gated_writer_plant",
+        json!({"path": "plant/made/t.txt", "content": "never"}),
+        || std::os::unix::fs::symlink(&outside, base.join("made")).unwrap(),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "not_a_directory", "{out}");
+    assert!(
+        out["w"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with(&base.join("made").display().to_string()),
+        "the message names the component in the way: {out}"
+    );
+    assert_eq!(
+        f.requests_for("gated_writer_plant"),
+        vec![Access::WriteFile(base.join("made/t.txt"))]
+    );
+    assert!(
+        !outside.join("t.txt").exists(),
+        "the write followed the planted link"
+    );
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "something landed through the link"
     );
 }
 

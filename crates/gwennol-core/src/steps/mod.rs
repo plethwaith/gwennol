@@ -12,7 +12,10 @@
 //!
 //! One deliberate exception to that ordering: `host_fs.read` opens the
 //! file — read-only, side-effect free, non-blocking — *before* asking, so
-//! the approval can be verified to name the very file the handle holds.
+//! the approval can be verified to name the very file the handle holds;
+//! `host_fs.write` likewise holds the destination's deepest existing
+//! directory open before asking, and does everything after the approval
+//! relative to that handle ([`dir`]).
 //!
 //! They are published to plugins by the `host_fs`, `host_process` and
 //! `host_http` manifests in `resources/` as `host_fs.read`, `host_fs.write`,
@@ -20,6 +23,7 @@
 //! None is `freelyUsable`: a plugin must hold the matching `step_type:host_`
 //! grant, which the kernel enforces at dispatch.
 
+pub mod dir;
 pub mod fs;
 pub mod http;
 pub mod process;

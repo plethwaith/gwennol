@@ -18,6 +18,7 @@
 //! missing file has no canonical path of its own — before the plugin
 //! learns that nothing is there.
 
+use std::ffi::{OsStr, OsString};
 use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,7 @@ use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use super::dir::{Dir, Kind};
 use super::{
     StepFuture, bool_param, cancelled, capped, lossy_capped, or_cancelled, resolve, str_param,
     u64_param,
@@ -252,15 +254,22 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
 /// synchronous — the one walk, for the host and for whoever needs to
 /// agree with it by construction.
 pub fn deepest_canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let (_, mut canonical, below) = split_at_existing(path)?;
+    canonical.extend(below);
+    Ok(canonical)
+}
+
+/// The walk behind [`deepest_canonical`]: the deepest ancestor of `path`
+/// that canonicalises — as spelled, and canonical — and the components
+/// below it, in order.
+fn split_at_existing(path: &Path) -> std::io::Result<(&Path, PathBuf, Vec<OsString>)> {
     let mut existing = path;
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut below: Vec<OsString> = Vec::new();
     loop {
         match std::fs::canonicalize(existing) {
-            Ok(mut canonical) => {
-                for component in rest.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
+            Ok(canonical) => {
+                below.reverse();
+                return Ok((existing, canonical, below));
             }
             // A component that exists but is not a directory, or one
             // the agent's user may not search, ends the walk the same
@@ -276,7 +285,7 @@ pub fn deepest_canonical(path: &Path) -> std::io::Result<PathBuf> {
                         | std::io::ErrorKind::PermissionDenied
                 ) =>
             {
-                rest.push(
+                below.push(
                     existing
                         .file_name()
                         .ok_or_else(|| std::io::Error::other("path has no file name"))?
@@ -301,39 +310,206 @@ async fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
         .map_err(std::io::Error::other)?
 }
 
-/// Create an exclusive (`create_new`) temporary sibling of `dest`, named
-/// with a random nonce — so a file or symlink planted at a guessed name
-/// makes creation *fail* rather than redirect the write. With `restrict`
-/// (used when replacing an existing file) the temporary is born 0600, so
-/// its content is never readable beyond what the destination allowed —
-/// there is no create-then-chmod gap in which another opener can grab a
-/// readable fd.
-async fn create_temp_sibling(
-    dest: &Path,
-    restrict: bool,
-) -> std::io::Result<(tokio::fs::File, PathBuf)> {
-    let parent = dest
+/// Run `work` on the blocking pool: a few syscalls that must not park
+/// a runtime worker, in one hop.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, StepError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| StepError::Failed(format!("blocking work failed: {e}")))
+}
+
+/// Where a write is anchored: the path the operator judges, the handle
+/// on its deepest existing ancestor, and the names below.
+struct Anchored {
+    /// The approved path — the anchor canonical, the rest as spelled:
+    /// [`deepest_canonical`] of the parent, plus the destination's name.
+    approved: PathBuf,
+    /// The anchor as canonicalised — a prefix of `approved`, and the
+    /// path a message about the ancestor itself names.
+    anchor: PathBuf,
+    /// The handle on the anchor, or why it could not be held: it is a
+    /// file (`NotADirectory`) or the agent's user may not search it
+    /// (`PermissionDenied`) — the destination's answer, given after the
+    /// approval as data like any other.
+    dir: std::io::Result<Dir>,
+    /// The names below the anchor in order, the last the destination's
+    /// own. Every one before it was missing when the anchor was found.
+    below: Vec<OsString>,
+    /// The destination is a symlink: refused after the approval, as
+    /// data.
+    dest_is_symlink: bool,
+}
+
+/// Find and hold a write's anchor. Opening a directory for search has
+/// no side effects, so this precedes the approval — the read path's
+/// exception, shared — and the approval can then name the very
+/// directory the handle holds.
+fn anchor(path: &Path) -> std::io::Result<Anchored> {
+    let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
-    let name = dest
+    let name = path
         .file_name()
-        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_os_string();
+    let (existing, walked, mut below) = split_at_existing(parent)?;
+    below.push(name.clone());
+    let (dir, anchor) = match Dir::open_canonical(existing) {
+        Ok((dir, canonical)) => (Ok(dir), canonical),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            (Err(e), walked)
+        }
+        Err(e) => return Err(e),
+    };
+    // Only a destination whose parent is the anchor can exist at all —
+    // and an unanswerable `lstat` here (unsearchable through the
+    // handle, say) is answered as data once the approval is given.
+    let dest_is_symlink = below.len() == 1
+        && dir
+            .as_ref()
+            .ok()
+            .and_then(|dir| dir.lstat(&name).ok())
+            .is_some_and(|stat| stat.kind == Kind::Symlink);
+    let mut approved = anchor.clone();
+    approved.extend(&below);
+    Ok(Anchored {
+        approved,
+        anchor,
+        dir,
+        below,
+        dest_is_symlink,
+    })
+}
+
+/// What a write holds once its approval is given and its ground is
+/// prepared: the destination's directory, open; the temporary made in
+/// it, open for writing; and what the destination's permissions are to
+/// be, if it is being replaced.
+struct Prepared {
+    dir: Dir,
+    name: OsString,
+    tmp: OsString,
+    file: std::fs::File,
+    dest_perms: Option<std::fs::Permissions>,
+}
+
+/// Between the approval and the bytes, everything relative to the
+/// anchor: descend through the missing directories — making them with
+/// `create_dirs`, following no symlink — classify the destination, and
+/// create the temporary beside it. What is not a [`Prepared`] is the
+/// step's answer: an outcome as data, or an error.
+fn prepare(
+    mut dir: Dir,
+    mut at: PathBuf,
+    mut below: Vec<OsString>,
+    create_dirs: bool,
+    approved: &Path,
+    path: &Path,
+) -> Result<Prepared, Result<StepOutput, StepError>> {
+    let Some(name) = below.pop() else {
+        return Err(Err(StepError::Failed("path has no file name".into())));
+    };
+    let what = if create_dirs { "mkdir" } else { "write" };
+    for component in below {
+        at.push(&component);
+        if create_dirs {
+            match dir.mkdir(&component) {
+                Ok(()) => {}
+                // Made meanwhile by someone else — or something else is
+                // in the way, which the descent reports.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(outcome_or_error(what, &at, e)),
+            }
+        }
+        dir = match dir.open_child(&component) {
+            Ok(dir) => dir,
+            // A file — or a symlink, which the descent does not follow
+            // whatever it points at: the operator approved a directory
+            // to be made here, not a link to be followed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+                return Err(Ok(Outcome::NotADirectory.result(&at)));
+            }
+            // Still missing (and `create_dirs` not asked for): the
+            // destination's answer, under the path that was asked for.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Ok(Outcome::NotFound.result(path)));
+            }
+            // Not searchable, say — the handle on the ancestor may be
+            // held without the permission the descent needs.
+            Err(e) => return Err(outcome_or_error(what, &at, e)),
+        };
+    }
+    // Whether this replaces an existing file decides both the
+    // temporary's birth mode and the permissions it ends with.
+    let dest_perms = match dir.lstat(&name) {
+        Ok(stat) if stat.kind == Kind::Directory => {
+            return Err(Ok(Outcome::IsDirectory.result(path)));
+        }
+        // Planted since the anchor looked: the same refusal, as data.
+        Ok(stat) if stat.kind == Kind::Symlink => {
+            return Err(Ok(Outcome::IsSymlink.result(path)));
+        }
+        Ok(stat) => Some(replacement_permissions(stat.permissions)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(outcome_or_error("write", approved, e)),
+    };
+    let (file, tmp) = match create_temp_in(&dir, &name, dest_perms.is_some()) {
+        Ok(created) => created,
+        // The directory is not writable, or something the classification
+        // above could not see: the destination's answer, reported as
+        // such.
+        Err(e) => return Err(outcome_or_error("write", path, e)),
+    };
+    Ok(Prepared {
+        dir,
+        name,
+        tmp,
+        file,
+        dest_perms,
+    })
+}
+
+/// The permissions a replacement keeps: the permission bits only.
+/// `fchmod` after the write means the kernel will not strip
+/// setuid/setgid for us, and replacing an `04755` file must not mint a
+/// setuid binary owned by the agent's user.
+fn replacement_permissions(perms: std::fs::Permissions) -> std::fs::Permissions {
     #[cfg(unix)]
-    if restrict {
-        opts.mode(0o600);
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(perms.mode() & 0o777)
     }
     #[cfg(not(unix))]
-    let _ = restrict;
+    {
+        perms
+    }
+}
+
+/// Create an exclusive temporary beside `dest` in `dir`, named with a
+/// random nonce — so a file or symlink planted at a guessed name makes
+/// creation *fail* rather than redirect the write. With `restrict`
+/// (used when replacing an existing file) the temporary is born 0600,
+/// so its content is never readable beyond what the destination
+/// allowed — there is no create-then-chmod gap in which another opener
+/// can grab a readable fd.
+fn create_temp_in(
+    dir: &Dir,
+    dest: &OsStr,
+    restrict: bool,
+) -> std::io::Result<(std::fs::File, OsString)> {
+    let mode = if restrict { 0o600 } else { 0o666 };
     for _ in 0..16 {
         let nonce = RandomState::new().build_hasher().finish();
-        let tmp = parent.join(format!(
-            ".{}.{nonce:016x}.gwennol-tmp",
-            name.to_string_lossy()
-        ));
-        match opts.open(&tmp).await {
+        let tmp = super::dir::temp_name(dest, nonce);
+        match dir.create_new(&tmp, mode) {
             Ok(file) => return Ok((file, tmp)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -367,11 +543,27 @@ async fn fill_temp(
 /// take the file (a missing parent without `create_dirs`, a directory or
 /// a non-directory in the way, permission denied, a symlink).
 ///
+/// The approved path is canonical up to its deepest existing ancestor
+/// ([`deepest_canonical`]), so the operator judges where the bytes will
+/// actually land, not an alias — and that ancestor is *held open* before
+/// the approval, verified to be what the canonical path names, and is
+/// what every operation after the approval is relative to: the
+/// directories `create_dirs` makes, the temporary, the rename that makes
+/// it the destination. A parent swapped after the approval cannot
+/// redirect the write, because nothing after the approval resolves the
+/// parent by name again; the bytes land in the directory the operator
+/// approved, wherever its name has gone meanwhile. Below the anchor no
+/// symlink is followed. See [`super::dir`].
+///
 /// A symlink destination is never written through or replaced — the
 /// outcome is `is_symlink`, approved as a probe under the link's own
-/// name — and otherwise the approved path is canonical up to its deepest
-/// existing ancestor, so the operator judges where the bytes will
-/// actually land, not an alias.
+/// name with its parent canonical: resolving the link would show the
+/// operator a write to the target that is precisely what will not
+/// happen. A link planted at the destination's name after the approval
+/// gets the same answer; one planted between that check and the rename
+/// is replaced by the rename, in the approved directory under the
+/// approved name — the bytes still land where the operator was told,
+/// and only the link is lost.
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
@@ -390,91 +582,69 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         };
         let create_dirs = bool_param(&p, "create_dirs", false)?;
         let cancel = ex.cancel_token();
-        // A symlink destination is never written: writing through it
-        // would land the bytes somewhere the approved path does not name,
-        // and the rename would otherwise silently destroy the link. The
-        // model can act on that (write to the target, or elsewhere), so
-        // it is an outcome, not an error — approved first, like every
-        // probe, under the link's own name with its parent canonical:
-        // resolving the link would show the operator a write to the
-        // target that is precisely what will not happen.
-        if let Ok(m) = tokio::fs::symlink_metadata(&path).await
-            && m.file_type().is_symlink()
-        {
-            let parent = path.parent().unwrap_or(&path);
-            let mut probed = or_cancelled(&cancel, canonicalize_missing(parent))
-                .await?
-                .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
-            if let Some(name) = path.file_name() {
-                probed.push(name);
-            }
-            let ask = approval(&*ex, Access::WriteFile(probed));
-            approve(ask).await?;
+        // The anchor is found and held before the approval, so the
+        // approval can name the very directory the handle holds — the
+        // module's documented exception to validate → approve → work,
+        // shared with `host_fs.read`. A few syscalls, none with a side
+        // effect: raced against cancellation, and abandoned if it wins.
+        let anchored = {
+            let path = path.clone();
+            or_cancelled(&cancel, blocking(move || anchor(&path))).await??
+        }
+        .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
+        let Anchored {
+            approved,
+            anchor,
+            dir,
+            below,
+            dest_is_symlink,
+        } = anchored;
+        let ask = approval(&*ex, Access::WriteFile(approved.clone()));
+        approve(ask).await?;
+        let dir = match dir {
+            Ok(dir) => dir,
+            // The ancestor is a file, or may not be searched: the
+            // destination's answer, reported as such.
+            Err(e) => return outcome_or_error("write", &anchor, e),
+        };
+        if dest_is_symlink {
             return Ok(Outcome::IsSymlink.result(&path));
         }
-        let canonical = or_cancelled(&cancel, canonicalize_missing(&path))
-            .await?
-            .map_err(|e| StepError::Failed(format!("write {}: {e}", path.display())))?;
-        let ask = approval(&*ex, Access::WriteFile(canonical.clone()));
-        approve(ask).await?;
-        if create_dirs
-            && let Some(parent) = canonical.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            // `create_dir_all` reports a parent that exists as a
-            // non-directory as AlreadyExists, which is not itself an
-            // outcome — but the answer is "not a directory", and the
-            // model can act on it.
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                return Ok(Outcome::NotADirectory.result(parent));
-            }
-            return outcome_or_error("mkdir", parent, e);
-        }
-        // Whether this replaces an existing file decides both the
-        // temporary's birth mode and the permissions it ends with.
-        let dest_perms = match tokio::fs::metadata(&canonical).await {
-            Ok(meta) if meta.is_dir() => return Ok(Outcome::IsDirectory.result(&path)),
-            Ok(meta) => {
-                #[cfg(unix)]
-                let perms = {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    // Permission bits only: fchmod after the write means
-                    // the kernel will not strip setuid/setgid for us, and
-                    // replacing an 04755 file must not mint a setuid
-                    // binary owned by the agent's user.
-                    std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
-                };
-                #[cfg(not(unix))]
-                let perms = meta.permissions();
-                Some(perms)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return outcome_or_error("write", &canonical, e),
-        };
         // Creation and rename are quick local operations and are not raced
         // against cancellation: a dropped future cannot clean up after
         // itself, so cancellation is consulted *between* phases instead. A
         // cancelled write either leaves the destination untouched with the
         // temporary removed, or — once the rename begins — completes.
-        let (file, tmp) = match create_temp_sibling(&canonical, dest_perms.is_some()).await {
-            Ok(created) => created,
-            // The parent is missing (and `create_dirs` was not asked
-            // for), is not a directory, or is not writable: the
-            // destination's answer, reported as such.
-            Err(e) => return outcome_or_error("write", &path, e),
+        let prepared = {
+            let (approved, path) = (approved.clone(), path.clone());
+            blocking(move || prepare(dir, anchor, below, create_dirs, &approved, &path)).await?
         };
+        let Prepared {
+            dir,
+            name,
+            tmp,
+            file,
+            dest_perms,
+        } = match prepared {
+            Ok(prepared) => prepared,
+            Err(answer) => return answer,
+        };
+        let file = tokio::fs::File::from_std(file);
         let filled = or_cancelled(&cancel, fill_temp(file, &content, dest_perms)).await;
         let cancelled_after_fill = cancel.is_cancelled();
         if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
-        filled?.map_err(|e| StepError::Failed(format!("write {}: {e}", canonical.display())))?;
-        if cancelled_after_fill {
+            let _ = blocking(move || dir.unlink(&tmp)).await;
+            filled?.map_err(|e| StepError::Failed(format!("write {}: {e}", approved.display())))?;
             return Err(cancelled());
         }
-        if let Err(e) = tokio::fs::rename(&tmp, &canonical).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return outcome_or_error("write", &canonical, e);
+        let renamed = blocking(move || {
+            dir.rename(&tmp, &name).inspect_err(|_| {
+                let _ = dir.unlink(&tmp);
+            })
+        })
+        .await?;
+        if let Err(e) = renamed {
+            return outcome_or_error("write", &approved, e);
         }
         Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into())
     })
@@ -558,19 +728,21 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_restricted_temporary_is_born_0600_not_chmodded_down_later() {
+    #[test]
+    fn a_restricted_temporary_is_born_0600_not_chmodded_down_later() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("private.txt");
-        let (file, tmp) = create_temp_sibling(&dest, true).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::open(tmp.path()).unwrap();
+        let (file, name) = create_temp_in(&dir, OsStr::new("private.txt"), true).unwrap();
         // The mode must hold from the instant of creation — before any
         // write, sync, or chmod — or an opener in the gap keeps an fd no
         // later chmod can revoke.
-        let mode = file.metadata().await.unwrap().permissions().mode() & 0o7777;
+        let mode = file.metadata().unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600, "temporary was created readable");
-        drop(file);
-        let _ = std::fs::remove_file(tmp);
+        assert!(tmp.path().join(&name).exists());
+        // A replacement keeps permission bits and nothing else.
+        let kept = replacement_permissions(std::fs::Permissions::from_mode(0o4755));
+        assert_eq!(kept.mode() & 0o7777, 0o755);
     }
 
     #[test]

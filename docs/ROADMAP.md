@@ -93,8 +93,12 @@ opens sockets.
   canonicalises the deepest existing ancestor, so the approved path is
   where the bytes will land; `host_fs.list` lists the canonical directory.
   The residual race — a parent directory swapped between approval and
-  rename — is tolerable under interactive review; the milestone-6 policy
-  file should close it with directory-handle (`openat`-family) I/O.
+  rename — was tolerable under interactive review and is closed after
+  milestone 6 with directory-handle (`openat`-family) I/O: the deepest
+  existing ancestor is held open before the approval, verified to be
+  what the approved path names, and everything after the approval —
+  the directories `create_dirs` makes, the temporary, the rename — is
+  relative to that handle, following no symlink below it.
 
 ### 2. SPI contracts
 
@@ -349,7 +353,9 @@ prompt exists to paper over it.
 - **Owed to milestone 1:** the directory-handle (`openat`-family)
   write that closes the parent-swap race the milestone-1 approval
   tolerated under interactive review. It is a `gwennol-core` change,
-  not a frontend one, and follows as its own change.
+  not a frontend one, and landed as its own change after this
+  milestone (`steps::dir`), pinned by a write whose parent is swapped
+  for a symlink while its approval is held open.
 
 ### 7. TUI
 
