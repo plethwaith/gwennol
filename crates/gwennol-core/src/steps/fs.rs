@@ -380,27 +380,23 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
     // answer to act on — not the model's, not the operator's — and a
     // `stat` of the destination cannot find it out for a name whose
     // parent does not exist yet. So while the anchor is held, every
-    // name below it, the destination's included, is put to its
-    // filesystem one at a time, directly under the anchor: the names
-    // below are on that filesystem — a missing one will be made there,
-    // one that exists is the descent's to answer — so its measure is
-    // theirs. Too long is refused here; an answer the model can act on
-    // waits for the approval; anything else — an I/O error, a stale
-    // handle — is nobody's, and fails the step before the operator is
-    // asked. (An anchor that could not be held has the destination's
-    // answer already, given after the approval.)
+    // name below it is put to its filesystem one at a time, directly
+    // under the anchor — the destination's too, when its parent is
+    // missing; otherwise the look at the destination below does it.
+    // The names below are on that filesystem: a missing one is made
+    // there with `create_dirs` or answered as missing without, one that
+    // exists is the descent's to answer. So its measure is theirs, and
+    // each name gets the [`Preflight`] answer. (An anchor that could not
+    // be held has the destination's answer already, given after the
+    // approval; one held with `O_PATH` but unsearchable answers
+    // permission denied to the first name, which waits for the
+    // approval like any such answer.)
     if let Ok(dir) = &dir {
-        for component in below.iter().chain(std::iter::once(&name)) {
-            match dir.lstat(component) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => {
-                    return Err(std::io::Error::other(format!(
-                        "file name too long: {}",
-                        component.to_string_lossy()
-                    )));
-                }
-                Err(e) if Outcome::classify(&e).is_some() => {}
-                Err(e) => return Err(e),
+        let names = below.iter().chain((!below.is_empty()).then_some(&name));
+        for component in names {
+            match dir.lstat(component).map_err(|e| preflight(e, component)) {
+                Ok(_) | Err(Preflight::Later) => {}
+                Err(Preflight::Refused(e) | Preflight::Failed(e)) => return Err(e),
             }
         }
     }
@@ -431,16 +427,18 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
                     name = on_disk;
                 }
             }
-            // Missing — or unanswerable through the handle (unsearchable,
-            // say), which is answered as data once the approval is given:
-            // the same set the walk keeps, [`Outcome::classify`]'s.
-            // Anything else — an I/O error, a stale handle — is nobody's
-            // to act on, and fails the step before the operator is
-            // asked; a transient one is not retried after the approval,
-            // by choice: an answer nobody can act on is not one to ask
-            // the operator about.
-            Err(e) if Outcome::classify(&e).is_some() => {}
-            Err(e) => return Err(e),
+            // The same [`Preflight`] answer as for the names above: a
+            // name the filesystem will not take is refused; missing —
+            // or unanswerable through the handle (unsearchable, say) —
+            // is answered as data once the approval is given; anything
+            // else is nobody's to act on, and fails the step before the
+            // operator is asked. A transient error is not retried after
+            // the approval, by choice: an answer nobody can act on is
+            // not one to ask the operator about.
+            Err(e) => match preflight(e, &name) {
+                Preflight::Later => {}
+                Preflight::Refused(e) | Preflight::Failed(e) => return Err(e),
+            },
         }
     }
     below.push(name);
@@ -493,6 +491,41 @@ fn vouched_name(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// What a name's `lstat` under the anchor decides, before the operator
+/// is asked: the one policy, for the names below the anchor and for
+/// the destination itself.
+#[derive(Debug)]
+enum Preflight {
+    /// The filesystem will not take the name — on unix, `ENAMETOOLONG`
+    /// and nothing else maps to `InvalidFilename` — which is nobody's
+    /// answer to act on: the step fails before asking, in the host's
+    /// words.
+    Refused(std::io::Error),
+    /// An answer the model can act on ([`Outcome::classify`]'s set),
+    /// kept for after the approval.
+    Later,
+    /// Anything else — an I/O error, a stale handle — nobody's to act
+    /// on: the step fails before asking, in the error's own words.
+    Failed(std::io::Error),
+}
+
+fn preflight(e: std::io::Error, name: &OsStr) -> Preflight {
+    if e.kind() == std::io::ErrorKind::InvalidFilename {
+        #[cfg(unix)]
+        let what = "file name too long";
+        #[cfg(not(unix))]
+        let what = "file name the filesystem will not take";
+        return Preflight::Refused(std::io::Error::other(format!(
+            "{what}: {}",
+            name.to_string_lossy()
+        )));
+    }
+    if Outcome::classify(&e).is_some() {
+        return Preflight::Later;
+    }
+    Preflight::Failed(e)
 }
 
 /// What a write holds once its approval is given and its ground is
@@ -625,12 +658,20 @@ fn create_temp_in(
 /// Remove a temporary the write will not use. A failure is logged and
 /// not returned — the step's answer is whatever made the temporary
 /// unwanted — so a `.gwennol-tmp` file left behind at least has a
-/// trace, with the directory it is in; one already gone is not left
-/// behind at all.
+/// trace, with the directory it is in. With the directory held, one
+/// already gone is not left behind at all; on the path fallback it
+/// may instead have moved with its directory, and that is logged too.
 fn discard_temp(dir: &Dir, in_dir: &Path, tmp: &OsStr) {
     match dir.unlink(tmp) {
         Ok(()) => {}
+        #[cfg(dir_handles)]
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        #[cfg(not(dir_handles))]
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => tracing::warn!(
+            path = %in_dir.join(tmp).display(),
+            error = %e,
+            "the temporary file could not be found where it was made; if its directory moved, it is left behind under the new name"
+        ),
         Err(e) => tracing::warn!(
             path = %in_dir.join(tmp).display(),
             error = %e,
@@ -688,12 +729,14 @@ async fn fill_temp(
 /// bytes still land where the operator was told, and only the link is
 /// lost.
 ///
-/// While the anchor is held, a destination nobody can act on — a name
-/// too long for the anchor's filesystem at any component below it, or
-/// one the handle cannot look at for an I/O error — fails the step
-/// before the operator is asked, rather than approve a write that
-/// cannot happen. An anchor that cannot be held (a file, unsearchable,
-/// gone) is the destination's answer, given after the approval.
+/// While the anchor is held and lets its names be looked at, a
+/// destination nobody can act on — a name too long for the anchor's
+/// filesystem at any component below it, or one the handle cannot look
+/// at for an I/O error — fails the step before the operator is asked,
+/// rather than approve a write that cannot happen. An anchor that
+/// cannot be held (a file, unsearchable, gone), or one held but
+/// unsearchable, is the destination's answer, given after the
+/// approval.
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
@@ -1010,6 +1053,34 @@ mod tests {
             })
             .unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    /// The one preflight policy, with each answer's error injected:
+    /// a name the filesystem will not take is refused in the host's
+    /// words, an answer the model can act on waits, anything else
+    /// fails as itself.
+    #[test]
+    fn a_name_is_refused_or_waits_or_fails_by_its_error_alone() {
+        use std::io::{Error, ErrorKind};
+        let name = OsStr::new("n");
+        match preflight(Error::from(ErrorKind::InvalidFilename), name) {
+            Preflight::Refused(e) => assert!(e.to_string().ends_with(": n"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::NotADirectory,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                matches!(preflight(Error::from(kind), name), Preflight::Later),
+                "{kind:?}"
+            );
+        }
+        match preflight(Error::other("stale handle"), name) {
+            Preflight::Failed(e) => assert_eq!(e.to_string(), "stale handle"),
+            other => panic!("{other:?}"),
         }
     }
 

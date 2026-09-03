@@ -2100,6 +2100,72 @@ async fn fs_write_defers_to_the_filesystem_on_what_a_long_name_is() {
     }
 }
 
+/// The thief's sibling: someone renames the directory mid-fill. With
+/// the directory held the write does not notice — the bytes land in
+/// the directory that was approved, under its new name, the mid-fill
+/// half of the parent-swap guarantee. On the path fallback the rename
+/// by spelled path finds nothing, and the step says the temporary
+/// could not be found where it was made, as its doc promises.
+#[tokio::test]
+async fn a_directory_moved_mid_fill_keeps_the_write_where_it_was_approved() {
+    let f = fixture();
+    let dir = f.workspace.join("mover");
+    let moved = f.workspace.join("mover-moved");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&moved);
+    let mover = std::thread::spawn({
+        let (dir, moved) = (dir.clone(), moved.clone());
+        move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10) {
+                let temp_seen = std::fs::read_dir(&dir).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|e| e.file_name().to_string_lossy().ends_with(".gwennol-tmp"))
+                });
+                if temp_seen {
+                    return std::fs::rename(&dir, &moved).is_ok();
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            false
+        }
+    });
+    let content = "y".repeat(2 << 20);
+    let out = run(
+        "plain_writer",
+        json!({"path": "mover/kept.txt", "content": content}),
+    )
+    .await;
+    assert!(mover.join().unwrap(), "the mover never saw a temporary");
+    #[cfg(dir_handles)]
+    {
+        let out = out.expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "ok", "{out}");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("kept.txt"))
+                .unwrap()
+                .len(),
+            2 << 20,
+            "the bytes did not land in the approved directory under its new name"
+        );
+        assert!(!dir.exists());
+    }
+    #[cfg(not(dir_handles))]
+    {
+        let err = out.expect_err("a step error");
+        assert!(
+            err.to_string()
+                .contains("could not be found where it was made"),
+            "{err}"
+        );
+        assert!(
+            !moved.join("kept.txt").exists(),
+            "the destination was written"
+        );
+    }
+}
+
 /// A temporary that someone else removes between its creation and the
 /// rename is the write's loss, and the step says so: not `not_found`
 /// for a destination that was never the problem, with the bytes gone
