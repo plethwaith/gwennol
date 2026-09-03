@@ -38,6 +38,12 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
+      # The path-based directory fallback (non-unix, Redox) has no runner
+      # here; it runs on this one with its cfg forced off, less the pins
+      # of the guarantees only handles make.
+      - run: cargo test --locked -p gwennol-core
+        env:
+          GWENNOL_NO_DIR_HANDLES: "1"
       # The documented bundling command, as a user would run it: the
       # committed manifests plus compiled guests, into target/bundle.
       - run: cargo xtask bundle
@@ -48,9 +54,10 @@ jobs:
 
   test-macos:
     # The other platform the host steps' directory handles have a
-    # distinct branch on: `O_SEARCH` where Linux has `O_PATH`, a
-    # case-insensitive default filesystem, and BSD errnos for a refused
-    # `O_NOFOLLOW`. The substrate's wasm build is the same on both.
+    # distinct branch on: `O_SEARCH` where Linux has `O_PATH`, and a
+    # case-insensitive default filesystem. (The BSD errnos for a refused
+    # `O_NOFOLLOW` run nowhere here; macOS returns ELOOP like Linux.)
+    # The substrate's wasm build is the same on both.
     name: Tests (macOS)
     runs-on: macos-latest
     steps:

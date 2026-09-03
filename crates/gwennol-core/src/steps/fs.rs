@@ -347,7 +347,9 @@ struct Anchored {
     /// approval as data like any other.
     dir: std::io::Result<Dir>,
     /// The names below the anchor in order, the last the destination's
-    /// own. Every one before it was missing when the anchor was found.
+    /// own. Every one before it failed to canonicalise when the anchor
+    /// was found: missing, or a file, or a directory the agent's user
+    /// may not search — which the descent finds out and reports.
     below: Vec<OsString>,
     /// The destination is a symlink: refused after the approval, as
     /// data.
@@ -387,12 +389,15 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
     // to — on a case-insensitive filesystem the name on disk, not the
     // one spelled — because that is what `deepest_canonical` spells for
     // it and so what a frontend's patterns match; and it is written
-    // under that name too. The canonicalisation is by path, the one
-    // step here that is, so what it names is checked through the
-    // handle: the name on disk must lie in the anchor *and* be the very
-    // file the spelled name was (by device and inode), or a link that
-    // turned up meanwhile — to a sibling, say — is refused rather than
-    // have its target approved and replaced.
+    // under that name too. The canonicalisation is by path — the one
+    // path-based step after the handle is held that nothing has yet
+    // vouched for — so what it names is checked through the handle: the
+    // name on disk must lie in the anchor *and* be the very file the
+    // spelled name was (by device and inode). A link that turned up
+    // meanwhile — to a sibling, say — resolves to another file and is
+    // refused rather than have its target approved and replaced; and a
+    // file that is simply not the same one any more (an editor's save
+    // landing in the window) is the race it is, not a symlink.
     let mut dest_is_symlink = false;
     if below.is_empty()
         && let Ok(dir) = &dir
@@ -404,18 +409,18 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
                     let on_disk = canonical
                         .file_name()
                         .ok_or_else(|| std::io::Error::other("path has no file name"))?;
-                    let same = match dir.lstat(on_disk) {
+                    match dir.lstat(on_disk) {
                         Ok(named) => match (spelled.identity, named.identity) {
-                            (Some(a), Some(b)) => a == b,
-                            // The path fallback closes no race.
-                            _ => true,
+                            (Some(a), Some(b)) if a != b => {
+                                return Err(std::io::Error::other("changed while being opened"));
+                            }
+                            // Equal — or the path fallback, which closes
+                            // no race.
+                            _ => name = on_disk.to_os_string(),
                         },
-                        Err(_) => false,
-                    };
-                    if same {
-                        name = on_disk.to_os_string();
-                    } else {
-                        dest_is_symlink = true;
+                        // Gone by now: spelled, as a missing file is.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok(_) => dest_is_symlink = true,

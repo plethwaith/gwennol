@@ -1733,7 +1733,9 @@ async fn a_write_withdrawn_at_its_prompt_leaves_nothing_behind() {
 /// Run `plugin` with its approval held open, do `meanwhile` while it
 /// is, then let the answer through and return the invocation's result:
 /// the harness for what a write does when the world changes between
-/// the approval and the work.
+/// the approval and the work. Its pins are the directory-handle
+/// guarantees, which the path-based fallback does not make.
+#[cfg(dir_handles)]
 async fn with_the_prompt_held(
     plugin: &'static str,
     input: Value,
@@ -1767,7 +1769,7 @@ async fn with_the_prompt_held(
 /// The bytes land in the directory that was approved — wherever its
 /// name has gone — and never where the link points, because nothing
 /// after the approval resolves the parent by name again.
-#[cfg(unix)]
+#[cfg(dir_handles)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parent_swapped_after_the_approval_cannot_redirect_the_write() {
     let f = fixture();
@@ -1811,7 +1813,7 @@ async fn a_parent_swapped_after_the_approval_cannot_redirect_the_write() {
 /// reaches it. The descent follows no link, so the answer is
 /// `not_a_directory` for that component, as data, and nothing lands
 /// where the link points.
-#[cfg(unix)]
+#[cfg(dir_handles)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_symlink_planted_where_a_directory_was_approved_is_not_followed() {
     let f = fixture();
@@ -1851,7 +1853,7 @@ async fn a_symlink_planted_where_a_directory_was_approved_is_not_followed() {
 /// `lswap/dir`, and before it is read the directory is renamed away
 /// and a symlink to somewhere else put in its place. What comes back is
 /// the directory that was approved, not what the link points at.
-#[cfg(unix)]
+#[cfg(dir_handles)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_directory_swapped_after_the_approval_is_not_what_gets_listed() {
     let f = fixture();

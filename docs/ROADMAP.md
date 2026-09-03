@@ -95,7 +95,7 @@ opens sockets.
   The residual race — a parent directory swapped between approval and
   rename — was tolerable under interactive review and is closed after
   milestone 6 with directory-handle (`openat`-family) I/O: the deepest
-  existing ancestor is held open before the approval, verified to be
+  canonicalisable ancestor is held open before the approval, verified to be
   what the approved path names, and everything after the approval —
   the directories `create_dirs` makes, the temporary, the rename — is
   relative to that handle, following no symlink below it. `host_fs.list`

@@ -76,12 +76,14 @@ pub struct Entry {
 /// How a directory is held: to resolve names against, or to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
-    /// A handle to resolve names against, which needs search permission
-    /// on the directory and not read — a `0o311` drop box takes a write
-    /// through the handle as it does by path. `O_PATH` and `O_SEARCH`
-    /// say exactly that on every target where nix exposes one of them;
-    /// elsewhere a read-only open is the closest thing, and such a
-    /// directory is refused there.
+    /// A handle to resolve names against, which needs no read permission
+    /// on the directory — a `0o311` drop box takes a write through the
+    /// handle as it does by path. `O_SEARCH` gives such a handle and
+    /// checks search permission; `O_PATH` gives one and checks nothing
+    /// on the directory itself, leaving the descent to meet a refusal.
+    /// One or the other is used on every target where nix exposes it;
+    /// elsewhere a read-only open is the closest thing, and a drop box
+    /// is refused there.
     Search,
     /// A handle whose entries will be read, which needs read permission
     /// as `opendir` does.
@@ -228,8 +230,9 @@ impl Dir {
                 nix::sys::stat::Mode::empty(),
             )
             .map_err(|e| {
-                // `O_NOFOLLOW` reports a link as ELOOP (EMLINK on
-                // FreeBSD and DragonFly, EFTYPE on NetBSD), except where `O_PATH` lets the open reach
+                // `O_NOFOLLOW` reports a link as ELOOP, EMLINK (FreeBSD,
+                // DragonFly) or EFTYPE (NetBSD; accepted wherever nix
+                // defines it), except where `O_PATH` lets the open reach
                 // the link itself and `O_DIRECTORY` then refuses it — one
                 // answer either way.
                 if is_nofollow_refusal(e) {
@@ -342,16 +345,24 @@ impl Dir {
         }
         #[cfg(not(dir_handles))]
         {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // The birth mode is the point: a temporary born wider and
+            // narrowed later has a window in which an opener keeps a
+            // readable descriptor no chmod revokes.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(mode);
+            }
+            #[cfg(not(unix))]
             let _ = mode;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(self.path.join(name))
+            opts.open(self.path.join(name))
         }
     }
 
     /// Rename `from` to `to`, both inside this directory: atomic, and
-    /// replacing whatever entry is at `to`.
+    /// replacing a file or a link at `to` — a directory there fails.
     pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
         #[cfg(dir_handles)]
         {
@@ -388,8 +399,14 @@ impl Dir {
         {
             use std::os::unix::ffi::OsStrExt as _;
             // `fdopendir` takes the descriptor over, and a `Dir` may
-            // outlive one listing: it reads through a duplicate.
-            let mut dir = nix::dir::Dir::from_fd(self.fd.try_clone()?)?;
+            // outlive one listing: it reads through a duplicate. The
+            // duplicate shares the handle's offset, so the stream is put
+            // at the start first rather than left where the last listing
+            // stopped (nix rewinds when its iterator drops; this does
+            // not rely on it).
+            let dup = self.fd.try_clone()?;
+            nix::unistd::lseek(&dup, 0, nix::unistd::Whence::SeekSet)?;
+            let mut dir = nix::dir::Dir::from_fd(dup)?;
             for entry in dir.iter() {
                 let entry = entry?;
                 let name = OsStr::from_bytes(entry.file_name().to_bytes());
@@ -440,7 +457,7 @@ pub fn temp_name(beside: &OsStr, nonce: u64) -> OsString {
 mod tests {
     use super::*;
 
-    #[cfg(dir_handles)]
+    #[cfg(unix)]
     #[test]
     fn a_descent_follows_no_symlink_whatever_it_points_at() {
         let tmp = tempfile::tempdir().unwrap();
@@ -504,7 +521,7 @@ mod tests {
         assert!(truncated);
     }
 
-    #[cfg(dir_handles)]
+    #[cfg(unix)]
     #[test]
     fn a_created_file_is_born_with_its_mode() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -530,6 +547,22 @@ mod tests {
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
+    }
+
+    /// The identity the case-fold check compares: two names of one file
+    /// share it, two files do not.
+    #[cfg(dir_handles)]
+    #[test]
+    fn identity_is_the_file_not_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::open(tmp.path(), Hold::Search).unwrap();
+        std::fs::write(tmp.path().join("one"), "x").unwrap();
+        std::fs::write(tmp.path().join("two"), "x").unwrap();
+        std::fs::hard_link(tmp.path().join("one"), tmp.path().join("also-one")).unwrap();
+        let one = dir.lstat(OsStr::new("one")).unwrap().identity;
+        assert!(one.is_some());
+        assert_eq!(one, dir.lstat(OsStr::new("also-one")).unwrap().identity);
+        assert_ne!(one, dir.lstat(OsStr::new("two")).unwrap().identity);
     }
 
     #[test]
