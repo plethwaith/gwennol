@@ -389,24 +389,22 @@ impl Dir {
         }
     }
 
-    /// The longest name this directory's filesystem takes (`NAME_MAX`,
-    /// by `fpathconf`), if it says: a name longer than that can be
-    /// refused before anything is asked or made — including one whose
-    /// parent does not exist yet, which no `stat` could reach.
-    pub fn name_max(&self) -> io::Result<Option<usize>> {
-        #[cfg(dir_handles)]
+    /// Whether the filesystem refuses `name` as too long — asked of the
+    /// kernel, by a `stat` of the one name under this directory, since
+    /// only the filesystem knows its own measure (APFS counts UTF-16
+    /// units where `NAME_MAX` says bytes). Any other answer, a missing
+    /// name included, means the length is fine. A target that cannot
+    /// say refuses nothing.
+    pub fn refuses_name(&self, name: &OsStr) -> bool {
+        #[cfg(unix)]
         {
-            let max = nix::unistd::fpathconf(&self.fd, nix::unistd::PathconfVar::NAME_MAX)?;
-            Ok(max.and_then(|n| usize::try_from(n).ok()))
-        }
-        #[cfg(all(unix, not(dir_handles)))]
-        {
-            let max = nix::unistd::pathconf(&self.path, nix::unistd::PathconfVar::NAME_MAX)?;
-            Ok(max.and_then(|n| usize::try_from(n).ok()))
+            self.lstat(name)
+                .is_err_and(|e| e.raw_os_error() == Some(nix::libc::ENAMETOOLONG))
         }
         #[cfg(not(unix))]
         {
-            Ok(None)
+            let _ = name;
+            false
         }
     }
 

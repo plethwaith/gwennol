@@ -2015,7 +2015,9 @@ async fn fs_write_takes_a_name_as_long_as_names_go() {
 /// A destination whose name is longer than a name may be is nobody's
 /// answer to act on — not the model's, not the operator's: the step
 /// fails before anyone is asked, rather than approve a write that
-/// cannot happen.
+/// cannot happen. What "longer than a name may be" is, the filesystem
+/// says — APFS takes a 255-character name of two-byte characters that
+/// `NAME_MAX` would refuse — so the pin asks it too.
 #[tokio::test]
 async fn fs_write_fails_a_name_too_long_before_asking() {
     let f = fixture();
@@ -2025,31 +2027,72 @@ async fn fs_write_fails_a_name_too_long_before_asking() {
         eprintln!("skipping: this filesystem takes a 256-byte name");
         return;
     }
-    let err = run("plain_writer", json!({"path": name, "content": "x"}))
+    // The host's own words, not the OS's after an approval as before.
+    let refused = format!("file name too long: {name}");
+    let err = run("plain_writer", json!({"path": &name, "content": "x"}))
         .await
         .expect_err("a step error");
-    assert!(err.to_string().contains("name too long"), "{err}");
+    assert!(err.to_string().ends_with(&refused), "{err}");
     assert!(
         !f.requests_for("plain_writer")
             .contains(&Access::WriteFile(f.workspace.join(&name))),
         "the operator was asked about a write that could not happen"
     );
-    // Under a parent that does not exist yet no `stat` could have found
-    // it out; the name is measured, not looked up — and nothing is made.
-    let below = format!("unmade/{name}");
-    let err = run("writer", json!({"path": below, "content": "x", "dir": "."}))
+    // Under a parent that does not exist yet a `stat` of the destination
+    // could not have found it out; each name is put to the filesystem
+    // on its own — and nothing is made. The same for a directory to be
+    // made whose own name is too long.
+    for (below, made) in [
+        (format!("unmade/{name}"), "unmade"),
+        (format!("gap/{name}/x.txt"), "gap"),
+    ] {
+        let err = run(
+            "writer",
+            json!({"path": &below, "content": "x", "dir": "."}),
+        )
         .await
         .expect_err("a step error");
-    assert!(err.to_string().contains("name too long"), "{err}");
-    assert!(
-        !f.requests_for("writer")
-            .contains(&Access::WriteFile(f.workspace.join(&below))),
-        "the operator was asked about a write that could not happen"
-    );
-    assert!(
-        !f.workspace.join("unmade").exists(),
-        "a directory was made for it"
-    );
+        assert!(err.to_string().ends_with(&refused), "{below}: {err}");
+        assert!(
+            !f.requests_for("writer")
+                .contains(&Access::WriteFile(f.workspace.join(&below))),
+            "{below}: the operator was asked about a write that could not happen"
+        );
+        assert!(
+            !f.workspace.join(made).exists(),
+            "{below}: a directory was made for it"
+        );
+    }
+}
+
+/// The filesystem's measure of a name is the filesystem's, not
+/// `NAME_MAX`'s: a name the filesystem takes is written, however many
+/// bytes it is — APFS takes 255 two-byte characters, ext4 does not, and
+/// the step defers to whichever it is on.
+#[tokio::test]
+async fn fs_write_defers_to_the_filesystem_on_what_a_long_name_is() {
+    let f = fixture();
+    let name = "é".repeat(200);
+    let taken = std::fs::write(f.workspace.join(&name), "probe").is_ok();
+    if taken {
+        std::fs::remove_file(f.workspace.join(&name)).unwrap();
+    }
+    let out = run("plain_writer", json!({"path": &name, "content": "wide"})).await;
+    if taken {
+        let out = out.expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "ok", "{out}");
+        assert_eq!(
+            std::fs::read_to_string(f.workspace.join(&name)).unwrap(),
+            "wide"
+        );
+    } else {
+        let err = out.expect_err("a step error");
+        assert!(
+            err.to_string()
+                .ends_with(&format!("file name too long: {name}")),
+            "{err}"
+        );
+    }
 }
 
 /// A drop box — a directory the agent's user may search and write but

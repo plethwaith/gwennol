@@ -377,17 +377,18 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
         Err(e) => return Err(e),
     };
     // A name longer than the anchor's filesystem takes is nobody's
-    // answer to act on — not the model's, not the operator's — and no
-    // `stat` finds it out for a name whose parent does not exist yet.
-    // Every name below the anchor, the destination's included, is
-    // measured against the filesystem's own limit before anything is
-    // asked or made. (A filesystem that does not say has no check.)
+    // answer to act on — not the model's, not the operator's — and a
+    // `stat` of the destination cannot find it out for a name whose
+    // parent does not exist yet. So every name below the anchor, the
+    // destination's included, is put to the filesystem one at a time,
+    // directly under the anchor — the directories to be made cannot be
+    // mount points, so its answer is theirs — before anything is asked
+    // or made.
     if let Ok(dir) = &dir
-        && let Some(max) = dir.name_max().ok().flatten()
         && let Some(long) = below
             .iter()
             .chain(std::iter::once(&name))
-            .find(|c| c.len() > max)
+            .find(|component| dir.refuses_name(component))
     {
         return Err(std::io::Error::other(format!(
             "file name too long: {}",
@@ -427,8 +428,8 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
             // Anything else — an I/O error, a stale handle — is nobody's
             // to act on, and fails the step before the operator is
             // asked; a transient one is not retried after the approval
-            // as it once was, by choice: a destination that cannot be
-            // looked at is not one to ask about.
+            // as it once was, by choice: an answer nobody can act on is
+            // not one to ask the operator about.
             Err(e) if Outcome::classify(&e).is_some() => {}
             Err(e) => return Err(e),
         }
@@ -491,8 +492,9 @@ fn vouched_name(
 /// be, if it is being replaced.
 struct Prepared {
     dir: Dir,
-    /// Where `dir` was when it was held — the canonical directory the
-    /// temporary lives in, for a message about it.
+    /// Where `dir` was when it was held — the directory the temporary
+    /// lives in, canonical up to the anchor and spelled below it, for a
+    /// message about it.
     in_dir: PathBuf,
     name: OsString,
     tmp: OsString,
@@ -677,6 +679,11 @@ async fn fill_temp(
 /// bytes still land where the operator was told, and only the link is
 /// lost.
 ///
+/// A destination nobody can act on — a name too long for the anchor's
+/// filesystem, at any component below the anchor, or one the handle
+/// cannot look at for an I/O error — fails the step before the
+/// operator is asked, rather than approve a write that cannot happen.
+///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
 pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
@@ -764,13 +771,31 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
             filled?.map_err(failed)?;
             return Err(cancelled());
         }
+        let leftover = in_dir.join(&tmp);
         let renamed = blocking(move || {
             dir.rename(&tmp, &name)
                 .inspect_err(|_| discard_temp(&dir, &in_dir, &tmp))
         })
         .await
+        .inspect_err(|e| {
+            // The pool's own failure: the filled temporary's fate is
+            // unknown.
+            tracing::warn!(
+                path = %leftover.display(),
+                error = %e,
+                "could not rename a temporary file into place; it may be left behind"
+            );
+        })
         .map_err(failed)?;
         if let Err(e) = renamed {
+            // The directory is held, so a rename that finds nothing has
+            // lost the temporary itself — to someone else, between its
+            // creation and now — which is not the destination's answer.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(failed(std::io::Error::other(
+                    "the temporary file vanished before it could be renamed into place",
+                )));
+            }
             return destination_answer("write", &approved, &path, e);
         }
         Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into())
