@@ -418,7 +418,16 @@ fn anchor(path: &Path) -> std::io::Result<Anchored> {
             }
             // Missing — or unanswerable through the handle (unsearchable,
             // say), which is answered as data once the approval is given.
-            Err(_) => {}
+            // Anything else — a name too long, an I/O error — is nobody's
+            // to act on, and fails the step before the operator is asked.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(e) => return Err(e),
         }
     }
     below.push(name);
@@ -595,6 +604,19 @@ fn create_temp_in(
     ))
 }
 
+/// Remove a temporary the write will not use. A failure is logged and
+/// not returned — the step's answer is whatever made the temporary
+/// unwanted — so a `.gwennol-tmp` file left behind at least has a trace.
+fn discard_temp(dir: &Dir, tmp: &OsStr) {
+    if let Err(e) = dir.unlink(tmp) {
+        tracing::warn!(
+            temporary = %tmp.to_string_lossy(),
+            error = %e,
+            "could not remove a temporary file; it is left behind"
+        );
+    }
+}
+
 /// Fill the temporary: write, flush to disk, and — when replacing an
 /// existing file — set its permissions on the *open handle* (fchmod, so a
 /// swapped path cannot redirect the chmod), widening the 0600 it was born
@@ -696,7 +718,8 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // against cancellation: a dropped future cannot clean up after
         // itself, so cancellation is consulted *between* phases instead. A
         // cancelled write either leaves the destination untouched with the
-        // temporary removed, or — once the rename begins — completes.
+        // temporary removed (or, if it cannot be, left behind and logged),
+        // or — once the rename begins — completes.
         let prepared = {
             let path = path.clone();
             blocking(move || prepare(dir, anchor, below, create_dirs, &path))
@@ -717,14 +740,13 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         let filled = or_cancelled(&cancel, fill_temp(file, &content, dest_perms)).await;
         let cancelled_after_fill = cancel.is_cancelled();
         if !matches!(filled, Ok(Ok(()))) || cancelled_after_fill {
-            let _ = blocking(move || dir.unlink(&tmp)).await;
+            let _ = blocking(move || discard_temp(&dir, &tmp)).await;
             filled?.map_err(failed)?;
             return Err(cancelled());
         }
         let renamed = blocking(move || {
-            dir.rename(&tmp, &name).inspect_err(|_| {
-                let _ = dir.unlink(&tmp);
-            })
+            dir.rename(&tmp, &name)
+                .inspect_err(|_| discard_temp(&dir, &tmp))
         })
         .await
         .map_err(failed)?;

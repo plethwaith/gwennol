@@ -2012,6 +2012,25 @@ async fn fs_write_takes_a_name_as_long_as_names_go() {
     );
 }
 
+/// A destination whose name is longer than a name may be is nobody's
+/// answer to act on — not the model's, not the operator's: the step
+/// fails before anyone is asked, rather than approve a write that
+/// cannot happen.
+#[tokio::test]
+async fn fs_write_fails_a_name_too_long_before_asking() {
+    let f = fixture();
+    let name = "t".repeat(256);
+    let err = run("plain_writer", json!({"path": name, "content": "x"}))
+        .await
+        .expect_err("a step error");
+    assert!(err.to_string().contains("write "), "{err}");
+    assert!(
+        !f.requests_for("plain_writer")
+            .contains(&Access::WriteFile(f.workspace.join(&name))),
+        "the operator was asked about a write that could not happen"
+    );
+}
+
 /// A drop box — a directory the agent's user may search and write but
 /// not read — takes a write: the hold needs no read permission.
 #[cfg(unix)]
