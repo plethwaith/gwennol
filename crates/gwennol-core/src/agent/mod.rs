@@ -694,16 +694,20 @@ impl Session {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 // The turn's token is the authority once it has fired:
-                // a stream that ends or fails then is the cut arriving,
+                // a stream that ends then, or fails on the read itself
+                // with the relay's own I/O error, is the cut arriving,
                 // not a vendor hanging up. The http step's body guard
                 // ends the body the instant the step's token fires;
                 // whether the reader sees the token or the ended body
                 // first is a race, and the token settles it. The error
                 // it folds goes to the log, as at the other two sites.
-                // A contract violation coinciding with the cut is still
-                // a contract violation.
+                // A contract violation coinciding with the cut — a
+                // line that is not JSON, a code the loop's own table
+                // does not carry — is still a contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
-                Err(e @ (ReadError::Cancelled | ReadError::Io(_))) if cancel.is_cancelled() => {
+                Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
+                    if cancel.is_cancelled() =>
+                {
                     tracing::info!(error = %e, "stream ended by the turn's cancellation");
                     return Err(TurnError::Cancelled);
                 }
