@@ -40,6 +40,15 @@ nix.workspace = true
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true
+# `start_paused = true` tests (the idle-timeout tests in `steps/http.rs`)
+# need the mocked clock this feature adds. `cargo test` / `clippy
+# --all-targets` unify it into every crate's `tokio` for those builds —
+# Cargo unifies features per package, dev-dependencies included,
+# whenever a dev target is compiled — but this workspace's own
+# `resolver = "3"` keeps it out of the *normal* dependency graph, so
+# nothing shipped links it (`cargo tree --edges normal` carries no
+# `test-util`).
+tokio = { workspace = true, features = ["test-util"] }
 # Guest wasm modules travel inline in plugin manifests as base64; the
 # substrate tests encode the compiled example guest with it.
 base64 = "0.22"

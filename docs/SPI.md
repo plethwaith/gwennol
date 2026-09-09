@@ -179,12 +179,15 @@ coalesced into one text block, `tool_use` and `opaque` events kept
 whole and in place. That is what keeps a vendor's reasoning in front of
 the tool call it led to.
 
-End-of-stream without an `end` or `error` event means the turn failed
-mid-stream with the cause lost; a failure before any bytes flow is an
-ordinary step error. Either way, consumers must treat a stream that did
-not reach `end` as a failed turn, not a short answer. Events can be
-arbitrarily long — a `tool_use` event carries its whole `input` on one
-line — so consumers must not assume bounded lines.
+A turn can fail mid-stream three ways: a provider-authored `error`
+event (above), always followed by end-of-stream and never by `end`;
+end-of-stream with no `end` or `error` event at all, the cause lost; or
+the read itself failing, reporting the failing step's own text rather
+than a misleadingly clean end. A failure before any bytes flow is an
+ordinary step error. Whichever shape it takes, consumers must treat a
+stream that did not reach `end` as a failed turn, not a short answer.
+Events can be arbitrarily long — a `tool_use` event carries its whole
+`input` on one line — so consumers must not assume bounded lines.
 
 One dispatch caveat: `Kernel::execute_by_role` cannot carry a streams
 table, so a streaming caller resolves the role first

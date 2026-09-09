@@ -76,7 +76,7 @@ pub mod sys;
 pub use args::Args;
 pub use entry::{__alloc_impl, __execute_impl, EntryFn, dispatch};
 pub use invoke::{Target, invoke, invoke_streaming};
-pub use stream::{Delivery, Stream, StreamError};
+pub use stream::{Delivery, Received, Stream, StreamError};
 
 /// Severity for [`log`], mapped onto the host's `tracing` levels.
 ///

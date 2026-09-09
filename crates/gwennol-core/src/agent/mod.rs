@@ -54,13 +54,15 @@
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a pending approval is
-//!   withdrawn, a running tool step is cancelled. The turn's own token
+//!   withdrawn, a running tool step observes the token and stops,
+//!   reported as the kernel's typed cancellation. The turn's own token
 //!   is the authority: once it has fired, whatever a step reports is
 //!   the cut arriving (its text goes to the log), and a cancellation
-//!   code arriving *without* it — the kernel's action ceiling ended
-//!   the step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
-//!   step failure, reported as such and logged. The code's part is to
-//!   say how far the step got: a withdrawn approval means nothing ran.
+//!   arriving *without* it — the kernel's action ceiling ended the
+//!   step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
+//!   step failure, reported as such and logged. Only a withdrawn
+//!   approval carries more than the typed variant can: nothing ran,
+//!   which is why it alone stays the structured `steps::CANCELLED_CODE`.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as
@@ -694,16 +696,32 @@ impl Session {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 // The turn's token is the authority once it has fired:
-                // a stream that ends then, or fails on the read itself
-                // with the relay's own I/O error, is the cut arriving,
-                // not a vendor hanging up. The http step's body guard
-                // ends the body the instant the step's token fires;
-                // whether the reader sees the token or the ended body
-                // first is a race, and the token settles it. The error
-                // it folds goes to the log, as at the other two sites.
-                // A contract violation coinciding with the cut — a
-                // line that is not JSON, a code the loop's own table
-                // does not carry — is still a contract violation.
+                // a stream that ends then, or fails on the read itself,
+                // is the cut arriving, not a vendor hanging up. A read
+                // parked on this handle — the chat action's streamed
+                // output — is released by gwead itself as
+                // `STREAM_CANCELLED` the moment the token fires. A
+                // `STREAM_IO_ERROR` reaching here under a fired token
+                // needs no particular timing: `cancel.is_cancelled()`
+                // below is checked *after* `reader.next()` has already
+                // returned, so an error from well before the
+                // cancellation lands here too. A failing relay step
+                // reports it directly onto this handle, once the bytes
+                // it wrote are drained. The fetch step's own idle
+                // timeout (synthesised by `guarded_body`) and a genuine
+                // vendor transport fault reach here differently: with
+                // `stream: true` the fetch step returns as soon as
+                // headers arrive, registering the body as a readable
+                // for the relay to read later, so a fault mid-body
+                // surfaces only once the relay reads that far, as an
+                // `Err` item that fails the *relay's* read — not the
+                // fetch step, which already finished. Either shape
+                // (`Cancelled` or `Io`) is read as the cut arriving
+                // here, and the error either one carries goes to the
+                // log, as at the other two sites. A contract violation
+                // coinciding with the cut — a line that is not JSON, a
+                // code the loop's own table does not carry — is still
+                // a contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
                     if cancel.is_cancelled() =>
@@ -904,9 +922,10 @@ enum Cut {
 
 impl Cut {
     /// Read how far the cancelled step got from what it reported. Only
-    /// a host step's own structured error can say it never started; a
-    /// cancellation flattened by a nested invoke, or the kernel's own,
-    /// is read as the cautious answer.
+    /// a withdrawn approval's structured error can say it never
+    /// started; the kernel's typed in-work cancellation, a cancellation
+    /// flattened by a nested invoke, or any other shape, is read as the
+    /// cautious answer.
     fn from_error(e: &KernelError) -> Self {
         match e {
             KernelError::PluginError { code, params, .. }
@@ -932,12 +951,14 @@ impl Cut {
 }
 
 /// Whether a kernel error carries a cancellation: the kernel's own
-/// between-step check, or a host step's structured
-/// `steps::CANCELLED_CODE`. Never on its own a reason to treat a turn
-/// as cancelled — the turn's token is the authority — because the code
-/// also arrives when the kernel's action ceiling cancels the invocation
-/// (gwead remaps only its own `Cancelled` to a timeout), and because
-/// any plugin may throw it.
+/// typed [`KernelError::Cancelled`] — an in-work host step stop, or the
+/// kernel's own between-step check — or a host step's structured
+/// `steps::CANCELLED_CODE`, which now names only a withdrawn approval.
+/// Never on its own a reason to treat a turn as cancelled — the turn's
+/// token is the authority — because `Cancelled` also arrives when the
+/// kernel's action ceiling cancels the invocation (gwead remaps only
+/// its own `Cancelled` to a timeout), and because any plugin may throw
+/// `steps::CANCELLED_CODE` itself.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,

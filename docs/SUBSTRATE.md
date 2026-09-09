@@ -24,8 +24,9 @@ Three facts, each verified in Gwead's source rather than assumed:
    live there.
 2. **The script-runtime ABI is the only guest surface with reach.** A
    module in that slot gets the full `gwead1` import set: stream
-   read/write/close, the pre-provisioned `long_running` dataflow
-   output, `host_invoke`/`host_invoke_streaming` back into the kernel,
+   read/write/close, the last-recorded stream error's text, the
+   pre-provisioned `long_running` dataflow output,
+   `host_invoke`/`host_invoke_streaming` back into the kernel,
    result/error reporting, logging, and the cancellation flag. The
    roadmap's milestone-3 constraint (streaming needs guest code
    concurrent with its consumer) is satisfiable *only* here — so both
@@ -156,9 +157,10 @@ provider is two actions on one plugin —
   and the relay must not start before the fetch's handle exists in its
   context) whose guest entry reads the SSE bytes and writes contract
   NDJSON to `Stream::output()`. The callee runs on a background task;
-  a failure there surfaces to the consumer as end-of-stream without an
-  `end` event — the contract's failed-turn shape, with no extra
-  plumbing.
+  a failure there surfaces to the consumer as a reported read error
+  carrying the failed step's own text, once the bytes it did write are
+  drained — one of the contract's three failed-turn shapes, with no
+  extra plumbing.
 
 ## Building
 

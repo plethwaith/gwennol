@@ -146,9 +146,9 @@ written, and it must be settled before a provider exists.
   `io.invoke_streaming` on a sibling `dataflow` action, whose single
   long-running guest step reads the SSE bytes and writes contract NDJSON;
   the readable end lands in the caller's own stream table, and a callee
-  failure surfaces as early end-of-stream — exactly the contract's
-  failed-turn rule. Whichever substrate is chosen must be able to occupy
-  that long-running slot.
+  failure surfaces as a reported read error carrying the failed step's
+  own text — one of the contract's three failed-turn shapes. Whichever
+  substrate is chosen must be able to occupy that long-running slot.
 - **Not in scope:** the Anthropic provider itself; installing plugins from
   outside the binary.
 - **Settled: Rust guests, not a bundled interpreter** — decision record
@@ -255,16 +255,19 @@ written, and it must be settled before a provider exists.
   lands, not even the directories it would have made) and a spawn
   (never runs). The walk before the miss probe is a few syscalls and
   cannot be held open; its race is pinned at the boundary after it.
-  A cancelled host step says so as data — a `PluginError` carrying
-  `steps::CANCELLED_CODE`, with `params.phase` naming a withdrawn
-  approval — but the loop's own token is the authority: once it has
-  fired, whatever a step reports is the cut arriving (a nested invoke
-  flattens the code to text, and the text goes to the log), and the
-  code arriving without it is a step failure, reported and logged —
-  the kernel's action ceiling cancels an invocation the same way and
-  remaps only its own `Cancelled` to a timeout, and any plugin may
-  throw the code. The code's part is to say how far the step got:
-  withdrawn at the approval means nothing ran. The process step's
+  A host step cancelled inside its work says so as the kernel's own
+  typed `Cancelled`; only a withdrawn approval keeps the structured
+  shape — a `PluginError` carrying `steps::CANCELLED_CODE`, with
+  `params.phase` naming it, since nothing ran is one thing more than
+  the typed variant can carry. The loop's own token is the authority
+  either way: once it has fired, whatever a step reports is the cut
+  arriving (a nested invoke flattens the code to text, and the text
+  goes to the log), and either shape arriving without it is a step
+  failure, reported and logged — the kernel's action ceiling cancels
+  an invocation the same way and remaps only its own `Cancelled` to a
+  timeout, and any plugin may throw the structured code itself. The
+  structured code's part is to say how far the step got: withdrawn at
+  the approval means nothing ran. The process step's
   own select is biased the other way,
   work first: a child that has already finished has acted, and its
   result is the truth about that.

@@ -23,9 +23,10 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gwead::kernel::streams::StreamRegistry;
+use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared};
 use gwead::kernel::{Kernel, KernelConfig};
 use gwead::serde_json::{Value, json};
+use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{HostConfig, ProcessEnv, spi};
 // The guest's own exported names: the manifest and these tests name the
 // plugin, its actions, and its entry points from the one declaration
@@ -176,11 +177,12 @@ const ERROR_SSE: &str = concat!(
 );
 
 /// A stream whose second event's payload is not JSON: the relay's step
-/// fails there, and the consumer must see the events so far and then
-/// end-of-stream — no `end`, no `error` event, no garbage line. This is
-/// the pin on the kernel's post-invocation drain closing the
-/// pre-provisioned output when the long-running step errors instead of
-/// closing it itself.
+/// fails there without closing its output itself, and the consumer
+/// must see the events so far, then the failure reported as a read
+/// error carrying the step's own text — no `end`, no `error` event, no
+/// garbage line. This is the pin on gwead recording that failure
+/// beside the channel and reporting it once the bytes the step did
+/// write are drained, rather than losing it to a plain EOF.
 const GARBAGE_SSE: &str = concat!(
     "event: text\ndata: {\"type\":\"text\",\"text\":\"before the garbage\"}\n\n",
     "event: text\ndata: this is not JSON\n\n",
@@ -257,10 +259,16 @@ fn sse_stub() -> &'static SseStub {
                   Connection: close\r\n\r\n",
             );
             let _ = socket.flush();
-            if path == "/slow-turn" {
+            if path == "/slow-turn" || path == "/slow-turn-cancel" {
                 // A long, slow turn: text events at a steady pace, so a
                 // consumer that hangs up does so with plenty still to
                 // come. Ends when the relay closes the connection.
+                // `/slow-turn-cancel` is the identical route under its
+                // own path, so the cancellation test below can poll
+                // `hangups` for a literal only it drives — two tests
+                // both hanging up `/slow-turn` under the shared,
+                // process-wide fixture would let either satisfy the
+                // other's poll.
                 for i in 0..200 {
                     let event = format!(
                         "event: text\ndata: {{\"type\":\"text\",\"text\":\"tick {i} \"}}\n\n"
@@ -422,8 +430,12 @@ async fn the_guest_builds_the_vendor_request() {
 
 /// A vendor error event is relayed as the contract error event and is
 /// the last event: nothing after it — not even the vendor's own
-/// spurious `end` — reaches the consumer, and the stream ends without
-/// an `end` event, which is the contract's failed-turn shape.
+/// spurious `end` — reaches the consumer. This is the first of the
+/// contract's three mid-stream failure shapes (`docs/SPI.md`): a
+/// provider-authored `error` event, then end-of-stream, never `end` —
+/// distinct from the other two, which carry no such event: silent
+/// end-of-stream with the cause lost, or the read itself failing,
+/// which does still report the failing step's own text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     let f = fixture();
@@ -439,16 +451,69 @@ async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
 }
 
 /// A relay step that *fails* (a non-JSON vendor payload) reaches the
-/// consumer as the contract's failed-turn shape: the events so far,
-/// then end-of-stream with no `end` and no `error` event. The relay
-/// does not close its output on this path — this pins the kernel's
-/// post-invocation drain doing it, which everything in
-/// `docs/SUBSTRATE.md` about `Err` surfacing as early EOF relies on.
+/// consumer as a reported stream failure, not a plain end-of-stream:
+/// gwead drains the bytes the step did write, then reports the
+/// failure itself as `STREAM_IO_ERROR` rather than an EOF a consumer
+/// could mistake for a clean end — the garbage line is not relayed,
+/// and the vendor's later `end` event never reaches the consumer. The
+/// relay does not close its output on this path; gwead does, and in
+/// the right order: the kernel holds its own reserved sender on the
+/// callee's writable handle until the callee's execution has ended,
+/// records that outcome first, and only then drops its own sender —
+/// closing the channel for the consumer's reader — so a failure can
+/// never race a close and be read as a clean EOF. That recorded
+/// outcome is what the consumer's read then reports as
+/// `STREAM_IO_ERROR`. Nothing here depends on the kernel's
+/// post-invocation drain — this test dispatches with its own
+/// `with_streams` registry, which disables that drain for the whole
+/// call.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failing_relay_step_surfaces_as_early_end_of_stream() {
+async fn a_failing_relay_step_surfaces_as_a_reported_stream_failure() {
     let f = fixture();
-    let events = stream_turn_events(f, "/garbage-turn").await;
+    let provider = f
+        .kernel
+        .role_candidates(None, spi::llm_chat::ROLE)
+        .into_iter()
+        .next()
+        .expect("an LLM_CHAT fulfiller");
+    let input = chat_input();
+    let config = json!({
+        "model": "m3-fixture",
+        "stream_url": format!("http://{}/garbage-turn", f.stub.addr)
+    });
+    let streams = Arc::new(Mutex::new(StreamRegistry::new()));
+    let out = f
+        .kernel
+        .execute(&provider, spi::llm_chat::CHAT, input)
+        .with_config(&config)
+        .with_streams(streams.clone())
+        .run()
+        .await
+        .expect("streamed chat dispatch succeeds")
+        .output;
+    assert_conforms(contracts().chat_output, &out);
+    let handle = out["stream"].as_u64().expect("streamed form") as u32;
+    let id = std::num::NonZeroU32::new(handle).unwrap();
 
+    let cancel = CancellationToken::new();
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 64];
+    let code = loop {
+        let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
+        if n < 0 {
+            break n;
+        }
+        collected.extend_from_slice(&buf[..n as usize]);
+    };
+    assert_eq!(
+        code, STREAM_IO_ERROR,
+        "a failed relay step must be reported, not silently read as EOF"
+    );
+    let events: Vec<Value> = String::from_utf8(collected)
+        .unwrap()
+        .lines()
+        .map(|line| gwead::serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
         events,
         vec![json!({"type": "text", "text": "before the garbage"})],
@@ -627,6 +692,89 @@ async fn a_consumer_hanging_up_is_a_graceful_stop_for_the_relay() {
     panic!("the relay never closed its upstream: the vendor kept streaming");
 }
 
+/// The other half of the milestone-5 cancellation contract, pinned the
+/// same way as the reader-gone test above: the vendor is still
+/// streaming when the turn is cancelled, so both the fetch step's body
+/// read and the relay's own `stream_read` are genuinely parked when
+/// the token fires. Neither raises: `guarded_body` no longer injects
+/// its own ready `Err("cancelled")` item ahead of gwead's read-side
+/// release, so the fetch's body stream, and the relay reading it,
+/// both see gwead's own `STREAM_CANCELLED` — not `STREAM_IO_ERROR` —
+/// and both relays wind down without raising.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
+    use gwead::futures::StreamExt as _;
+    let f = fixture();
+    let input = json!({
+        "url": format!("http://{}/slow-turn-cancel", f.stub.addr),
+        "request": {"model": "m3-fixture", "stream": true, "messages": []}
+    });
+    let mut handle = f
+        .kernel
+        .execute(PLUGIN, STREAM_ACTION, input)
+        .with_config(&json!({}))
+        .into_dataflow_streaming_handle()
+        .expect("the dataflow action streams");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), handle.output.next())
+        .await
+        .expect("the relay produces within 10s")
+        .expect("not EOF")
+        .expect("not an I/O error");
+    assert!(
+        String::from_utf8_lossy(&first).contains("tick"),
+        "{first:?}"
+    );
+    // The vendor is still sending: cancel the whole invocation while
+    // the relay's next read is parked on it.
+    handle.cancel();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle.result)
+        .await
+        .expect("the relay winds down within 10s")
+        .expect("the pipeline reports");
+    // `is_ok()` alone cannot tell "the relay wound down" from "the
+    // relay raised and the kernel swallowed it under the invocation's
+    // own cancellation": both resolve `Ok`, but a raising relay never
+    // records its own step result, and the fetch step's raw
+    // `{status, body}` surfaces as the action's output in its place.
+    // The relay's `Ok(Value::Null)` recorded as `step_results["relay"]`
+    // is what only D11's actual wind-down produces.
+    let result =
+        outcome.expect("a cancelled turn is a graceful stop for the relay, not a failed step");
+    assert_eq!(
+        result.output,
+        Value::Null,
+        "the relay's own Ok(Value::Null) must be the action's output: {:?}",
+        result.step_results
+    );
+    assert_eq!(
+        result.step_results.get("relay"),
+        Some(&Value::Null),
+        "the relay step itself must have completed, not been swallowed under the cancellation: {:?}",
+        result.step_results
+    );
+    // And the vendor connection ends — on its own dedicated path, so
+    // this poll cannot be satisfied by the reader-gone sibling test's
+    // identical hang-up on the shared, process-wide fixture. This
+    // does not distinguish *who* closed it (the relay's own
+    // `upstream.close()`, or the kernel's post-invocation drain, which
+    // `into_dataflow_streaming_handle` keeps enabled and so runs
+    // regardless once the action ends): either way the vendor sees the
+    // connection go.
+    for _ in 0..250 {
+        if f.stub
+            .hangups
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "/slow-turn-cancel")
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the relay never closed its upstream: the vendor kept streaming");
+}
+
 /// The example implements only the streamed form and says so as a step
 /// error, rather than returning something shaped like a buffered turn.
 #[tokio::test(flavor = "multi_thread")]
@@ -645,11 +793,14 @@ async fn the_buffered_form_is_refused_with_a_readable_error() {
     assert!(msg.contains("streamed form"), "names the limitation: {msg}");
 }
 
-/// gwennol-guest re-declares the six STREAM_* return codes because it
-/// deliberately cannot depend on gwead — so nothing but this test keeps
-/// the copies equal. A gwead renumbering would otherwise silently
-/// misclassify stream errors in every guest (Closed decoded as Io turns
-/// "reader hung up, wind down" into a failed step).
+/// gwennol-guest re-declares the seven STREAM_* return codes and the
+/// `MAX_LAST_ERROR_BYTES` cap because it deliberately cannot depend on
+/// gwead — so nothing but this test keeps the copies equal. A gwead
+/// renumbering would otherwise silently misclassify stream errors in
+/// every guest: Closed decoded as Io turns "reader hung up, wind down"
+/// into a failed step, and a wrong `STREAM_CANCELLED` turns a relay's
+/// own cancellation into a reported failure instead of the clean stop
+/// it is.
 #[test]
 fn the_guest_stream_codes_match_gwead() {
     use gwead::kernel::streams as host;
@@ -663,6 +814,8 @@ fn the_guest_stream_codes_match_gwead() {
     assert_eq!(guest::STREAM_CLOSED, host::STREAM_CLOSED);
     assert_eq!(guest::STREAM_IO_ERROR, host::STREAM_IO_ERROR);
     assert_eq!(guest::STREAM_OOB, host::STREAM_OOB);
+    assert_eq!(guest::STREAM_CANCELLED, host::STREAM_CANCELLED);
+    assert_eq!(guest::MAX_LAST_ERROR_BYTES, host::MAX_LAST_ERROR_BYTES);
 }
 
 /// The two-key authorization holds, first key: the manifest's

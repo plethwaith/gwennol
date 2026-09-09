@@ -883,9 +883,9 @@ dependencies = [
 
 [[package]]
 name = "gwead"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d513438777b1ac98e204bccb595f7ea71e6620e7287c53020772b25359c5f664"
+checksum = "89b4e83f31f1fb45493a6f8bafa1f1cf1300c1b187c404a25df21ad1e05713f6"
 dependencies = [
  "base64",
  "boon",
