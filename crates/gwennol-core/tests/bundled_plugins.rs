@@ -1,4 +1,4 @@
-//! Milestone 4, end to end: the committed manifests under `plugins/`
+//! End to end: the committed manifests under `plugins/`
 //! — the Anthropic provider and the four tools — bundled by the same
 //! code `cargo xtask bundle` runs, registered on a real kernel, and
 //! driven against a stub that speaks the Messages API.
@@ -129,7 +129,8 @@ impl Fixture {
         )
     }
 
-    /// Run one tool call the milestone-5 way: by harvested descriptor.
+    /// Run one tool call the way the agent loop does: by harvested
+    /// descriptor.
     async fn call_tool(&self, name: &str, input: Value) -> Value {
         let descriptors = spi::harvest_tools(&self.kernel).unwrap();
         let d = descriptors
@@ -850,7 +851,7 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
     );
 }
 
-/// The milestone-5 loop over the bundled plugins: the same round trip,
+/// The agent loop over the bundled plugins: the same round trip,
 /// driven by `Session` — opening turn streamed and rebuilt (thinking
 /// carried as `opaque`, text coalesced, the split tool call whole), the
 /// `read` tool dispatched by harvested descriptor with the model's

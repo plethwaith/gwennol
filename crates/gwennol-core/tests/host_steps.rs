@@ -1682,7 +1682,7 @@ fn host_manifests_are_valid_and_nothing_is_freely_usable() {
 
 /// Run `plugin` with its own token, wait until the operator has been
 /// asked, cancel, and return the invocation's error — which must arrive
-/// without the operator ever answering. The milestone-5 cancel harness:
+/// without the operator ever answering. The cancel harness:
 /// an approval held open is the one place a step can be cancelled at a
 /// known point, so these pins are deterministic where a cancel fired
 /// into a few syscalls' worth of work would be a coin toss.
@@ -1811,7 +1811,7 @@ async fn with_the_prompt_held(
         .map(|r| Value::Object(r.step_results.into_iter().collect()))
 }
 
-/// The parent-swap race the milestone-1 approval tolerated: the operator
+/// The parent-swap race a path-based write tolerates: the operator
 /// approves `swap/dir/t.txt`, and before the write happens `swap/dir`
 /// is renamed away and a symlink to somewhere else put in its place.
 /// The bytes land in the directory that was approved — wherever its

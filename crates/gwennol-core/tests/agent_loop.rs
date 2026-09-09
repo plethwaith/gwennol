@@ -1,4 +1,4 @@
-//! Milestone 5, end to end: the agent loop against a scriptable
+//! End to end: the agent loop against a scriptable
 //! provider and fixture tools on a real kernel.
 //!
 //! The roadmap's done-when, each pinned here: a multi-turn conversation

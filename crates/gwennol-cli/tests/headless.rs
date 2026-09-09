@@ -1,4 +1,4 @@
-//! Milestone 6, end to end: the built `gwennol` binary runs a task
+//! End to end: the built `gwennol` binary runs a task
 //! headlessly against the bundled plugins and a stub Messages API, with
 //! every approval decided by a rule and traced to it, and no prompt
 //! anywhere.

@@ -30,9 +30,9 @@ struct Fixture {
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        // Canonicalised like the M1 fixture: macOS tempdirs sit behind
-        // the /var symlink, and future host_fs tests here would compare
-        // approval paths against workspace joins.
+        // Canonicalised like the host-steps fixture: macOS tempdirs sit
+        // behind the /var symlink, and future host_fs tests here would
+        // compare approval paths against workspace joins.
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         let mut kernel = gwennol_core::boot(Arc::new(Permissive), workspace).unwrap();
         for plugin in [fixture_provider(), fixture_tool(), decoy_tool()] {
@@ -188,10 +188,10 @@ fn wire_tools(kernel: &Kernel) -> Value {
     )
 }
 
-/// Run one tool call the milestone-5 way: the model named a tool, the
-/// *harvested* descriptor (filtered and checked, not the raw list) says
-/// what to execute — by plugin and action, not by role, since many
-/// `TOOL` plugins register at once.
+/// Run one tool call the way the agent loop does: the model named a
+/// tool, the *harvested* descriptor (filtered and checked, not the
+/// raw list) says what to execute — by plugin and action, not by
+/// role, since many `TOOL` plugins register at once.
 async fn call_by_descriptor(f: &Fixture, call: &Value) -> Value {
     let name = call["name"].as_str().unwrap();
     let descriptors = spi::harvest_tools(&f.kernel).unwrap();
@@ -282,7 +282,7 @@ fn stream_stub() -> &'static str {
 async fn stream_events_from(f: &Fixture, url: String) -> Vec<Value> {
     // `execute_by_role` cannot carry a streams table, so a streaming
     // caller resolves the role first and executes the winner — exactly
-    // what the milestone-5 loop will do.
+    // what the agent loop does.
     let provider = f
         .kernel
         .role_candidates(None, spi::llm_chat::ROLE)
@@ -601,8 +601,9 @@ async fn the_tool_is_dispatched_by_role() {
 #[tokio::test]
 async fn a_tool_call_round_trips_with_no_agent_loop() {
     // Provider output → tool inputs → tool results → provider, wired by
-    // hand: the loop is milestone 5. The provider is dispatched by role;
-    // the tools by harvested descriptor, per docs/SPI.md.
+    // hand: the loop itself is `Session`'s, pinned in `agent_loop.rs`.
+    // The provider is dispatched by role; the tools by harvested
+    // descriptor, per docs/SPI.md.
     let f = fixture();
     let opening = json!({
         "messages": [user_text("please call the tool")],

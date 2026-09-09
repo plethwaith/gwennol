@@ -323,11 +323,10 @@ mod tests {
     #[test]
     fn an_empty_value_flood_buys_no_memory_and_no_event() {
         // `data:\n` forever: six wire bytes must not buy any buffered
-        // bytes. Under the old per-payload tally each such line cost a
-        // container slot the accounting never saw; now an empty value
-        // before any content stores nothing at all. The proof is
-        // behavioral: if the flood had buffered anything, the eventual
-        // real value would arrive with a million separators in front.
+        // bytes. An empty value before any content stores nothing at
+        // all. The proof is behavioral: if the flood had buffered
+        // anything, the eventual real value would arrive with a
+        // million separators in front.
         let mut p = SseParser::new();
         let flood = "data:\n".repeat(1_000_000);
         assert!(p.feed(flood.as_bytes()).unwrap().is_empty());
