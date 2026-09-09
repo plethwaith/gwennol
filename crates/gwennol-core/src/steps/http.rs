@@ -139,21 +139,42 @@ fn redirect_target(
 /// gwead's own read loop never sees one: gwead skips an empty chunk
 /// *inside* one `read_async` call instead of returning to ask again, so
 /// a source that is always immediately ready with them never lets a
-/// fired token win the race (tracked upstream as gwead#22) — reachable
-/// here from a hostile or broken HTTP/2 peer flooding zero-length DATA
-/// frames, since this body is a raw `reqwest::bytes_stream()`, unlike a
-/// `gwennol-guest` guest's `Stream::write_all`, which never commits an
-/// empty write. `yield_now` between chunks gives the executor a chance
-/// to run the task racing this one on the cancellation token,
-/// mirroring gwead's own mitigation for the same
-/// hole in its skip loop.
+/// fired token win the race (tracked upstream as gwead#22). Nothing in
+/// this repo guarantees a raw `reqwest::bytes_stream()`'s chunks are
+/// non-empty — unlike a `gwennol-guest` guest's `Stream::write_all`,
+/// which never commits an empty write — so a hostile or broken peer
+/// that sends only empty ones is this function's problem to bound.
+///
+/// `yield_now` between chunks is load-bearing, not a courtesy to other
+/// tasks: it is what makes this call return `Pending` at least once.
+/// `source.next()` is what gwead's own `read_async` races the
+/// cancellation token against, `biased` toward source — an
+/// always-ready empty chunk would resolve *this* call `Ready` on every
+/// poll, so the race would never reach the token at all. The first
+/// poll of `yield_now` returns `Pending`, which propagates out through
+/// this whole `.await` chain as this call's own result for that poll,
+/// letting gwead's select fall through to the token this time. This is
+/// not what gwead's own identically-named call in its skip loop does:
+/// that `yield_now` races the *same* select every iteration and can
+/// never let its token win one — the source there is polled inside the
+/// very race being raced, biased toward itself — so it only keeps
+/// *other* tasks scheduled while gwead#22 stays open. Here, this call
+/// entirely *is* the source gwead's select polls, so making it
+/// `Pending` is the whole fix, not a side effect of one.
+///
+/// The per-chunk idle deadline is computed once per real chunk sought,
+/// not once per host call: an empty chunk restarting it would let a
+/// peer that never stops sending them (this function's very adversary)
+/// evade `idle_timeout_ms` forever, so the timer counts the wait for a
+/// chunk with something in it, empties included in that wait.
 fn guarded_body(source: ReadableSource, idle: Duration) -> ReadableSource {
     Box::pin(gwead::futures::stream::unfold(
         Some(source),
         move |state| async move {
             let mut source = state?;
+            let deadline = tokio::time::Instant::now() + idle;
             loop {
-                match tokio::time::timeout(idle, source.next()).await {
+                match tokio::time::timeout_at(deadline, source.next()).await {
                     Ok(Some(Ok(bytes))) if bytes.is_empty() => {
                         tokio::task::yield_now().await;
                         continue;
@@ -257,9 +278,13 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// the body as well when it is buffered. A streamed body is bounded
 /// instead by `idle_timeout_ms` between chunks; the invocation's
 /// cancellation token bounds a *consumer's* read of it, releasing one
-/// parked on a quiet chunk as `STREAM_CANCELLED`, and the connection
-/// itself is torn down by the kernel's post-invocation drain once the
-/// action ends.
+/// parked on a source that has gone quiet as `STREAM_CANCELLED`. The
+/// connection itself ends when the consumer closes or drops its
+/// handle; the kernel's post-invocation drain only reaches it when the
+/// caller left the kernel owning the stream table — a caller that
+/// supplies its own (`with_streams`, which is how a streamed handle
+/// reaches a consumer at all) keeps handles alive past the action
+/// returning, and is responsible for closing them itself.
 pub fn http_post<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -546,14 +571,26 @@ mod tests {
     /// source can (gwead#22): `guarded_body` drops empty chunks itself
     /// so gwead's own read loop, which skips them *inside* one call
     /// rather than returning to ask again, never sees one to skip.
+    ///
+    /// Bounded and sentinel-based, not timeout-based: plan section 6
+    /// forbids relying on a timeout to catch a spin, and half of this
+    /// fix's own regression — `yield_now` deleted but the `continue`
+    /// kept — spins synchronously inside `guarded_body`, in the same
+    /// task as a `tokio::time::timeout` wrapped around the read, so
+    /// such a timeout is never even polled and the suite wedges
+    /// instead of failing red. A finite flood followed by a real
+    /// sentinel chunk fails on a wrong *value* the instant the fix (or
+    /// half of it) is reverted, whether the revert hangs or not.
     #[tokio::test]
     async fn an_always_empty_body_does_not_starve_a_fired_token() {
         use gwead::bytes::Bytes;
         use gwead::kernel::streams::{STREAM_CANCELLED, StreamRegistry, read_async_shared};
         use gwead::tokio_util::sync::CancellationToken;
 
-        let source: ReadableSource =
-            Box::pin(gwead::futures::stream::repeat_with(|| Ok(Bytes::new())));
+        let mut items: Vec<std::io::Result<Bytes>> =
+            (0..10_000).map(|_| Ok(Bytes::new())).collect();
+        items.push(Ok(Bytes::from_static(b"payload")));
+        let source: ReadableSource = Box::pin(gwead::futures::stream::iter(items));
         let guarded = guarded_body(source, Duration::from_secs(60));
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/octet-stream", guarded);
@@ -561,12 +598,110 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut buf = [0u8; 8];
+        let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
+        assert_eq!(n, STREAM_CANCELLED, "got n={n}");
+    }
+
+    /// Dropping empty chunks must not drop or reorder the real ones
+    /// around them: widening the `bytes.is_empty()` guard, or moving
+    /// it above the `Ok(Some(item))` arm, would truncate a body with
+    /// this still green if it only tested an all-empty source.
+    #[tokio::test]
+    async fn empty_chunks_interleaved_with_data_are_dropped_without_losing_bytes() {
+        use gwead::bytes::Bytes;
+        use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
+        use gwead::tokio_util::sync::CancellationToken;
+
+        let items: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(b"hi")),
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(b"there")),
+            Ok(Bytes::new()),
+        ];
+        let source: ReadableSource = Box::pin(gwead::futures::stream::iter(items));
+        let guarded = guarded_body(source, Duration::from_secs(60));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/octet-stream", guarded);
+        let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        let mut buf = [0u8; 16];
+        assert_eq!(read_async_shared(&streams, id, &mut buf, &cancel).await, 2);
+        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(read_async_shared(&streams, id, &mut buf, &cancel).await, 5);
+        assert_eq!(&buf[..5], b"there");
+        assert_eq!(
+            read_async_shared(&streams, id, &mut buf, &cancel).await,
+            STREAM_EOF
+        );
+    }
+
+    /// An error item past some empty chunks still surfaces: the skip
+    /// arm must not swallow anything but a genuinely empty `Ok`.
+    #[tokio::test]
+    async fn an_error_item_past_empty_chunks_still_surfaces() {
+        use gwead::bytes::Bytes;
+        use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared};
+        use gwead::tokio_util::sync::CancellationToken;
+
+        let items: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::new()),
+            Err(std::io::Error::other("boom")),
+            Ok(Bytes::from_static(b"after")),
+        ];
+        let source: ReadableSource = Box::pin(gwead::futures::stream::iter(items));
+        let guarded = guarded_body(source, Duration::from_secs(60));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/octet-stream", guarded);
+        let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            read_async_shared(&streams, id, &mut buf, &cancel).await,
+            STREAM_IO_ERROR
+        );
+    }
+
+    /// The idle deadline is computed once per real chunk sought, not
+    /// restarted by every skipped empty one: a peer that sends only
+    /// empty chunks (this function's very adversary) must not be able
+    /// to evade `idle_timeout_ms` just by never sending anything real.
+    /// Bounded by a generous outer timeout, not relied on as the
+    /// guard: the loop yields cooperatively either way (that half is
+    /// pinned above), so if the deadline itself failed to bound this,
+    /// the outer bound would still be the one to fire, at 3s instead
+    /// of ~50ms — a difference this test can see either way.
+    #[tokio::test]
+    async fn an_empty_chunk_flood_still_trips_the_idle_timeout() {
+        use gwead::bytes::Bytes;
+        use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared};
+        use gwead::tokio_util::sync::CancellationToken;
+
+        // A source that trickles an empty chunk every 5ms, forever —
+        // not `repeat_with`, which resolves every poll synchronously
+        // and so never gives `tokio::time::timeout_at` an inner
+        // `Pending` to observe its own elapsed clock against, no
+        // matter where the deadline is computed. A real socket always
+        // has *some* latency between frames, however small; this
+        // source's sleep stands in for that, so the loop's `.await` on
+        // `source.next()` genuinely suspends and the accumulated wait
+        // is what the hoisted deadline measures.
+        let source: ReadableSource = Box::pin(gwead::futures::stream::unfold((), |()| async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Some((Ok(Bytes::new()), ()))
+        }));
+        let guarded = guarded_body(source, Duration::from_millis(50));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/octet-stream", guarded);
+        let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        let mut buf = [0u8; 8];
         let n = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             read_async_shared(&streams, id, &mut buf, &cancel),
         )
         .await
-        .expect("a fired token must not be starved by an empty-chunk flood");
-        assert_eq!(n, STREAM_CANCELLED);
+        .expect("idle_timeout_ms itself must bound an empty-chunk flood");
+        assert_eq!(n, STREAM_IO_ERROR, "got n={n}");
     }
 }

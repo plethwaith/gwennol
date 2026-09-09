@@ -698,17 +698,23 @@ impl Session {
                 // The turn's token is the authority once it has fired:
                 // a stream that ends then, or fails on the read itself,
                 // is the cut arriving, not a vendor hanging up. A read
-                // parked on the fetch step's body is released by gwead
-                // itself as `STREAM_CANCELLED` the moment the token
-                // fires. A `STREAM_IO_ERROR` under a fired token instead
-                // means the vendor's own transport error arrived in the
-                // same poll as the cancellation and won it — gwead polls
-                // the source before the token — so both are read as the
-                // cut arriving here, and the error either one carries
-                // goes to the log, as at the other two sites. A contract
-                // violation coinciding with the cut — a line that is not
-                // JSON, a code the loop's own table does not carry — is
-                // still a contract violation.
+                // parked on this handle — the chat action's streamed
+                // output — is released by gwead itself as
+                // `STREAM_CANCELLED` the moment the token fires. A
+                // `STREAM_IO_ERROR` reaching here under a fired token
+                // needs no particular timing: `cancel.is_cancelled()`
+                // below is checked *after* `reader.next()` has already
+                // returned, so an error from well before the
+                // cancellation lands here too — whichever of three
+                // things produced it: a failing relay step, reported
+                // once the bytes it wrote are drained; the fetch step's
+                // own idle timeout, synthesised by `guarded_body`; or a
+                // genuine vendor transport fault. Either shape is read
+                // as the cut arriving here, and the error either one
+                // carries goes to the log, as at the other two sites. A
+                // contract violation coinciding with the cut — a line
+                // that is not JSON, a code the loop's own table does
+                // not carry — is still a contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
                     if cancel.is_cancelled() =>

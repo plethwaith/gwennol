@@ -69,7 +69,7 @@ impl EventReader {
     /// The next event, `None` at end-of-stream. An incomplete final line
     /// — bytes after the last newline when the stream ends — is not an
     /// event: the contract frames every event as a whole line, so a
-    /// torn one is the failed-turn shape, and the caller's
+    /// torn one is a failed-turn shape, and the caller's
     /// no-`end`-event rule reports it.
     ///
     /// Two guards keep a cancelled turn from reading past its token,

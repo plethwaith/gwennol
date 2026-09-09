@@ -259,10 +259,16 @@ fn sse_stub() -> &'static SseStub {
                   Connection: close\r\n\r\n",
             );
             let _ = socket.flush();
-            if path == "/slow-turn" {
+            if path == "/slow-turn" || path == "/slow-turn-cancel" {
                 // A long, slow turn: text events at a steady pace, so a
                 // consumer that hangs up does so with plenty still to
                 // come. Ends when the relay closes the connection.
+                // `/slow-turn-cancel` is the identical route under its
+                // own path, so the cancellation test below can poll
+                // `hangups` for a literal only it drives — two tests
+                // both hanging up `/slow-turn` under the shared,
+                // process-wide fixture would let either satisfy the
+                // other's poll.
                 for i in 0..200 {
                     let event = format!(
                         "event: text\ndata: {{\"type\":\"text\",\"text\":\"tick {i} \"}}\n\n"
@@ -424,8 +430,11 @@ async fn the_guest_builds_the_vendor_request() {
 
 /// A vendor error event is relayed as the contract error event and is
 /// the last event: nothing after it — not even the vendor's own
-/// spurious `end` — reaches the consumer, and the stream ends without
-/// an `end` event, one of the contract's two failed-turn shapes.
+/// spurious `end` — reaches the consumer. This is the contract's
+/// reported-failure shape (an `error` event, then end-of-stream, never
+/// `end`) — distinct from the two shapes a failure with nothing to
+/// report takes: silent end-of-stream with the cause lost, or the read
+/// itself failing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     let f = fixture();
@@ -687,7 +696,7 @@ async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
     use gwead::futures::StreamExt as _;
     let f = fixture();
     let input = json!({
-        "url": format!("http://{}/slow-turn", f.stub.addr),
+        "url": format!("http://{}/slow-turn-cancel", f.stub.addr),
         "request": {"model": "m3-fixture", "stream": true, "messages": []}
     });
     let mut handle = f
@@ -733,18 +742,20 @@ async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
         "the relay step itself must have completed, not been swallowed under the cancellation: {:?}",
         result.step_results
     );
-    // And the fetch step's own upstream connection is genuinely torn
-    // down, the same proof the reader-gone sibling test above uses —
-    // this is the test that most needs it, since the whole premise of
-    // this round's fix is that gwead's own release now does the
-    // teardown `guarded_body` used to do itself.
+    // And the vendor connection ends — on its own dedicated path, so
+    // this poll cannot be satisfied by the reader-gone sibling test's
+    // identical hang-up on the shared, process-wide fixture. This
+    // does not distinguish *who* closed it (the relay's own
+    // `upstream.close()`, or the kernel's post-invocation drain, which
+    // runs regardless once the action ends): either way the vendor
+    // sees the connection go.
     for _ in 0..250 {
         if f.stub
             .hangups
             .lock()
             .unwrap()
             .iter()
-            .any(|p| p == "/slow-turn")
+            .any(|p| p == "/slow-turn-cancel")
         {
             return;
         }

@@ -129,7 +129,11 @@ fn classify_read(n: i32) -> Result<Received, i32> {
 
 /// Map one `stream_write` return value to a step of
 /// [`Stream::write_all`]'s loop. Pure and testable off-wasm, unlike
-/// `sys::stream_write` itself; mirrors `classify_read`.
+/// `sys::stream_write` itself; built the same way as `classify_read`,
+/// with one deliberate difference — `classify_read` maps `0` to
+/// `Ok(Received::Bytes(0))`, a real (if never-healthy) outcome to
+/// report, where a write's `0` is `ZeroCommit`, an error the caller
+/// decodes, since the two ABI calls don't treat it alike.
 ///
 /// `Ok(Delivery::Delivered)` means only that *this call* committed `n`
 /// bytes — the loop advances `rest` by `n` and keeps going, or, if
@@ -159,8 +163,12 @@ fn classify_write(n: i32) -> Result<Delivery, i32> {
 /// an entry point that obtains a handle from
 /// [`invoke_streaming`](crate::invoke_streaming) and returns it as part
 /// of its result must leave it open for whoever reads the result. Call
-/// [`Stream::close`] when the guest itself is the endpoint and is done;
-/// otherwise the kernel's post-invocation drain cleans up.
+/// [`Stream::close`] when the guest itself is the endpoint and is
+/// done — don't rely on the kernel's post-invocation drain instead: it
+/// runs only when the embedder that invoked this action left the
+/// kernel owning the stream table, and is skipped whenever that
+/// embedder supplied its own, which is how a streamed handle reaches a
+/// consumer outside the action at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream {
     handle: i32,
