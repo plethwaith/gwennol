@@ -547,15 +547,11 @@ mod tests {
     /// so gwead's own read loop, which skips them *inside* one call
     /// rather than returning to ask again, never sees one to skip.
     ///
-    /// Bounded and sentinel-based, not timeout-based: plan section 6
-    /// forbids relying on a timeout to catch a spin, and half of this
-    /// fix's own regression — `yield_now` deleted but the `continue`
-    /// kept — spins synchronously inside `guarded_body`, in the same
-    /// task as a `tokio::time::timeout` wrapped around the read, so
-    /// such a timeout is never even polled and the suite wedges
-    /// instead of failing red. A finite flood followed by a real
-    /// sentinel chunk fails on a wrong *value* the instant the fix (or
-    /// half of it) is reverted, whether the revert hangs or not.
+    /// Bounded and value-based: a finite flood followed by a real
+    /// sentinel chunk fails on a wrong value if the skip or its yield
+    /// goes, whether or not the loop would spin, where a timeout
+    /// around the read would never be polled by a spin inside
+    /// `guarded_body`.
     #[tokio::test]
     async fn an_always_empty_body_does_not_starve_a_fired_token() {
         use gwead::bytes::Bytes;
@@ -641,26 +637,16 @@ mod tests {
         );
     }
 
-    /// The idle deadline is computed once per real chunk sought, not
-    /// restarted by every skipped empty one: a *trickling* peer that
-    /// sends only empty chunks, spaced out enough for `source.next()`
-    /// to genuinely suspend between them, must not be able to evade
-    /// `idle_timeout_ms` just by never sending anything real. (An
-    /// always-ready peer is a different case entirely — see
-    /// `an_always_empty_body_does_not_starve_a_fired_token`'s doc — and
-    /// this test does not claim to bound one.)
+    /// The idle deadline is taken once per chunk sought: a trickling
+    /// peer that sends only empty chunks, spaced out enough to park
+    /// between them, cannot evade `idle_timeout_ms` that way. The
+    /// always-ready case is
+    /// `an_always_empty_body_does_not_starve_a_fired_token`'s.
     ///
-    /// `start_paused = true` runs this against a mocked clock: the
-    /// 5ms-per-chunk margin against the 50ms deadline is exact virtual
-    /// time, and the test resolves in milliseconds rather than costing
-    /// real wall-clock time on every run. Bounded by a fixed item count
-    /// too, not an outer timeout: an unbounded trickle would still run
-    /// forever against a reverted hoist, mocked clock or not, since
-    /// nothing would ever reach a value to assert on. 40 empty chunks
-    /// at 5ms is 200ms of (virtual) delay if all are consumed —
-    /// comfortably past the 50ms deadline — so a reverted hoist reaches
-    /// the real chunk after item 40 and this fails on a **value**, with
-    /// no timeout anywhere and no dependence on wall-clock time at all.
+    /// `start_paused = true` gives exact virtual time; 40 items bound
+    /// the run. A deadline that restarted on empties would reach the
+    /// real chunk after item 40 and fail on a value, with no timeout
+    /// anywhere.
     #[tokio::test(start_paused = true)]
     async fn a_trickling_empty_chunk_flood_still_trips_the_idle_timeout() {
         use gwead::bytes::Bytes;
