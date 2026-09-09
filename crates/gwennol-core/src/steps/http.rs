@@ -139,18 +139,28 @@ fn redirect_target(
 /// gwead's own read loop never sees one: gwead skips an empty chunk
 /// *inside* one `read_async` call instead of returning to ask again, so
 /// a source that is always immediately ready with them never lets a
-/// fired token win the race (tracked upstream as gwead#22). Nothing in
-/// this repo guarantees a raw `reqwest::bytes_stream()`'s chunks are
-/// non-empty — unlike a `gwennol-guest` guest's `Stream::write_all`,
-/// which never commits an empty write — so a hostile or broken peer
-/// that sends only empty ones is this function's problem to bound.
+/// fired token win the race (tracked upstream as gwead#22). This is
+/// defense-in-depth against a source contract this repo does not
+/// itself enforce — nothing pins a raw `reqwest::bytes_stream()`'s
+/// chunks as non-empty the way a `gwennol-guest` guest's
+/// `Stream::write_all` pins its own writes — rather than a fix for a
+/// threat live against this build: `h2` is absent from this
+/// workspace's lockfile and `reqwest` is built without the `http2`
+/// feature, and over HTTP/1.1 chunked encoding a size-0 chunk *is* the
+/// terminator, so a non-terminal empty chunk from a real peer, hostile
+/// or not, cannot reach here today. The guard exists so a future flip
+/// of that feature does not silently make the residual live.
 ///
-/// `yield_now` between chunks is load-bearing, not a courtesy to other
-/// tasks: it is what makes this call return `Pending` at least once.
-/// `source.next()` is what gwead's own `read_async` races the
-/// cancellation token against, `biased` toward source — an
-/// always-ready empty chunk would resolve *this* call `Ready` on every
-/// poll, so the race would never reach the token at all. The first
+/// `yield_now` after a dropped chunk is load-bearing, not a courtesy to
+/// other tasks: it is what makes this call return `Pending` at least
+/// once. `source.next()` is what gwead's own `read_async` races the
+/// cancellation token against, `biased` toward source — a source that
+/// is always immediately ready with empty chunks would resolve *this*
+/// call `Ready` on every poll if the empty-chunk skip above ran with
+/// no suspension point of its own, so the race would never reach the
+/// token at all. (That is the counterfactual for removing `yield_now`
+/// specifically; removing the whole skip arm instead hands such a
+/// chunk to the consumer, a different failure entirely.) The first
 /// poll of `yield_now` returns `Pending`, which propagates out through
 /// this whole `.await` chain as this call's own result for that poll,
 /// letting gwead's select fall through to the token this time. This is
@@ -164,9 +174,14 @@ fn redirect_target(
 ///
 /// The per-chunk idle deadline is computed once per real chunk sought,
 /// not once per host call: an empty chunk restarting it would let a
-/// peer that never stops sending them (this function's very adversary)
-/// evade `idle_timeout_ms` forever, so the timer counts the wait for a
-/// chunk with something in it, empties included in that wait.
+/// *trickling* peer that never stops sending them evade
+/// `idle_timeout_ms` forever, so the timer counts the wait for a chunk
+/// with something in it, empties included in that wait. This bounds
+/// only a peer whose gaps between chunks are real enough for
+/// `source.next()` to suspend; the always-ready case above never
+/// reaches a deadline check at all — `tokio::time::timeout_at` only
+/// consults its clock once the future it wraps returns `Pending`, and
+/// an always-ready source never does.
 fn guarded_body(source: ReadableSource, idle: Duration) -> ReadableSource {
     Box::pin(gwead::futures::stream::unfold(
         Some(source),
@@ -280,11 +295,15 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// cancellation token bounds a *consumer's* read of it, releasing one
 /// parked on a source that has gone quiet as `STREAM_CANCELLED`. The
 /// connection itself ends when the consumer closes or drops its
-/// handle; the kernel's post-invocation drain only reaches it when the
-/// caller left the kernel owning the stream table — a caller that
-/// supplies its own (`with_streams`, which is how a streamed handle
-/// reaches a consumer at all) keeps handles alive past the action
-/// returning, and is responsible for closing them itself.
+/// handle, or — when the kernel still owns the stream table at the end
+/// of the driving action — the kernel's own post-invocation drain
+/// force-closes it. Two dispatch paths hand a consumer a streamed
+/// handle and disagree on which: `with_streams` (the agent loop's own
+/// streamed reads) supplies the caller's own table, which disables
+/// that drain for the whole call, so a consumer must close what it
+/// opens; `into_dataflow_streaming_handle` allocates its own table and
+/// leaves the drain enabled, so it is what ends a handle nothing else
+/// closed.
 pub fn http_post<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -603,9 +622,13 @@ mod tests {
     }
 
     /// Dropping empty chunks must not drop or reorder the real ones
-    /// around them: widening the `bytes.is_empty()` guard, or moving
-    /// it above the `Ok(Some(item))` arm, would truncate a body with
-    /// this still green if it only tested an all-empty source.
+    /// around them: a mutated `bytes.is_empty()` guard that also
+    /// matched some real chunks would truncate a body with the
+    /// all-empty starvation test above still green. This does not
+    /// independently prove *this function's* skip is what runs —
+    /// gwead's own `read_async` skips empty chunks too, so the same
+    /// bytes would survive with this arm disabled entirely — only that
+    /// nothing here loses or reorders data around one.
     #[tokio::test]
     async fn empty_chunks_interleaved_with_data_are_dropped_without_losing_bytes() {
         use gwead::bytes::Bytes;
@@ -663,45 +686,48 @@ mod tests {
     }
 
     /// The idle deadline is computed once per real chunk sought, not
-    /// restarted by every skipped empty one: a peer that sends only
-    /// empty chunks (this function's very adversary) must not be able
-    /// to evade `idle_timeout_ms` just by never sending anything real.
-    /// Bounded by a generous outer timeout, not relied on as the
-    /// guard: the loop yields cooperatively either way (that half is
-    /// pinned above), so if the deadline itself failed to bound this,
-    /// the outer bound would still be the one to fire, at 3s instead
-    /// of ~50ms — a difference this test can see either way.
-    #[tokio::test]
-    async fn an_empty_chunk_flood_still_trips_the_idle_timeout() {
+    /// restarted by every skipped empty one: a *trickling* peer that
+    /// sends only empty chunks, spaced out enough for `source.next()`
+    /// to genuinely suspend between them, must not be able to evade
+    /// `idle_timeout_ms` just by never sending anything real. (An
+    /// always-ready peer is a different case entirely — see
+    /// `an_always_empty_body_does_not_starve_a_fired_token`'s doc — and
+    /// this test does not claim to bound one.)
+    ///
+    /// `start_paused = true` runs this against a mocked clock: the
+    /// 5ms-per-chunk margin against the 50ms deadline is exact and
+    /// immune to real scheduling jitter, unlike a real-time sleep
+    /// under load, which can stretch enough to make the fixed and
+    /// regressed code trip identically. Bounded by a fixed item count
+    /// too, not an outer timeout: an unbounded trickle would still run
+    /// forever against a reverted hoist, mocked clock or not, since
+    /// nothing would ever reach a value to assert on. 40 empty chunks
+    /// at 5ms is 200ms of (virtual) delay if all are consumed —
+    /// comfortably past the 50ms deadline — so a reverted hoist reaches
+    /// the real chunk after item 40 and this fails on a **value**, with
+    /// no timeout anywhere and no dependence on wall-clock time at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickling_empty_chunk_flood_still_trips_the_idle_timeout() {
         use gwead::bytes::Bytes;
         use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared};
         use gwead::tokio_util::sync::CancellationToken;
 
-        // A source that trickles an empty chunk every 5ms, forever —
-        // not `repeat_with`, which resolves every poll synchronously
-        // and so never gives `tokio::time::timeout_at` an inner
-        // `Pending` to observe its own elapsed clock against, no
-        // matter where the deadline is computed. A real socket always
-        // has *some* latency between frames, however small; this
-        // source's sleep stands in for that, so the loop's `.await` on
-        // `source.next()` genuinely suspends and the accumulated wait
-        // is what the hoisted deadline measures.
-        let source: ReadableSource = Box::pin(gwead::futures::stream::unfold((), |()| async {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            Some((Ok(Bytes::new()), ()))
-        }));
+        let source: ReadableSource =
+            Box::pin(gwead::futures::stream::unfold(0usize, |i| async move {
+                if i < 40 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    Some((Ok(Bytes::new()), i + 1))
+                } else {
+                    Some((Ok(Bytes::from_static(b"payload")), i + 1))
+                }
+            }));
         let guarded = guarded_body(source, Duration::from_millis(50));
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/octet-stream", guarded);
         let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
         let cancel = CancellationToken::new();
         let mut buf = [0u8; 8];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            read_async_shared(&streams, id, &mut buf, &cancel),
-        )
-        .await
-        .expect("idle_timeout_ms itself must bound an empty-chunk flood");
+        let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
         assert_eq!(n, STREAM_IO_ERROR, "got n={n}");
     }
 }

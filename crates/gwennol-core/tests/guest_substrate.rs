@@ -430,11 +430,12 @@ async fn the_guest_builds_the_vendor_request() {
 
 /// A vendor error event is relayed as the contract error event and is
 /// the last event: nothing after it — not even the vendor's own
-/// spurious `end` — reaches the consumer. This is the contract's
-/// reported-failure shape (an `error` event, then end-of-stream, never
-/// `end`) — distinct from the two shapes a failure with nothing to
-/// report takes: silent end-of-stream with the cause lost, or the read
-/// itself failing.
+/// spurious `end` — reaches the consumer. This is the first of the
+/// contract's three mid-stream failure shapes (`docs/SPI.md`): a
+/// provider-authored `error` event, then end-of-stream, never `end` —
+/// distinct from the other two, which carry no such event: silent
+/// end-of-stream with the cause lost, or the read itself failing,
+/// which does still report the failing step's own text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     let f = fixture();
@@ -455,8 +456,13 @@ async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
 /// failure itself as `STREAM_IO_ERROR` rather than an EOF a consumer
 /// could mistake for a clean end — the garbage line is not relayed,
 /// and the vendor's later `end` event never reaches the consumer. The
-/// relay does not close its output on this path; the kernel's
-/// post-invocation drain and failure reporting do.
+/// relay does not close its output on this path; returning `Err` drops
+/// its writable handle, which closes the channel, and gwead's own
+/// callee-failure recording is what turns that closed channel into a
+/// reported `STREAM_IO_ERROR` rather than a plain EOF. Nothing here
+/// depends on the kernel's post-invocation drain — this test dispatches
+/// with its own `with_streams` registry, which disables that drain for
+/// the whole call.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_relay_step_surfaces_as_a_reported_stream_failure() {
     let f = fixture();
@@ -747,8 +753,9 @@ async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
     // identical hang-up on the shared, process-wide fixture. This
     // does not distinguish *who* closed it (the relay's own
     // `upstream.close()`, or the kernel's post-invocation drain, which
-    // runs regardless once the action ends): either way the vendor
-    // sees the connection go.
+    // `into_dataflow_streaming_handle` keeps enabled and so runs
+    // regardless once the action ends): either way the vendor sees the
+    // connection go.
     for _ in 0..250 {
         if f.stub
             .hangups

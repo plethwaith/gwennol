@@ -705,16 +705,20 @@ impl Session {
                 // needs no particular timing: `cancel.is_cancelled()`
                 // below is checked *after* `reader.next()` has already
                 // returned, so an error from well before the
-                // cancellation lands here too — whichever of three
-                // things produced it: a failing relay step, reported
-                // once the bytes it wrote are drained; the fetch step's
-                // own idle timeout, synthesised by `guarded_body`; or a
-                // genuine vendor transport fault. Either shape is read
-                // as the cut arriving here, and the error either one
-                // carries goes to the log, as at the other two sites. A
-                // contract violation coinciding with the cut — a line
-                // that is not JSON, a code the loop's own table does
-                // not carry — is still a contract violation.
+                // cancellation lands here too. Only a failing relay
+                // step reports directly onto this handle, once the
+                // bytes it wrote are drained; the fetch step's own
+                // idle timeout (synthesised by `guarded_body`) and a
+                // genuine vendor transport fault reach here the same
+                // way, one link upstream — each fails the fetch step,
+                // which fails the relay step's own read of it, which
+                // is what this handle then reports. Either shape
+                // (`Cancelled` or `Io`) is read as the cut arriving
+                // here, and the error either one carries goes to the
+                // log, as at the other two sites. A contract violation
+                // coinciding with the cut — a line that is not JSON, a
+                // code the loop's own table does not carry — is still
+                // a contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
                     if cancel.is_cancelled() =>
