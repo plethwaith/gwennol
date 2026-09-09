@@ -984,8 +984,8 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
             json!({"path": "hello.txt"}),
             "operator denied",
         ),
-        // The code without the turn's token is not a cancel: the
-        // kernel's ceiling, or — here — the plugin's own doing.
+        // The code without the turn's token is not a cancel: the plugin's own
+        // doing (the kernel's ceiling reports a timeout, never this).
         (
             "/forged-cancel",
             "forger",

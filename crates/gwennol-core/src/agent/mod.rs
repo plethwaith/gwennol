@@ -58,11 +58,13 @@
 //!   reported as the kernel's typed cancellation. The turn's own token
 //!   is the authority: once it has fired, whatever a step reports is
 //!   the cut arriving (its text goes to the log), and a cancellation
-//!   arriving *without* it — the kernel's action ceiling ended the
-//!   step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
-//!   step failure, reported as such and logged. Only a withdrawn
-//!   approval carries more than the typed variant can: nothing ran,
-//!   which is why it alone stays the structured `steps::CANCELLED_CODE`.
+//!   arriving *without* it is a step failure, reported as such and
+//!   logged — the kernel's action ceiling is not one, since its
+//!   watchdog reports a step it stopped as `ExecutionTimeout`, so the
+//!   known source is a plugin throwing `steps::CANCELLED_CODE` itself.
+//!   Only a withdrawn approval carries more than the typed variant
+//!   can: nothing ran, which is why it alone stays the structured
+//!   `steps::CANCELLED_CODE`.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as
@@ -823,13 +825,13 @@ impl Session {
                             return Err(Interrupted(Cut::from_error(&e)));
                         }
                         // A cancellation nobody asked for is a failure
-                        // to report, not a cut: the kernel's action
-                        // ceiling ended the step, or the plugin threw
-                        // the code itself.
+                        // to report, not a cut: the kernel's ceiling
+                        // reports itself as a timeout, so this is a
+                        // plugin throwing the code itself.
                         Err(e) if reports_cancellation(&e) => {
                             warn_if_unrequested(&e);
                             Err(format!(
-                                "{:?} stopped with a cancellation the turn did not request — the kernel's action ceiling, or the plugin's own doing: {e}",
+                                "{:?} stopped with a cancellation the turn did not request: {e}",
                                 call.name
                             ))
                         }
@@ -935,14 +937,14 @@ impl Cut {
     }
 }
 
-/// Whether a kernel error carries a cancellation: the kernel's own
-/// typed [`KernelError::Cancelled`] — an in-work host step stop, or the
-/// kernel's own between-step check — or a host step's structured
-/// `steps::CANCELLED_CODE`, which now names only a withdrawn approval.
-/// Never on its own a reason to treat a turn as cancelled — the turn's
-/// token is the authority — because `Cancelled` also arrives when the
-/// kernel's action ceiling cancels the invocation (gwead remaps only
-/// its own `Cancelled` to a timeout), and because any plugin may throw
+/// Whether a kernel error carries a cancellation: the kernel's typed
+/// [`KernelError::Cancelled`] — a host step that stopped on its token,
+/// or the kernel's own between-step check — or a host step's
+/// structured `steps::CANCELLED_CODE`, which names a withdrawn
+/// approval. Never on its own a reason to treat a turn as cancelled:
+/// the turn's token is the authority. The kernel's action ceiling
+/// produces neither shape — its watchdog reports a step it stopped as
+/// [`KernelError::ExecutionTimeout`] — but any plugin may throw
 /// `steps::CANCELLED_CODE` itself.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
@@ -955,7 +957,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling ended the step, or the plugin threw the code itself");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: a plugin threw the code itself");
     }
 }
 
