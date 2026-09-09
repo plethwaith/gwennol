@@ -146,10 +146,12 @@ fn redirect_target(
 /// `Stream::write_all` pins its own writes — rather than a fix for a
 /// threat live against this build: `h2` is absent from this
 /// workspace's lockfile and `reqwest` is built without the `http2`
-/// feature, and over HTTP/1.1 chunked encoding a size-0 chunk *is* the
-/// terminator, so a non-terminal empty chunk from a real peer, hostile
-/// or not, cannot reach here today. The guard exists so a future flip
-/// of that feature does not silently make the residual live.
+/// feature, so over HTTP/1.1 chunked encoding a size-0 chunk *is* the
+/// terminator and a non-terminal empty chunk from a real peer, hostile
+/// or not, cannot reach here that way; `reqwest` also carries none of
+/// `gzip`/`brotli`/`zstd`, so a decompressor emitting one is equally
+/// absent. The guard exists so a future flip of either kind of feature
+/// does not silently make the residual live.
 ///
 /// `yield_now` after a dropped chunk is load-bearing, not a courtesy to
 /// other tasks: it is what makes this call return `Pending` at least
@@ -695,10 +697,9 @@ mod tests {
     /// this test does not claim to bound one.)
     ///
     /// `start_paused = true` runs this against a mocked clock: the
-    /// 5ms-per-chunk margin against the 50ms deadline is exact and
-    /// immune to real scheduling jitter, unlike a real-time sleep
-    /// under load, which can stretch enough to make the fixed and
-    /// regressed code trip identically. Bounded by a fixed item count
+    /// 5ms-per-chunk margin against the 50ms deadline is exact virtual
+    /// time, and the test resolves in milliseconds rather than costing
+    /// real wall-clock time on every run. Bounded by a fixed item count
     /// too, not an outer timeout: an unbounded trickle would still run
     /// forever against a reverted hoist, mocked clock or not, since
     /// nothing would ever reach a value to assert on. 40 empty chunks
@@ -729,5 +730,46 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
         assert_eq!(n, STREAM_IO_ERROR, "got n={n}");
+    }
+
+    /// The symmetric case the test above does not cover: the deadline
+    /// must *restart* on every real chunk sought, not stay fixed for
+    /// the whole connection. A source delivering ten real chunks 40ms
+    /// apart, against a 50ms idle, is 400ms of total virtual time —
+    /// comfortably past a single whole-body deadline computed once —
+    /// but each individual 40ms gap is comfortably under the 50ms
+    /// per-chunk deadline this function is supposed to give it. A
+    /// healthy stream any longer than `idle_timeout_ms` in total would
+    /// otherwise fail mid-answer with a synthesised "no response data
+    /// for …", which is essentially every real turn.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_deadline_restarts_on_every_real_chunk() {
+        use gwead::bytes::Bytes;
+        use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
+        use gwead::tokio_util::sync::CancellationToken;
+
+        let source: ReadableSource =
+            Box::pin(gwead::futures::stream::unfold(0usize, |i| async move {
+                if i < 10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    Some((Ok(Bytes::from_static(b"x")), i + 1))
+                } else {
+                    None
+                }
+            }));
+        let guarded = guarded_body(source, Duration::from_millis(50));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/octet-stream", guarded);
+        let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        let mut buf = [0u8; 8];
+        for i in 0..10 {
+            let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
+            assert_eq!(n, 1, "chunk {i}: got n={n}");
+        }
+        assert_eq!(
+            read_async_shared(&streams, id, &mut buf, &cancel).await,
+            STREAM_EOF
+        );
     }
 }

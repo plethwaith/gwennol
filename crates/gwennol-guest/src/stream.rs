@@ -169,10 +169,14 @@ fn classify_write(n: i32) -> Result<Delivery, i32> {
 /// [`invoke_streaming`](crate::invoke_streaming) and returns it as part
 /// of its result must leave it open for whoever reads the result. Call
 /// [`Stream::close`] when the guest itself is the endpoint and is
-/// done — don't rely on the kernel's post-invocation drain instead:
-/// whether it reaches this handle at all depends on how the embedder
+/// done — don't rely on the kernel's post-invocation drain instead.
+/// Whether it reaches this handle at all depends on how the embedder
 /// that invoked this action manages its own stream table, which is
-/// not this guest's to know.
+/// not this guest's to know; and it never reaches a handle at all when
+/// this action is itself running as a nested
+/// [`invoke_streaming`](crate::invoke_streaming) callee (a `dataflow`
+/// action's `long_running` step, say), whichever way the outermost
+/// embedder dispatched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream {
     handle: i32,

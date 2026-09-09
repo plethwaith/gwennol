@@ -159,7 +159,7 @@ provider is two actions on one plugin —
   NDJSON to `Stream::output()`. The callee runs on a background task;
   a failure there surfaces to the consumer as a reported read error
   carrying the failed step's own text, once the bytes it did write are
-  drained — one of the contract's two failed-turn shapes, with no
+  drained — one of the contract's three failed-turn shapes, with no
   extra plumbing.
 
 ## Building

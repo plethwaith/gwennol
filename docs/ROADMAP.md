@@ -147,7 +147,7 @@ written, and it must be settled before a provider exists.
   long-running guest step reads the SSE bytes and writes contract NDJSON;
   the readable end lands in the caller's own stream table, and a callee
   failure surfaces as a reported read error carrying the failed step's
-  own text — one of the contract's two failed-turn shapes. Whichever
+  own text — one of the contract's three failed-turn shapes. Whichever
   substrate is chosen must be able to occupy that long-running slot.
 - **Not in scope:** the Anthropic provider itself; installing plugins from
   outside the binary.

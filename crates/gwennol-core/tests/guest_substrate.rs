@@ -456,13 +456,17 @@ async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
 /// failure itself as `STREAM_IO_ERROR` rather than an EOF a consumer
 /// could mistake for a clean end — the garbage line is not relayed,
 /// and the vendor's later `end` event never reaches the consumer. The
-/// relay does not close its output on this path; returning `Err` drops
-/// its writable handle, which closes the channel, and gwead's own
-/// callee-failure recording is what turns that closed channel into a
-/// reported `STREAM_IO_ERROR` rather than a plain EOF. Nothing here
-/// depends on the kernel's post-invocation drain — this test dispatches
-/// with its own `with_streams` registry, which disables that drain for
-/// the whole call.
+/// relay does not close its output on this path; gwead does, and in
+/// the right order: the kernel holds its own reserved sender on the
+/// callee's writable handle until the callee's execution has ended,
+/// records that outcome first, and only then drops its own sender —
+/// closing the channel for the consumer's reader — so a failure can
+/// never race a close and be read as a clean EOF. That recorded
+/// outcome is what the consumer's read then reports as
+/// `STREAM_IO_ERROR`. Nothing here depends on the kernel's
+/// post-invocation drain — this test dispatches with its own
+/// `with_streams` registry, which disables that drain for the whole
+/// call.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_relay_step_surfaces_as_a_reported_stream_failure() {
     let f = fixture();
