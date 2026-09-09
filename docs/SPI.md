@@ -120,10 +120,11 @@ ignore them.
 
 ### Failure, buffered — settled
 
-Settled in milestone 4, with a real provider to inform it. The buffered
-form has a third shape, `{"error": {"message", "retryable"?, "kind"?}}`
-— the same three fields the stream's `error` event carries — for a
-turn the vendor answered and refused: a non-2xx status, or an error
+Settled with the first real provider to inform it ("4. Provider and
+tools" in the roadmap). The buffered form has a third shape,
+`{"error": {"message", "retryable"?, "kind"?}}` — the same three
+fields the stream's `error` event carries — for a turn the vendor
+answered and refused: a non-2xx status, or an error
 document in place of a message. The provider fills `retryable` from
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
@@ -211,18 +212,18 @@ never masquerade as tool results. The loop still answers such a call —
 the protocol requires every call answered — with an `is_error` result
 carrying the step's message verbatim, and tells the frontend as data
 that the tool did not answer (`Event::ToolFailed`), so the distinction
-this boundary exists for is kept at every layer; see the milestone-5
-record in the roadmap.
+this boundary exists for is kept at every layer; see "5. Agent loop"
+in the roadmap.
 
-That boundary constrains milestone 4 at the host-step layer, not just in
+That boundary constrains the host-step layer, not just in
 tool manifests. A declarative tool's only failure primitive is the `try`
 intrinsic, and its `catch` sees the error as a *string* — so a tool that
 wrapped `host_fs.read` in `try` could separate "file not found" from "the
 operator said no" only by matching English error text, and a denial that
 slipped the match would become `is_error: true`, exactly the masquerade
 forbidden above. The rule is therefore: **an outcome the model should
-react to must arrive as data, not as an error**. Settled in milestone 4
-at the host-step layer: every `host_fs` step reports the answers a model
+react to must arrive as data, not as an error**. Settled at the
+host-step layer: every `host_fs` step reports the answers a model
 can act on — `not_found`, `is_directory`, `not_a_directory`,
 `permission_denied`, and for a write `is_symlink` — as a result whose
 `outcome` names them, with a one-line `message` fit to hand over
@@ -337,7 +338,7 @@ rather than oversights. Each would be a contract change; none blocks
 milestones 3–7.
 
 - **Thinking, as content.** A vendor's thinking travels only as an
-  `opaque` block (above, settled in milestone 4): replayed, never
+  `opaque` block (above): replayed, never
   shown. Surfacing reasoning to the operator — a summary the frontend
   could display — would be a block the consumer *reads*, and is not on
   this wire.

@@ -1,6 +1,6 @@
 # The plugin substrate
 
-Milestone 3's question: Gwead bundles no script runtime, so how does a
+The question: Gwead bundles no script runtime, so how does a
 plugin that *needs code* — parsing a chunked body, shaping a JSON
 request — get written? The roadmap offered two shapes: (a) a minimal
 Rust → wasm32 guest helper, or (b) a bundled interpreter plugin
@@ -28,8 +28,8 @@ Three facts, each verified in Gwead's source rather than assumed:
    pre-provisioned `long_running` dataflow output,
    `host_invoke`/`host_invoke_streaming` back into the kernel,
    result/error reporting, logging, and the cancellation flag. The
-   roadmap's milestone-3 constraint (streaming needs guest code
-   concurrent with its consumer) is satisfiable *only* here — so both
+   roadmap's constraint ("3. Plugin substrate": streaming needs guest
+   code concurrent with its consumer) is satisfiable *only* here — so both
    candidate substrates were always going to target this one ABI.
 3. **The "interpreter" contract does not require interpreting.** The
    slot's contract is three exports (`alloc`, `execute`, `memory`) and
@@ -139,7 +139,7 @@ the step names the keys — visible in the manifest an operator reviews.
 
 ### The streaming composition
 
-The roadmap's milestone-3 constraint, now demonstrated end to end by
+The roadmap's constraint, demonstrated end to end by
 the example: streams are reachable only from this ABI, and a streaming
 provider is two actions on one plugin —
 

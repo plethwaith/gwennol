@@ -31,19 +31,19 @@ manifests.
 
 ## Status
 
-**Pre-alpha.** The native host step types (milestone 1), the
-`LLM_CHAT`/`TOOL` role contracts (milestone 2, [docs/SPI.md](docs/SPI.md)),
-the plugin substrate (milestone 3 — Rust guests compiled to wasm32,
-[docs/SUBSTRATE.md](docs/SUBSTRATE.md)), the bundled plugins
-(milestone 4 — the Anthropic provider and the `read`, `write`, `grep`
-and `bash` tools, [plugins/](plugins/)), the agent loop (milestone 5
-— `gwennol_core::agent::Session`) and the non-interactive CLI
-(milestone 6 — `gwennol`, every approval decided by a rule and traced
-to it, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
+**Pre-alpha.** The native host step types, the `LLM_CHAT`/`TOOL` role
+contracts ([docs/SPI.md](docs/SPI.md)), the plugin substrate (Rust
+guests compiled to wasm32, [docs/SUBSTRATE.md](docs/SUBSTRATE.md)),
+the bundled plugins (the Anthropic provider and the `read`, `write`,
+`grep` and `bash` tools, [plugins/](plugins/)), the agent loop
+(`gwennol_core::agent::Session`) and the non-interactive CLI
+(`gwennol`, every approval decided by a rule and traced to it,
+[crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
 exercised by integration tests against a real kernel and a stubbed
 Messages API. Nothing is packaged yet: the CLI runs from a checkout
-with `cargo xtask bundle` beside it. The interactive TUI is milestone
-7. The 0.0.0 release on crates.io is a name reservation.
+with `cargo xtask bundle` beside it. The interactive TUI is
+"7. TUI" in the roadmap. The 0.0.0 release on crates.io is a name
+reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.
