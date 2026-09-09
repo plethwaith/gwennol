@@ -696,32 +696,17 @@ impl Session {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 // The turn's token is the authority once it has fired:
-                // a stream that ends then, or fails on the read itself,
-                // is the cut arriving, not a vendor hanging up. A read
-                // parked on this handle — the chat action's streamed
-                // output — is released by gwead itself as
-                // `STREAM_CANCELLED` the moment the token fires. A
-                // `STREAM_IO_ERROR` reaching here under a fired token
-                // needs no particular timing: `cancel.is_cancelled()`
-                // below is checked *after* `reader.next()` has already
-                // returned, so an error from well before the
-                // cancellation lands here too. A failing relay step
-                // reports it directly onto this handle, once the bytes
-                // it wrote are drained. The fetch step's own idle
-                // timeout (synthesised by `guarded_body`) and a genuine
-                // vendor transport fault reach here differently: with
-                // `stream: true` the fetch step returns as soon as
-                // headers arrive, registering the body as a readable
-                // for the relay to read later, so a fault mid-body
-                // surfaces only once the relay reads that far, as an
-                // `Err` item that fails the *relay's* read — not the
-                // fetch step, which already finished. Either shape
-                // (`Cancelled` or `Io`) is read as the cut arriving
-                // here, and the error either one carries goes to the
-                // log, as at the other two sites. A contract violation
-                // coinciding with the cut — a line that is not JSON, a
-                // code the loop's own table does not carry — is still
-                // a contract violation.
+                // a stream that ends then, or fails on the read, is the
+                // cut arriving, not a vendor hanging up. The kernel
+                // releases a read parked on this handle as
+                // `STREAM_CANCELLED` when the token fires; an
+                // `STREAM_IO_ERROR` under a fired token — the fetch
+                // step's idle timeout, a transport fault mid-body, a
+                // failing relay, each of which fails the *read* of the
+                // handle rather than the step that made it — reads the
+                // same way. Only the code reaches this arm (#17). A
+                // contract violation coinciding with the cut is still a
+                // contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
                     if cancel.is_cancelled() =>

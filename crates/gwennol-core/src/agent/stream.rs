@@ -66,36 +66,21 @@ impl EventReader {
         }
     }
 
-    /// The next event, `None` at end-of-stream. An incomplete final line
-    /// — bytes after the last newline when the stream ends — is not an
-    /// event: the contract frames every event as a whole line, so a
-    /// torn one is a failed-turn shape, and the caller's
-    /// no-`end`-event rule reports it.
+    /// The next event, `None` at end-of-stream. An incomplete final
+    /// line — bytes after the last newline when the stream ends — is
+    /// not an event: the contract frames every event as a whole line,
+    /// so a torn one falls to the caller's no-`end`-event rule.
     ///
-    /// Two guards keep a cancelled turn from reading past its token,
-    /// and neither replaces the other. The token is passed into the
-    /// read itself, which releases a read parked on a source that has
-    /// *not yet* yielded — the kernel polls the source before the
-    /// token, so bytes, an error, or EOF already available still win.
-    /// A source that is instead *always immediately ready with data*
-    /// would outrun a fired token indefinitely under that alone, so
-    /// `next` also checks the token immediately before issuing each
-    /// read and declines to start one once it has fired. Both checks
-    /// sit after the buffer scan, so an event already whole in the
-    /// buffer is still returned before either stops the read.
-    ///
-    /// Neither guard stops a source that is always immediately ready
-    /// with **empty** chunks: gwead's own `read_async` skips those
-    /// inside one call rather than returning to ask again, so a fired
-    /// token cannot win the race until the source finally yields
-    /// something or ends. No producer in this repo can trigger it — a
-    /// guest's `Stream::write_all` (in `gwennol-guest`) never commits a
-    /// zero-length write, and the native `host_http` step's own body
-    /// wrapper (`guarded_body`, in `steps/http.rs`) drops empty chunks
-    /// itself so gwead's loop never sees one — so this is a residual
-    /// gap only a third-party `LLM_CHAT` guest, or an embedder
-    /// registering a raw readable directly, could still hit; tracked
-    /// upstream as gwead#22, not fixed by either check here.
+    /// Two guards keep a cancelled turn from reading past its token.
+    /// The token goes into the read, which releases only a read that
+    /// has to wait: the kernel polls the source before the token, so
+    /// bytes, an error, or EOF already available still win. And `next`
+    /// checks the token before issuing each read, since a source that
+    /// is always immediately ready would otherwise outrun a fired
+    /// token indefinitely. Both sit after the buffer scan, so an event
+    /// already whole in the buffer is returned first. Neither bounds a
+    /// source always ready with *empty* chunks; `guarded_body` in
+    /// `steps/http.rs` says why none in this repo is.
     pub(crate) async fn next(
         &mut self,
         cancel: &CancellationToken,
@@ -124,13 +109,8 @@ impl EventReader {
             if self.buf.len() - self.consumed > self.cap {
                 return Err(ReadError::TooLong { cap: self.cap });
             }
-            // No new read once the turn is cancelled. Only a read that has to
-            // *wait* is released by the token below; the kernel polls the
-            // source before the token by contract, so a source that is
-            // always immediately ready with data would otherwise outrun a
-            // fired token indefinitely. The scan above has already run, so
-            // an event that was fully buffered is still returned before
-            // this stops asking for more.
+            // No new read once the turn is cancelled; the scan above has run, so
+            // a whole event already buffered was returned first.
             if cancel.is_cancelled() {
                 return Err(ReadError::Cancelled);
             }

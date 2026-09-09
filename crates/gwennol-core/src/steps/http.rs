@@ -123,67 +123,28 @@ fn redirect_target(
 /// Wrap a response body so a stalled peer ends the stream instead of
 /// holding it open.
 ///
-/// The idle limit is per chunk: it catches a peer that stops talking, which
-/// is the failure a long-lived SSE stream actually has. A total budget would
-/// be wrong here — a model streaming a long answer is working, not stuck.
+/// The limit is per chunk, not per body: it catches a peer that stops
+/// talking, which is the failure a long-lived SSE stream has, and a
+/// model streaming a long answer is working, not stuck. The deadline
+/// is taken once per chunk sought and restarts on every chunk with
+/// bytes in it; when it passes, the stream ends with an `Err` item
+/// reading `no response data for …`, seen by whoever reads the handle.
 ///
-/// Cancelling the invocation is deliberately not this function's job.
-/// gwead's own registry-side read release (`STREAM_CANCELLED`) already
-/// tears a parked read down, using the very token a consumer's
-/// `stream_read` carries; racing that same token in here too would only
-/// pre-empt it — the wrapped source would resolve *ready* with an error
-/// item the instant the token fired, and gwead polls the source before
-/// the token, so the release would never be the one seen.
+/// Empty chunks are skipped here, with a `yield_now` so the skip is a
+/// suspension point, and they do not restart the deadline. Both halves
+/// matter. The kernel's `read_async` polls its source before the
+/// invocation's token and skips an empty chunk inside one call
+/// (gwead#22), so a source always ready with empties would never let a
+/// fired token win unless this call itself returns `Pending`; and a
+/// trickle of empties spaced out enough to park must not restart the
+/// idle clock. No peer can produce a non-terminal empty chunk against
+/// this build — over HTTP/1.1 a size-0 chunk is the terminator, and
+/// `reqwest` here has no `http2` (no `h2` in `Cargo.lock`) and no
+/// decompression — so the skip guards a feature flip, nothing live.
 ///
-/// Empty chunks are dropped here rather than handed to the consumer, so
-/// gwead's own read loop never sees one: gwead skips an empty chunk
-/// *inside* one `read_async` call instead of returning to ask again, so
-/// a source that is always immediately ready with them never lets a
-/// fired token win the race (tracked upstream as gwead#22). This is
-/// defense-in-depth against a source contract this repo does not
-/// itself enforce — nothing pins a raw `reqwest::bytes_stream()`'s
-/// chunks as non-empty the way a `gwennol-guest` guest's
-/// `Stream::write_all` pins its own writes — rather than a fix for a
-/// threat live against this build: `h2` is absent from this
-/// workspace's lockfile and `reqwest` is built without the `http2`
-/// feature, so over HTTP/1.1 chunked encoding a size-0 chunk *is* the
-/// terminator and a non-terminal empty chunk from a real peer, hostile
-/// or not, cannot reach here that way; `reqwest` also carries none of
-/// `gzip`/`brotli`/`zstd`, so a decompressor emitting one is equally
-/// absent. The guard exists so a future flip of either kind of feature
-/// does not silently make the residual live.
-///
-/// `yield_now` after a dropped chunk is load-bearing, not a courtesy to
-/// other tasks: it is what makes this call return `Pending` at least
-/// once. `source.next()` is what gwead's own `read_async` races the
-/// cancellation token against, `biased` toward source — a source that
-/// is always immediately ready with empty chunks would resolve *this*
-/// call `Ready` on every poll if the empty-chunk skip above ran with
-/// no suspension point of its own, so the race would never reach the
-/// token at all. (That is the counterfactual for removing `yield_now`
-/// specifically; removing the whole skip arm instead hands such a
-/// chunk to the consumer, a different failure entirely.) The first
-/// poll of `yield_now` returns `Pending`, which propagates out through
-/// this whole `.await` chain as this call's own result for that poll,
-/// letting gwead's select fall through to the token this time. This is
-/// not what gwead's own identically-named call in its skip loop does:
-/// that `yield_now` races the *same* select every iteration and can
-/// never let its token win one — the source there is polled inside the
-/// very race being raced, biased toward itself — so it only keeps
-/// *other* tasks scheduled while gwead#22 stays open. Here, this call
-/// entirely *is* the source gwead's select polls, so making it
-/// `Pending` is the whole fix, not a side effect of one.
-///
-/// The per-chunk idle deadline is computed once per real chunk sought,
-/// not once per host call: an empty chunk restarting it would let a
-/// *trickling* peer that never stops sending them evade
-/// `idle_timeout_ms` forever, so the timer counts the wait for a chunk
-/// with something in it, empties included in that wait. This bounds
-/// only a peer whose gaps between chunks are real enough for
-/// `source.next()` to suspend; the always-ready case above never
-/// reaches a deadline check at all — `tokio::time::timeout_at` only
-/// consults its clock once the future it wraps returns `Pending`, and
-/// an always-ready source never does.
+/// Cancellation is not this function's job: the kernel releases a read
+/// parked on this source with the same token (`STREAM_CANCELLED`), and
+/// a cancel arm here would resolve ready ahead of it.
 fn guarded_body(source: ReadableSource, idle: Duration) -> ReadableSource {
     Box::pin(gwead::futures::stream::unfold(
         Some(source),
@@ -291,21 +252,14 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 ///
 /// # Time
 ///
-/// `timeout_ms` bounds reaching a response, redirect chain included, and
-/// the body as well when it is buffered. A streamed body is bounded
-/// instead by `idle_timeout_ms` between chunks; the invocation's
-/// cancellation token bounds a *consumer's* read of it, releasing one
-/// parked on a source that has gone quiet as `STREAM_CANCELLED`. The
-/// connection itself ends when the consumer closes or drops its
-/// handle, or — when the kernel still owns the stream table at the end
-/// of the driving action — the kernel's own post-invocation drain
-/// force-closes it. Two dispatch paths hand a consumer a streamed
-/// handle and disagree on which: `with_streams` (the agent loop's own
-/// streamed reads) supplies the caller's own table, which disables
-/// that drain for the whole call, so a consumer must close what it
-/// opens; `into_dataflow_streaming_handle` allocates its own table and
-/// leaves the drain enabled, so it is what ends a handle nothing else
-/// closed.
+/// `timeout_ms` bounds reaching a response, redirect chain included,
+/// and the body as well when it is buffered. A streamed body is
+/// bounded instead by `idle_timeout_ms` per chunk (`guarded_body`);
+/// the reader's own cancellation token releases a read parked on it.
+/// The connection ends when the reader closes or drops the handle,
+/// or when the kernel drains the invocation's stream table at the
+/// end of a top-level action it allocated the table for (a caller
+/// that supplies its own table disables that drain).
 pub fn http_post<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -730,6 +684,13 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
         assert_eq!(n, STREAM_IO_ERROR, "got n={n}");
+        let text = streams
+            .lock()
+            .unwrap()
+            .get(id)
+            .expect("handle still registered")
+            .last_error();
+        assert_eq!(text.as_deref(), Some("no response data for 50ms"));
     }
 
     /// The symmetric case the test above does not cover: the deadline
