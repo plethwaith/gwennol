@@ -75,12 +75,13 @@ impl EventReader {
     /// The token goes into the read, which releases only a read that
     /// has to wait: the kernel polls the source before the token, so
     /// bytes, an error, or EOF already available still win. And `next`
-    /// checks the token before issuing each read, since a source that
-    /// is always immediately ready would otherwise outrun a fired
-    /// token indefinitely. Both sit after the buffer scan, so an event
-    /// already whole in the buffer is returned first. Neither bounds a
-    /// source always ready with *empty* chunks; `guarded_body` in
-    /// `steps/http.rs` says why none in this repo is.
+    /// checks the token before issuing each read, since a source
+    /// always ready would otherwise outrun a fired token. Both sit
+    /// after the buffer scan, so a whole buffered event returns first.
+    /// Neither bounds a source always ready with *empty* chunks; the
+    /// relay writing this handle never sends one (`gwennol-guest`'s
+    /// `write_all`); `guarded_body` in `steps/http.rs` covers the
+    /// HTTP-body case.
     pub(crate) async fn next(
         &mut self,
         cancel: &CancellationToken,

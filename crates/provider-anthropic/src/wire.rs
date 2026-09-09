@@ -16,7 +16,7 @@
 //!   exclusions").
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
-//!   `Failure` the contract's buffered failed form (`LLM_CHAT` 0.2.0)
+//!   `Failure` the contract's buffered failed form (since `LLM_CHAT` 0.2.0)
 //!   carries when the vendor answered and said no.
 //! - **stream**: [`StreamTranslator`] is the state machine that folds
 //!   the Messages API's server-sent events into contract events: text

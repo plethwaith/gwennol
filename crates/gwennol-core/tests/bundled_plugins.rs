@@ -3,7 +3,8 @@
 //! code `cargo xtask bundle` runs, registered on a real kernel, and
 //! driven against a stub that speaks the Messages API.
 //!
-//! The roadmap's done-when, each pinned here: the provider streams a
+//! The roadmap's "4. Provider and tools" done-when, each pinned here:
+//! the provider streams a
 //! response against a stub HTTP server (and answers a buffered one);
 //! every tool manifest declares only the host step types it actually
 //! uses; and a model-issued tool call executes end to end against the
@@ -781,8 +782,9 @@ async fn a_vendor_rejection_is_the_contract_failure_on_both_paths() {
 
 // ------------------------------------------------------- the round trip
 
-/// The milestone's done-when: a model-issued tool call executes end to
-/// end. The stub's opening turn asks for `read` on hello.txt; the call
+/// The roadmap's "4. Provider and tools" done-when: a model-issued
+/// tool call executes end to end. The stub's opening turn asks for
+/// `read` on hello.txt; the call
 /// is dispatched by harvested descriptor; the result is rendered by
 /// the shared convention and carried back as a tool_result; the stub's
 /// closing turn quotes it.

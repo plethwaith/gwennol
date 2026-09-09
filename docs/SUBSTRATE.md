@@ -42,8 +42,9 @@ interpreter is *also* a wasm module somebody writes against the
 `gwead1` imports — the binding layer is the same work — plus an entire
 interpreter, plus the actual plugin logic rewritten in untyped strings
 inside manifest JSON, unreachable by `cargo test`, `clippy`, or
-`rustfmt`. And the milestone's done-when requires the module built by
-a documented command CI runs, not a committed blob: `cargo build
+`rustfmt`. And the roadmap's "3. Plugin substrate" done-when requires
+the module built by a documented command CI runs, not a committed
+blob: `cargo build
 --target wasm32-unknown-unknown` is that command natively, where a C
 interpreter (Lua, QuickJS) would drag a wasi-sdk/emscripten toolchain
 into CI or force the forbidden blob.
@@ -51,8 +52,8 @@ into CI or force the forbidden blob.
 Nothing is foreclosed. When plugins become installable from outside
 the binary (see the roadmap's "Beyond the MVP") and third-party
 authors want a scripting language, an interpreter is *just another
-plugin* registered through exactly the machinery this milestone built —
-the trust gate, the `(script, <language>)` slot, the build-injection
+plugin* registered through exactly the machinery "3. Plugin substrate"
+built — the trust gate, the `(script, <language>)` slot, the build-injection
 pipeline. Choosing (a) now defers (b); it does not reject it.
 
 ## How a guest-backed plugin is put together

@@ -137,10 +137,11 @@ fn redirect_target(
 /// (gwead#22), so a source always ready with empties would never let a
 /// fired token win unless this call itself returns `Pending`; and a
 /// trickle of empties spaced out enough to park must not restart the
-/// idle clock. No peer can produce a non-terminal empty chunk against
-/// this build — over HTTP/1.1 a size-0 chunk is the terminator, and
-/// `reqwest` here has no `http2` (no `h2` in `Cargo.lock`) and no
-/// decompression — so the skip guards a feature flip, nothing live.
+/// idle clock. Over HTTP/1.1 the wire cannot carry a non-terminal
+/// empty chunk (a size-0 chunk is the terminator), and `reqwest` here
+/// has no `http2` (no `h2` in `Cargo.lock`) and no decompression; but
+/// nothing pins `reqwest::bytes_stream()` itself as never yielding an
+/// empty `Bytes`, so the skip guards the crate, not only a flip.
 ///
 /// Cancellation is not this function's job: the kernel releases a read
 /// parked on this source with the same token (`STREAM_CANCELLED`), and
@@ -256,10 +257,10 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// and the body as well when it is buffered. A streamed body is
 /// bounded instead by `idle_timeout_ms` per chunk (`guarded_body`);
 /// the reader's own cancellation token releases a read parked on it.
-/// The connection ends when the reader closes or drops the handle,
-/// or when the kernel drains the invocation's stream table at the
-/// end of a top-level action it allocated the table for (a caller
-/// that supplies its own table disables that drain).
+/// The connection ends when the reader closes or drops the handle, or
+/// when the kernel drains the invocation's stream table at the end of
+/// a top-level action it allocated the table for — a caller supplying
+/// its own table disables that drain, so it must close what it opens.
 pub fn http_post<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -643,10 +644,11 @@ mod tests {
     /// always-ready case is
     /// `an_always_empty_body_does_not_starve_a_fired_token`'s.
     ///
-    /// `start_paused = true` gives exact virtual time; 40 items bound
-    /// the run. A deadline that restarted on empties would reach the
-    /// real chunk after item 40 and fail on a value, with no timeout
-    /// anywhere.
+    /// `start_paused = true` gives exact virtual time; the empty
+    /// prefix is 40 items, and the single `read_async_shared` call
+    /// ends the test on the first chunk with bytes in it. A deadline
+    /// that restarted on empties would instead reach that chunk late
+    /// and fail on a value, with no timeout anywhere.
     #[tokio::test(start_paused = true)]
     async fn a_trickling_empty_chunk_flood_still_trips_the_idle_timeout() {
         use gwead::bytes::Bytes;

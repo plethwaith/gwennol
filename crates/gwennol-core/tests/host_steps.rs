@@ -2333,3 +2333,41 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
         "ended at the suite's ceiling, not gwead's: {elapsed:?}"
     );
 }
+
+/// The ceiling can still end a step parked on a withheld approval, with
+/// no caller cancel involved: `host::approve` races the same token the
+/// watchdog fires, and returns the approval as withdrawn rather than
+/// the step's own typed cancellation, so this arrives as the
+/// structured `steps::CANCELLED_CODE`, not `ExecutionTimeout`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ceiling_can_still_withdraw_a_held_approval() {
+    let f = fixture();
+    let gate = f.operator.gates.gate("gated_runner");
+    let running = tokio::spawn(async move {
+        fixture()
+            .kernel
+            .execute("gated_runner", "go", json!({"argv": ["true"]}))
+            .with_config(&json!({}))
+            .run()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+        .await
+        .expect("gated_runner never asked the operator");
+    let err = tokio::time::timeout(ACTION_TIMEOUT + Duration::from_secs(20), running)
+        .await
+        .expect("the ceiling never ended the held prompt")
+        .unwrap()
+        .expect_err("the ceiling ends the action");
+    assert!(
+        matches!(&err, KernelError::PluginError { code, params, .. }
+            if code == gwennol_core::steps::CANCELLED_CODE
+                && params["phase"] == gwennol_core::steps::CANCELLED_AT_APPROVAL),
+        "{err}"
+    );
+    assert_eq!(
+        gate.release.available_permits(),
+        0,
+        "the operator never answered"
+    );
+}

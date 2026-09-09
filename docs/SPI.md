@@ -335,7 +335,7 @@ complete for what a provider can express, not a starter list.
 
 Doors closed on purpose for the MVP, listed so they read as decisions
 rather than oversights. Each would be a contract change; none blocks
-milestones 3–7.
+"3. Plugin substrate" through "7. TUI".
 
 - **Thinking, as content.** A vendor's thinking travels only as an
   `opaque` block (above): replayed, never
