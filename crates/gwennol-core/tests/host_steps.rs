@@ -250,8 +250,10 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
         ),
-        // A second held runner, one per ceiling pin: the gate is per
-        // plugin name and the pins run in parallel.
+        // A second held runner: the ceiling pin cannot share
+        // `gated_runner`'s gate with the cancel pin above — the gate is
+        // per plugin name over one process-wide fixture, and the pins
+        // run in parallel.
         plugin(
             "gated_runner_ceiling",
             &["step_type:host_process.run"],
@@ -2350,6 +2352,7 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 async fn the_ceiling_can_still_withdraw_a_held_approval() {
     let f = fixture();
     let gate = f.operator.gates.gate("gated_runner_ceiling");
+    let started = std::time::Instant::now();
     let running = tokio::spawn(async move {
         fixture()
             .kernel
@@ -2366,6 +2369,11 @@ async fn the_ceiling_can_still_withdraw_a_held_approval() {
         .expect("the ceiling never ended the held prompt")
         .unwrap()
         .expect_err("the ceiling ends the action");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= ACTION_TIMEOUT && elapsed < ACTION_TIMEOUT + Duration::from_secs(10),
+        "ended at the suite's ceiling, not sooner: {elapsed:?}"
+    );
     assert!(
         matches!(&err, KernelError::PluginError { code, params, .. }
             if code == gwennol_core::steps::CANCELLED_CODE
