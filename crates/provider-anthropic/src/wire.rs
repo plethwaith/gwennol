@@ -16,7 +16,7 @@
 //!   exclusions").
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
-//!   `Failure` the contract's buffered failed form (since 0.2.0)
+//!   `Failure` the contract's buffered failed form (since `LLM_CHAT` 0.2.0)
 //!   carries when the vendor answered and said no.
 //! - **stream**: [`StreamTranslator`] is the state machine that folds
 //!   the Messages API's server-sent events into contract events: text
@@ -39,14 +39,14 @@
 //! of a turn and a note per fragment would be noise. Thinking blocks
 //! are neither: the vendor requires a tool-use turn replayed with its
 //! thinking intact, so they travel as the contract's `opaque` block
-//! (`LLM_CHAT` 0.3.0), carried by the consumer, unwrapped back into the
-//! vendor block by
-//! `replay_messages` on the next request. The request sends no
-//! `thinking` field unless `$config.thinking` (or `$config.extra`)
-//! supplies one — absence is the setting every current model accepts,
-//! where an explicit `disabled` is refused by the models that cannot
-//! turn thinking off — so thinking is on by the vendor's default on
-//! current models, and the opaque round trip is what makes that work.
+//! (`LLM_CHAT` 0.3.0), carried by the consumer, unwrapped back into
+//! the vendor block by `replay_messages` on the next request. The
+//! request sends no `thinking` field unless `$config.thinking` (or
+//! `$config.extra`) supplies one — absence is the setting every
+//! current model accepts, where an explicit `disabled` is refused by
+//! the models that cannot turn thinking off — so thinking is on by
+//! the vendor's default on current models, and the opaque round trip
+//! is what makes that work.
 
 use std::collections::HashMap;
 

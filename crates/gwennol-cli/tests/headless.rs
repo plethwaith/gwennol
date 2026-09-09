@@ -1,9 +1,10 @@
-//! Milestone 6, end to end: the built `gwennol` binary runs a task
+//! End to end: the built `gwennol` binary runs a task
 //! headlessly against the bundled plugins and a stub Messages API, with
 //! every approval decided by a rule and traced to it, and no prompt
 //! anywhere.
 //!
-//! The roadmap's done-when, each pinned here: a real task — read a
+//! The roadmap's "6. Non-interactive CLI" done-when, each pinned
+//! here: a real task — read a
 //! file, answer from it — runs with no interaction; each decision's
 //! trace names the flag or file rule that made it, or says none did;
 //! a request no rule matches is denied and the model is told, not the

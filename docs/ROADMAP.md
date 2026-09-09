@@ -263,14 +263,14 @@ written, and it must be settled before a provider exists.
   either way: once it has fired, whatever a step reports is the cut
   arriving (a nested invoke flattens the code to text, and the text
   goes to the log), and either shape arriving without it is a step
-  failure, reported and logged — the kernel's action ceiling cancels
-  an invocation the same way and remaps only its own `Cancelled` to a
-  timeout, and any plugin may throw the structured code itself. The
-  structured code's part is to say how far the step got: withdrawn at
-  the approval means nothing ran. The process step's
-  own select is biased the other way,
-  work first: a child that has already finished has acted, and its
-  result is the truth about that.
+  failure, reported and logged — the kernel's typed cancellation is
+  never the ceiling, since its watchdog reports a step it stopped as
+  `ExecutionTimeout`, but ending a held approval under the ceiling
+  still throws the structured code, the same as a plugin doing it
+  itself. The structured code's part is to say how far the step got:
+  withdrawn at the approval means nothing ran. The process step's own
+  select is biased the other way, work first: a child that has
+  already finished has acted, and its result is the truth about that.
 - **Settled: every tool call is answered.** A tool's own `is_error`
   is carried as is. A call the tool cannot answer — no such tool,
   arguments its schema refuses, a step error (the operator denied,

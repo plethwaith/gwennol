@@ -43,7 +43,7 @@ pub mod tool {
     /// A `call` result's `content` as the model should see it: verbatim,
     /// plus [`TRUNCATED_MARKER`] on its own final line when the tool
     /// reported a cut. The one implementation of the convention — the
-    /// milestone-5 loop renders through here, and so do the tests that
+    /// agent loop renders through here, and so do the tests that
     /// pin the bundled tools to it.
     pub fn render_content(content: &str, truncated: bool) -> String {
         if !truncated {

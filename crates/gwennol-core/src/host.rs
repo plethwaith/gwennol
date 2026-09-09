@@ -237,8 +237,7 @@ fn describe(access: &Access) -> String {
 /// then has to answer for it to stop, so the ask races the invocation's
 /// token, biased toward cancellation — a token already cancelled on
 /// arrival never asks at all. The operator's `approve` future is then
-/// dropped mid-flight, which [`Operator::approve`] documents. Settled in
-/// milestone 5, where the loop first owned a cancel surface; every
+/// dropped mid-flight, which [`Operator::approve`] documents. Every
 /// approval site goes through here, so it holds uniformly.
 pub async fn approve(ask: Ask) -> Result<(), StepError> {
     let Ask { request, cancel } = ask;

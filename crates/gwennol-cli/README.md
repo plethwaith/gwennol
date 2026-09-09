@@ -2,8 +2,8 @@
 
 The non-interactive command-line frontend: one task, run headlessly,
 with every approval decided by a rule and traced to it. There is no
-prompt. The TUI (milestone 7) is a second `Operator`, not a mode of this
-one.
+prompt. The TUI ("7. TUI" in the roadmap) is a second `Operator`, not
+a mode of this one.
 
 ## Quick start
 
@@ -222,4 +222,4 @@ exit 2, while a failed or cancelled turn keeps its own status.
 
 Persist or resume a conversation, manage the context window, install
 plugins from outside the bundle, or prompt: the roadmap's "Beyond the
-MVP" and milestone 7 respectively.
+MVP" and "7. TUI" respectively.

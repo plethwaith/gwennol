@@ -1,6 +1,6 @@
 # The plugin substrate
 
-Milestone 3's question: Gwead bundles no script runtime, so how does a
+The question: Gwead bundles no script runtime, so how does a
 plugin that *needs code* — parsing a chunked body, shaping a JSON
 request — get written? The roadmap offered two shapes: (a) a minimal
 Rust → wasm32 guest helper, or (b) a bundled interpreter plugin
@@ -28,8 +28,8 @@ Three facts, each verified in Gwead's source rather than assumed:
    pre-provisioned `long_running` dataflow output,
    `host_invoke`/`host_invoke_streaming` back into the kernel,
    result/error reporting, logging, and the cancellation flag. The
-   roadmap's milestone-3 constraint (streaming needs guest code
-   concurrent with its consumer) is satisfiable *only* here — so both
+   roadmap's constraint ("3. Plugin substrate": streaming needs guest
+   code concurrent with its consumer) is satisfiable *only* here — so both
    candidate substrates were always going to target this one ABI.
 3. **The "interpreter" contract does not require interpreting.** The
    slot's contract is three exports (`alloc`, `execute`, `memory`) and
@@ -42,8 +42,9 @@ interpreter is *also* a wasm module somebody writes against the
 `gwead1` imports — the binding layer is the same work — plus an entire
 interpreter, plus the actual plugin logic rewritten in untyped strings
 inside manifest JSON, unreachable by `cargo test`, `clippy`, or
-`rustfmt`. And the milestone's done-when requires the module built by
-a documented command CI runs, not a committed blob: `cargo build
+`rustfmt`. And the roadmap's "3. Plugin substrate" done-when requires
+the module built by a documented command CI runs, not a committed
+blob: `cargo build
 --target wasm32-unknown-unknown` is that command natively, where a C
 interpreter (Lua, QuickJS) would drag a wasi-sdk/emscripten toolchain
 into CI or force the forbidden blob.
@@ -51,8 +52,8 @@ into CI or force the forbidden blob.
 Nothing is foreclosed. When plugins become installable from outside
 the binary (see the roadmap's "Beyond the MVP") and third-party
 authors want a scripting language, an interpreter is *just another
-plugin* registered through exactly the machinery this milestone built —
-the trust gate, the `(script, <language>)` slot, the build-injection
+plugin* registered through exactly the machinery "3. Plugin substrate"
+built — the trust gate, the `(script, <language>)` slot, the build-injection
 pipeline. Choosing (a) now defers (b); it does not reject it.
 
 ## How a guest-backed plugin is put together
@@ -139,7 +140,7 @@ the step names the keys — visible in the manifest an operator reviews.
 
 ### The streaming composition
 
-The roadmap's milestone-3 constraint, now demonstrated end to end by
+The roadmap's constraint, demonstrated end to end by
 the example: streams are reachable only from this ABI, and a streaming
 provider is two actions on one plugin —
 

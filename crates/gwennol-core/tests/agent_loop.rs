@@ -1,7 +1,8 @@
-//! Milestone 5, end to end: the agent loop against a scriptable
+//! End to end: the agent loop against a scriptable
 //! provider and fixture tools on a real kernel.
 //!
-//! The roadmap's done-when, each pinned here: a multi-turn conversation
+//! The roadmap's "5. Agent loop" done-when, each pinned here: a
+//! multi-turn conversation
 //! with tool calls runs against a stubbed provider; a failing tool is
 //! reported to the model rather than ending the turn; cancelling
 //! mid-stream tears the turn down cleanly. Around those, the consumer
@@ -985,7 +986,10 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
             "operator denied",
         ),
         // The code without the turn's token is not a cancel: the
-        // kernel's ceiling, or — here — the plugin's own doing.
+        // kernel's typed cancellation is never the ceiling (that
+        // reports a timeout), but ending a held approval under the
+        // ceiling still throws this same code, the same as a plugin
+        // doing it itself.
         (
             "/forged-cancel",
             "forger",

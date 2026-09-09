@@ -23,8 +23,7 @@
 //! On a target without the `openat` family and `fdopendir` — non-unix,
 //! and Redox, where nix has no `dir` module — the same interface is
 //! provided over paths (`cfg(dir_handles)`, from the build script,
-//! draws the line): the milestone-1 behaviour the handle-based one
-//! replaces, with the race it does not close.
+//! draws the line), with the race it does not close.
 
 use std::ffi::{OsStr, OsString};
 use std::io;

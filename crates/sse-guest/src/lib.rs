@@ -1,10 +1,10 @@
-//! The milestone-3 example guest: a chat-shaped plugin whose
+//! The example guest: a chat-shaped plugin whose
 //! non-declarative work — building a JSON request, parsing a chunked
 //! server-sent-events body — runs as Rust compiled to wasm32, occupying
 //! the script-runtime slot (see `docs/SUBSTRATE.md`).
 //!
 //! Two entry points, matching the two halves of the streaming-provider
-//! composition the roadmap's milestone-3 constraint records:
+//! composition the substrate decision records (`docs/SUBSTRATE.md`):
 //!
 //! - `chat` runs in the plain `chat` action: it translates the
 //!   `LLM_CHAT` input into a vendor-shaped JSON request, dispatches the
@@ -18,9 +18,9 @@
 //! The "vendor" wire here is deliberately thin — its SSE `data:`
 //! payloads are already contract-shaped events — because the fixture's
 //! job is to prove the substrate, not to translate a real provider's
-//! protocol (that is milestone 4). The parsing is real: framing,
-//! chunk-boundary reassembly, multi-line `data:` joining, keepalive
-//! filtering, and NDJSON-safe re-serialisation.
+//! protocol (that is the bundled provider's job). The parsing is real:
+//! framing, chunk-boundary reassembly, multi-line `data:` joining,
+//! keepalive filtering, and NDJSON-safe re-serialisation.
 
 use gwennol_guest::sse::SseParser;
 use gwennol_guest::{

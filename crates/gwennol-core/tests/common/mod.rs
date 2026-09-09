@@ -4,8 +4,8 @@
 //! drift: the permissive test operator, the contract-schema validator,
 //! the stub HTTP plumbing, and the NDJSON stream drain. `host_steps.rs`
 //! still carries its own richer echo server (method/header echo plus
-//! the hang/dribble/endless timing routes M1's pins depend on); folding
-//! it in is worthwhile but belongs to its own change, not a fix round.
+//! the hang/dribble/endless timing routes the host-steps suite's pins
+//! depend on); folding it in is worthwhile but belongs to its own change.
 
 // Each test binary compiles this module afresh and uses its own subset,
 // so per-binary dead-code analysis would flag whatever that binary

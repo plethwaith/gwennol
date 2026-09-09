@@ -1,9 +1,10 @@
-//! Milestone 4, end to end: the committed manifests under `plugins/`
+//! End to end: the committed manifests under `plugins/`
 //! — the Anthropic provider and the four tools — bundled by the same
 //! code `cargo xtask bundle` runs, registered on a real kernel, and
 //! driven against a stub that speaks the Messages API.
 //!
-//! The roadmap's done-when, each pinned here: the provider streams a
+//! The roadmap's "4. Provider and tools" done-when, each pinned here:
+//! the provider streams a
 //! response against a stub HTTP server (and answers a buffered one);
 //! every tool manifest declares only the host step types it actually
 //! uses; and a model-issued tool call executes end to end against the
@@ -129,7 +130,8 @@ impl Fixture {
         )
     }
 
-    /// Run one tool call the milestone-5 way: by harvested descriptor.
+    /// Run one tool call the way the agent loop does: by harvested
+    /// descriptor.
     async fn call_tool(&self, name: &str, input: Value) -> Value {
         let descriptors = spi::harvest_tools(&self.kernel).unwrap();
         let d = descriptors
@@ -780,8 +782,9 @@ async fn a_vendor_rejection_is_the_contract_failure_on_both_paths() {
 
 // ------------------------------------------------------- the round trip
 
-/// The milestone's done-when: a model-issued tool call executes end to
-/// end. The stub's opening turn asks for `read` on hello.txt; the call
+/// The roadmap's "4. Provider and tools" done-when: a model-issued
+/// tool call executes end to end. The stub's opening turn asks for
+/// `read` on hello.txt; the call
 /// is dispatched by harvested descriptor; the result is rendered by
 /// the shared convention and carried back as a tool_result; the stub's
 /// closing turn quotes it.
@@ -850,7 +853,7 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
     );
 }
 
-/// The milestone-5 loop over the bundled plugins: the same round trip,
+/// The agent loop over the bundled plugins: the same round trip,
 /// driven by `Session` — opening turn streamed and rebuilt (thinking
 /// carried as `opaque`, text coalesced, the split tool call whole), the
 /// `read` tool dispatched by harvested descriptor with the model's

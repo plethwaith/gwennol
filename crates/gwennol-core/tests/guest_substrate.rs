@@ -1,11 +1,12 @@
-//! End-to-end proof of the milestone-3 substrate decision: the example
-//! guest (`crates/sse-guest`, Rust compiled to wasm32-unknown-unknown)
-//! occupies the script-runtime slot and runs the full streaming-provider
-//! composition through a real kernel — a plain `chat` action whose guest
-//! entry builds the vendor request and calls `io.invoke_streaming` on a
-//! sibling `dataflow: true` action, whose single `long_running` guest
-//! step parses a chunked server-sent-events body off `host_http.post`
-//! and relays contract NDJSON to its pre-provisioned output.
+//! End-to-end proof of the substrate decision (`docs/SUBSTRATE.md`):
+//! the example guest (`crates/sse-guest`, Rust compiled to
+//! wasm32-unknown-unknown) occupies the script-runtime slot and runs
+//! the full streaming-provider composition through a real kernel — a
+//! plain `chat` action whose guest entry builds the vendor request
+//! and calls `io.invoke_streaming` on a sibling `dataflow: true`
+//! action, whose single `long_running` guest step parses a chunked
+//! server-sent-events body off `host_http.post` and relays contract
+//! NDJSON to its pre-provisioned output.
 //!
 //! The wasm module is **built from source by this suite** — the
 //! documented command is
@@ -321,7 +322,7 @@ fn chat_input() -> Value {
 
 /// Run one streamed `chat` turn against the stub `path` and return the
 /// NDJSON events, resolving the provider by role and reading the handle
-/// after the action returns — the milestone-5 loop's pattern.
+/// after the action returns — the agent loop's pattern.
 ///
 /// Bounded: a stub or kernel regression that stalls the stream fails
 /// here with a named timeout instead of hanging the suite until the
@@ -632,7 +633,7 @@ async fn an_oversized_error_body_is_truncated_with_a_marker() {
     );
 }
 
-/// Owed by milestone 3, pinned here where the outcome is observable: a
+/// Pinned here, where the outcome is observable: a
 /// consumer that hangs up mid-turn is a benign stop for the relay, not
 /// a failed step. The dataflow action is driven directly so its result
 /// can be seen — through `chat`'s `io.invoke_streaming` the callee's
@@ -692,15 +693,13 @@ async fn a_consumer_hanging_up_is_a_graceful_stop_for_the_relay() {
     panic!("the relay never closed its upstream: the vendor kept streaming");
 }
 
-/// The other half of the milestone-5 cancellation contract, pinned the
+/// The other half of the loop's cancellation contract, pinned the
 /// same way as the reader-gone test above: the vendor is still
 /// streaming when the turn is cancelled, so both the fetch step's body
 /// read and the relay's own `stream_read` are genuinely parked when
-/// the token fires. Neither raises: `guarded_body` no longer injects
-/// its own ready `Err("cancelled")` item ahead of gwead's read-side
-/// release, so the fetch's body stream, and the relay reading it,
-/// both see gwead's own `STREAM_CANCELLED` — not `STREAM_IO_ERROR` —
-/// and both relays wind down without raising.
+/// the token fires. Neither raises: the fetch's body stream, and the
+/// relay reading it, both see gwead's own `STREAM_CANCELLED` — not
+/// `STREAM_IO_ERROR` — and both relays wind down without raising.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
     use gwead::futures::StreamExt as _;
