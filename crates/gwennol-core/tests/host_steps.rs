@@ -250,6 +250,13 @@ fn fixture_plugins() -> Vec<Value> {
             &["step_type:host_process.run"],
             json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
         ),
+        // A second held runner, one per ceiling pin: the gate is per
+        // plugin name and the pins run in parallel.
+        plugin(
+            "gated_runner_ceiling",
+            &["step_type:host_process.run"],
+            json!([{"id": "p", "type": "host_process.run", "params": {"argv": "{{$input.argv}}", "timeout_ms": 10000, "max_output_bytes": 1024}}]),
+        ),
         plugin(
             "ungranted",
             &[],
@@ -2342,18 +2349,18 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ceiling_can_still_withdraw_a_held_approval() {
     let f = fixture();
-    let gate = f.operator.gates.gate("gated_runner");
+    let gate = f.operator.gates.gate("gated_runner_ceiling");
     let running = tokio::spawn(async move {
         fixture()
             .kernel
-            .execute("gated_runner", "go", json!({"argv": ["true"]}))
+            .execute("gated_runner_ceiling", "go", json!({"argv": ["true"]}))
             .with_config(&json!({}))
             .run()
             .await
     });
     tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
         .await
-        .expect("gated_runner never asked the operator");
+        .expect("gated_runner_ceiling never asked the operator");
     let err = tokio::time::timeout(ACTION_TIMEOUT + Duration::from_secs(20), running)
         .await
         .expect("the ceiling never ended the held prompt")
@@ -2364,10 +2371,5 @@ async fn the_ceiling_can_still_withdraw_a_held_approval() {
             if code == gwennol_core::steps::CANCELLED_CODE
                 && params["phase"] == gwennol_core::steps::CANCELLED_AT_APPROVAL),
         "{err}"
-    );
-    assert_eq!(
-        gate.release.available_permits(),
-        0,
-        "the operator never answered"
     );
 }

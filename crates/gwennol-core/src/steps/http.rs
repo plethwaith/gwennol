@@ -133,15 +133,15 @@ fn redirect_target(
 /// Empty chunks are skipped here, with a `yield_now` so the skip is a
 /// suspension point, and they do not restart the deadline. Both halves
 /// matter. The kernel's `read_async` polls its source before the
-/// invocation's token and skips an empty chunk inside one call
-/// (gwead#22), so a source always ready with empties would never let a
-/// fired token win unless this call itself returns `Pending`; and a
-/// trickle of empties spaced out enough to park must not restart the
-/// idle clock. Over HTTP/1.1 the wire cannot carry a non-terminal
-/// empty chunk (a size-0 chunk is the terminator), and `reqwest` here
-/// has no `http2` (no `h2` in `Cargo.lock`) and no decompression; but
-/// nothing pins `reqwest::bytes_stream()` itself as never yielding an
-/// empty `Bytes`, so the skip guards the crate, not only a flip.
+/// invocation's token and skips an empty chunk inside one call (gwead#22),
+/// so a source always ready with empties would never let a fired token win
+/// unless this call itself returns `Pending`; and a trickle of empties
+/// spaced out enough to park must not restart the idle clock. Over
+/// HTTP/1.1 the wire cannot carry a non-terminal empty chunk (a size-0
+/// chunk is the terminator), and `reqwest` here has no `http2` (no `h2` in
+/// `Cargo.lock`) and no decompression; but nothing pins
+/// `reqwest::bytes_stream()` itself as never yielding an empty `Bytes`, so
+/// the skip guards against the crate, not only against a feature flip.
 ///
 /// Cancellation is not this function's job: the kernel releases a read
 /// parked on this source with the same token (`STREAM_CANCELLED`), and
@@ -644,11 +644,12 @@ mod tests {
     /// always-ready case is
     /// `an_always_empty_body_does_not_starve_a_fired_token`'s.
     ///
-    /// `start_paused = true` gives exact virtual time; the empty
-    /// prefix is 40 items, and the single `read_async_shared` call
-    /// ends the test on the first chunk with bytes in it. A deadline
-    /// that restarted on empties would instead reach that chunk late
-    /// and fail on a value, with no timeout anywhere.
+    /// `start_paused = true` gives exact virtual time. Each empty
+    /// costs 5ms against a 50ms idle, so the single
+    /// `read_async_shared` call ends on the deadline about ten items
+    /// in and never reaches the payload at item 40. A deadline that
+    /// restarted on empties would walk the whole prefix and return
+    /// `payload` instead, failing on a value with no timeout anywhere.
     #[tokio::test(start_paused = true)]
     async fn a_trickling_empty_chunk_flood_still_trips_the_idle_timeout() {
         use gwead::bytes::Bytes;
