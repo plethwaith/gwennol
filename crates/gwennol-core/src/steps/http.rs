@@ -121,27 +121,25 @@ fn redirect_target(
 }
 
 /// Wrap a response body so a stalled peer ends the stream instead of
-/// holding it open, and so cancelling the invocation tears it down.
+/// holding it open.
 ///
 /// The idle limit is per chunk: it catches a peer that stops talking, which
 /// is the failure a long-lived SSE stream actually has. A total budget would
 /// be wrong here — a model streaming a long answer is working, not stuck.
-fn guarded_body(
-    source: ReadableSource,
-    idle: Duration,
-    cancel: gwead::tokio_util::sync::CancellationToken,
-) -> ReadableSource {
-    Box::pin(gwead::futures::stream::unfold(Some(source), move |state| {
-        let cancel = cancel.clone();
-        async move {
+///
+/// Cancelling the invocation is deliberately not this function's job.
+/// gwead's own registry-side read release (`STREAM_CANCELLED`) already
+/// tears a parked read down, using the very token a consumer's
+/// `stream_read` carries; racing that same token in here too would only
+/// pre-empt it — the wrapped source would resolve *ready* with an error
+/// item the instant the token fired, and gwead polls the source before
+/// the token, so the release would never be the one seen.
+fn guarded_body(source: ReadableSource, idle: Duration) -> ReadableSource {
+    Box::pin(gwead::futures::stream::unfold(
+        Some(source),
+        move |state| async move {
             let mut source = state?;
-            let next = tokio::select! {
-                () = cancel.cancelled() => {
-                    return Some((Err(std::io::Error::other("cancelled")), None));
-                }
-                r = tokio::time::timeout(idle, source.next()) => r,
-            };
-            match next {
+            match tokio::time::timeout(idle, source.next()).await {
                 Ok(Some(item)) => {
                     let keep = item.is_ok().then_some(source);
                     Some((item, keep))
@@ -155,8 +153,8 @@ fn guarded_body(
                     None,
                 )),
             }
-        }
-    }))
+        },
+    ))
 }
 
 /// Strip everything from a URL that can carry a credential — userinfo,
@@ -407,7 +405,7 @@ fn request<'a>(
                 .map_err(|e| std::io::Error::other(scrubbed(e)))
                 .boxed();
             let handle = lock_shared(ex.streams())
-                .register_readable(content_type, guarded_body(source, idle, cancel));
+                .register_readable(content_type, guarded_body(source, idle));
             return Ok(StepOutput::with_metadata(
                 json!({"status": status, "body": handle.get()}),
                 metadata,

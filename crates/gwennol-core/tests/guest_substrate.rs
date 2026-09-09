@@ -177,11 +177,12 @@ const ERROR_SSE: &str = concat!(
 );
 
 /// A stream whose second event's payload is not JSON: the relay's step
-/// fails there, and the consumer must see the events so far and then
-/// end-of-stream — no `end`, no `error` event, no garbage line. This is
-/// the pin on the kernel's post-invocation drain closing the
-/// pre-provisioned output when the long-running step errors instead of
-/// closing it itself.
+/// fails there without closing its output itself, and the consumer
+/// must see the events so far, then the failure reported as a read
+/// error carrying the step's own text — no `end`, no `error` event, no
+/// garbage line. This is the pin on gwead recording that failure
+/// beside the channel and reporting it once the bytes the step did
+/// write are drained, rather than losing it to a plain EOF.
 const GARBAGE_SSE: &str = concat!(
     "event: text\ndata: {\"type\":\"text\",\"text\":\"before the garbage\"}\n\n",
     "event: text\ndata: this is not JSON\n\n",
@@ -670,6 +671,51 @@ async fn a_consumer_hanging_up_is_a_graceful_stop_for_the_relay() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("the relay never closed its upstream: the vendor kept streaming");
+}
+
+/// The other half of the milestone-5 cancellation contract, pinned the
+/// same way as the reader-gone test above: the vendor is still
+/// streaming when the turn is cancelled, so both the fetch step's body
+/// read and the relay's own `stream_read` are genuinely parked when
+/// the token fires. Neither raises: `guarded_body` no longer injects
+/// its own ready `Err("cancelled")` item ahead of gwead's read-side
+/// release, so the fetch's body stream, and the relay reading it,
+/// both see gwead's own `STREAM_CANCELLED` — not `STREAM_IO_ERROR` —
+/// and both relays wind down without raising.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
+    use gwead::futures::StreamExt as _;
+    let f = fixture();
+    let input = json!({
+        "url": format!("http://{}/slow-turn", f.stub.addr),
+        "request": {"model": "m3-fixture", "stream": true, "messages": []}
+    });
+    let mut handle = f
+        .kernel
+        .execute(PLUGIN, STREAM_ACTION, input)
+        .with_config(&json!({}))
+        .into_dataflow_streaming_handle()
+        .expect("the dataflow action streams");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), handle.output.next())
+        .await
+        .expect("the relay produces within 10s")
+        .expect("not EOF")
+        .expect("not an I/O error");
+    assert!(
+        String::from_utf8_lossy(&first).contains("tick"),
+        "{first:?}"
+    );
+    // The vendor is still sending: cancel the whole invocation while
+    // the relay's next read is parked on it.
+    handle.cancel();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle.result)
+        .await
+        .expect("the relay winds down within 10s")
+        .expect("the pipeline reports");
+    assert!(
+        outcome.is_ok(),
+        "a cancelled turn is a graceful stop for the relay, not a failed step: {outcome:?}"
+    );
 }
 
 /// The example implements only the streamed form and says so as a step

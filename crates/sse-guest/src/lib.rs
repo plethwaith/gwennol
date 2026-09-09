@@ -140,13 +140,14 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             // Wind down without an `end` event: the consumer reads the
             // early end-of-stream as a failed turn, which a cancelled
             // turn is. Polling here only catches cancellation between
-            // chunks — a read blocked on a stalled vendor is caught by
-            // the `Received::Cancelled` arm below, and one blocked on a
-            // stalled vendor that the token never reaches ends when the
-            // fetch's streaming idle timeout ends the body, which ends
-            // the read (a dataflow callee carries no wallclock deadline
-            // of its own under the kernel's defaults). A parked write is
-            // released the same way, as `Delivery::Cancelled`.
+            // chunks — a read blocked on a stalled vendor is caught
+            // instead by the token releasing it as `Received::Cancelled`
+            // below, or (a dataflow callee carries no wallclock deadline
+            // of its own under the kernel's defaults) by the fetch's
+            // streaming idle timeout ending the body, which ends the
+            // read, if the token never reaches it first. A write parked
+            // on a full channel is released by the very same token, as
+            // `Delivery::Cancelled`.
             upstream.close();
             output.close();
             return Ok(Value::Null);
@@ -209,9 +210,9 @@ fn relay_sse(args: Args) -> Result<Value, String> {
 /// The parse is load-bearing twice over: multi-line `data:` joins with
 /// a raw newline, which NDJSON cannot carry, so compact re-serialisation
 /// is what restores one-event-one-line — and a payload that is not JSON
-/// at all fails the step here, surfacing to the consumer as an early
-/// end-of-stream rather than as a garbage line it would have to parse to
-/// distrust.
+/// at all fails the step here, surfacing to the consumer as a reported
+/// read error carrying this step's own text, rather than as a garbage
+/// line it would have to parse to distrust.
 fn emit_data(output: &Stream, data: &str) -> Result<Delivery, String> {
     let value: Value = serde_json::from_str(data)
         .map_err(|e| format!("vendor event payload is not JSON: {e}; payload: {data:?}"))?;

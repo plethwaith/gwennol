@@ -10,9 +10,13 @@ pub enum StreamError {
     InvalidHandle,
     /// Read on a writable handle, or write on a readable one.
     DirectionMismatch,
-    /// The handle was closed, or (on write) the paired consumer is
-    /// gone. For a producer this is the normal way to learn the reader
-    /// stopped listening — wind down, don't retry.
+    /// The handle was closed. On a read, this is what
+    /// [`Stream::read`] itself reports. On a write,
+    /// [`Stream::write_all`] never reaches this variant: it decodes
+    /// `STREAM_CLOSED` itself, into [`Delivery::ReaderGone`] — the
+    /// normal way a producer learns its reader stopped listening —
+    /// before falling through to `from_code`. A producer winds that
+    /// down; it never sees `Closed` for its own write.
     Closed,
     /// The readable's underlying source reported an I/O error, with
     /// the vendor's own text when the host recorded one
@@ -108,6 +112,21 @@ pub enum Received {
     Cancelled,
 }
 
+/// Map a `stream_read` return value to [`Stream::read`]'s outcome.
+/// Pure and testable off-wasm, unlike `sys::stream_read` itself: any
+/// code not classified here is left for the caller to decode through
+/// [`StreamError::from_code`], which alone needs the handle — to fetch
+/// `stream_last_error`'s text for `STREAM_IO_ERROR` — the seam that
+/// keeps that host call out of this table.
+fn classify_read(n: i32) -> Result<Received, i32> {
+    match n {
+        n if n >= 0 => Ok(Received::Bytes(n as usize)),
+        sys::STREAM_EOF => Ok(Received::End),
+        sys::STREAM_CANCELLED => Ok(Received::Cancelled),
+        code => Err(code),
+    }
+}
+
 /// One Gwead stream handle: an index into the current invocation's
 /// stream registry, readable or writable (the registry knows which;
 /// calling the wrong direction returns
@@ -145,7 +164,9 @@ impl Stream {
         self.handle
     }
 
-    /// Read into `buf`, blocking (via the host) until bytes arrive.
+    /// Read into `buf`, blocking (via the host) until [`Received::Bytes`]
+    /// arrive, the source ends ([`Received::End`]), or the step's own
+    /// cancellation releases a parked wait ([`Received::Cancelled`]).
     /// An empty `buf` is refused ([`StreamError::EmptyBuffer`]) — its
     /// 0-byte read would be indistinguishable from EOF, and guests ship
     /// as release builds where a debug assertion would never fire.
@@ -153,12 +174,8 @@ impl Stream {
         if buf.is_empty() {
             return Err(StreamError::EmptyBuffer);
         }
-        match sys::stream_read(self.handle, buf) {
-            n if n >= 0 => Ok(Received::Bytes(n as usize)),
-            sys::STREAM_EOF => Ok(Received::End),
-            sys::STREAM_CANCELLED => Ok(Received::Cancelled),
-            code => Err(StreamError::from_code(self.handle, code)),
-        }
+        classify_read(sys::stream_read(self.handle, buf))
+            .map_err(|code| StreamError::from_code(self.handle, code))
     }
 
     /// Write all of `buf`, blocking (via the host) while the consumer
@@ -190,7 +207,9 @@ impl Stream {
     }
 }
 
-/// What became of one line written with [`Stream::write_json_line`].
+/// What became of one call to [`Stream::write_all`] (and so, since it
+/// forwards the result, one line written with
+/// [`Stream::write_json_line`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     /// The consumer took it.
@@ -214,8 +233,9 @@ impl Stream {
     /// value carrying raw newlines inside its strings is escaped, never
     /// split.
     pub fn write_json_line(&self, value: &serde_json::Value) -> Result<Delivery, StreamError> {
-        let mut line =
-            serde_json::to_string(value).map_err(|_| StreamError::Io { detail: None })?;
+        let mut line = serde_json::to_string(value).map_err(|e| StreamError::Io {
+            detail: Some(e.to_string()),
+        })?;
         line.push('\n');
         self.write_all(line.as_bytes())
     }
@@ -225,45 +245,57 @@ impl Stream {
     /// vendor's non-2xx body. Up to one extra chunk is consumed past the
     /// cap; that overshoot is how truncation is detected, and is trimmed
     /// away. Every degraded state marks itself: a truncated excerpt
-    /// says so, a read error mid-body marks the partial excerpt as
-    /// interrupted, and a body that could not be read at all says that
-    /// instead of posing as empty. A read released by the step's own
-    /// cancellation token stops collecting like end-of-stream and is
-    /// **not** marked interrupted: the excerpt exists to explain a
-    /// non-2xx body to an operator who may at that moment be cancelling
-    /// the turn, and reporting their own stop as a degraded read would
-    /// misname it.
+    /// says so, and a read error mid-body marks the partial excerpt as
+    /// interrupted — except a body that could not be read *at all*,
+    /// which says so instead of posing as empty, unless the reason was
+    /// the step's own cancellation reaching the very first read (below),
+    /// in which case it is indistinguishable from an empty body. A read
+    /// released by the step's own cancellation token stops collecting
+    /// like end-of-stream and is **not** marked interrupted: the
+    /// excerpt exists to explain a non-2xx body to an operator who may
+    /// at that moment be cancelling the turn, and reporting their own
+    /// stop as a degraded read would misname it.
     pub fn read_excerpt(&self, cap: usize) -> String {
-        let mut collected = Vec::new();
-        let mut buf = [0u8; 1024];
-        let mut interrupted = false;
-        while collected.len() <= cap {
-            match self.read(&mut buf) {
-                Ok(Received::End) | Ok(Received::Cancelled) => break,
-                // No progress; a healthy kernel never sends one.
-                Ok(Received::Bytes(0)) => break,
-                Ok(Received::Bytes(n)) => collected.extend_from_slice(&buf[..n]),
-                Err(_) => {
-                    interrupted = true;
-                    break;
-                }
+        collect_excerpt(cap, |buf| self.read(buf))
+    }
+}
+
+/// The pure body of [`Stream::read_excerpt`], taking the read as a
+/// closure so its collection and marker logic is testable off-wasm:
+/// `read` stands in for repeated calls to [`Stream::read`].
+fn collect_excerpt(
+    cap: usize,
+    mut read: impl FnMut(&mut [u8]) -> Result<Received, StreamError>,
+) -> String {
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut interrupted = false;
+    while collected.len() <= cap {
+        match read(&mut buf) {
+            Ok(Received::End) | Ok(Received::Cancelled) => break,
+            // No progress; a healthy kernel never sends one.
+            Ok(Received::Bytes(0)) => break,
+            Ok(Received::Bytes(n)) => collected.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                interrupted = true;
+                break;
             }
         }
-        let truncated = collected.len() > cap;
-        collected.truncate(cap);
-        let mut text = String::from_utf8_lossy(&collected).trim().to_string();
-        let marker = match (text.is_empty(), truncated, interrupted) {
-            (true, false, true) => "(body unreadable)",
-            (_, true, _) => "…(truncated)",
-            (false, false, true) => "…(read interrupted)",
-            _ => return text,
-        };
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(marker);
-        text
     }
+    let truncated = collected.len() > cap;
+    collected.truncate(cap);
+    let mut text = String::from_utf8_lossy(&collected).trim().to_string();
+    let marker = match (text.is_empty(), truncated, interrupted) {
+        (true, false, true) => "(body unreadable)",
+        (_, true, _) => "…(truncated)",
+        (false, false, true) => "…(read interrupted)",
+        _ => return text,
+    };
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(marker);
+    text
 }
 
 #[cfg(test)]
@@ -318,8 +350,121 @@ mod tests {
         );
     }
 
+    /// `Stream::read`'s actual code-to-outcome mapping, table-tested
+    /// through the pure `classify_read` it delegates to. This is the
+    /// behaviour a `PartialEq` comparison of two `Received` variants
+    /// cannot pin: mutating `read` to map a 0-byte host return to
+    /// `Received::End` instead of `Bytes(0)` leaves `Received`'s own
+    /// derive untouched and only this table catches it.
     #[test]
-    fn an_empty_chunk_is_not_end_of_stream() {
-        assert_ne!(Received::Bytes(0), Received::End);
+    fn classify_read_maps_every_code_to_its_outcome() {
+        assert_eq!(classify_read(5), Ok(Received::Bytes(5)));
+        assert_eq!(classify_read(0), Ok(Received::Bytes(0)), "not End");
+        assert_eq!(classify_read(sys::STREAM_EOF), Ok(Received::End));
+        assert_eq!(
+            classify_read(sys::STREAM_CANCELLED),
+            Ok(Received::Cancelled)
+        );
+        // Left to the caller to decode via `StreamError::from_code`.
+        assert_eq!(classify_read(sys::STREAM_CLOSED), Err(sys::STREAM_CLOSED));
+        assert_eq!(
+            classify_read(sys::STREAM_INVALID_HANDLE),
+            Err(sys::STREAM_INVALID_HANDLE)
+        );
+    }
+
+    /// The handle-free branches of `from_code`: every code but
+    /// `STREAM_IO_ERROR` needs no host call, so these are testable
+    /// off-wasm with a handle value that is never touched.
+    #[test]
+    fn from_code_decodes_every_handle_free_branch() {
+        const H: i32 = 1;
+        assert_eq!(
+            StreamError::from_code(H, sys::STREAM_INVALID_HANDLE),
+            StreamError::InvalidHandle
+        );
+        assert_eq!(
+            StreamError::from_code(H, sys::STREAM_DIRECTION_MISMATCH),
+            StreamError::DirectionMismatch
+        );
+        assert_eq!(
+            StreamError::from_code(H, sys::STREAM_CLOSED),
+            StreamError::Closed
+        );
+        assert_eq!(StreamError::from_code(H, -99), StreamError::Other(-99));
+    }
+
+    /// [`collect_excerpt`] at each of `read_excerpt`'s documented
+    /// outcomes, driven by a fake reader instead of the wasm-only
+    /// `Stream::read` — this is what "unlocks" these arms for testing.
+    #[test]
+    fn collect_excerpt_covers_every_documented_outcome() {
+        let scripted = |mut items: std::vec::IntoIter<Result<Received, StreamError>>| {
+            move |buf: &mut [u8]| match items.next().expect("script exhausted") {
+                Ok(Received::Bytes(n)) => {
+                    buf[..n].copy_from_slice(&b"xxxxxxxxxxxxxxxxxxxxxxxxxx"[..n]);
+                    Ok(Received::Bytes(n))
+                }
+                other => other,
+            }
+        };
+
+        // A clean, short body: exact text, no marker.
+        assert_eq!(
+            collect_excerpt(
+                1024,
+                scripted(vec![Ok(Received::Bytes(5)), Ok(Received::End)].into_iter())
+            ),
+            "xxxxx"
+        );
+
+        // Cancelled before any byte: indistinguishable from an empty
+        // body by design (D12) — the doc above qualifies this.
+        assert_eq!(
+            collect_excerpt(1024, scripted(vec![Ok(Received::Cancelled)].into_iter())),
+            ""
+        );
+
+        // Cancelled after some bytes: what was collected, no marker —
+        // the operator's own stop is not a degraded read.
+        assert_eq!(
+            collect_excerpt(
+                1024,
+                scripted(vec![Ok(Received::Bytes(5)), Ok(Received::Cancelled)].into_iter())
+            ),
+            "xxxxx"
+        );
+
+        // Truncated: collected past `cap`, cut and marked.
+        assert_eq!(
+            collect_excerpt(
+                3,
+                scripted(vec![Ok(Received::Bytes(5)), Ok(Received::End)].into_iter())
+            ),
+            "xxx …(truncated)"
+        );
+
+        // A read error before any byte: unreadable, not empty.
+        assert_eq!(
+            collect_excerpt(1024, scripted(vec![Err(StreamError::Closed)].into_iter())),
+            "(body unreadable)"
+        );
+
+        // A read error after some bytes: interrupted, not silently
+        // truncated.
+        assert_eq!(
+            collect_excerpt(
+                1024,
+                scripted(vec![Ok(Received::Bytes(5)), Err(StreamError::Closed)].into_iter())
+            ),
+            "xxxxx …(read interrupted)"
+        );
+
+        // No progress: a healthy kernel never sends this, but the
+        // guard treats it like end-of-stream rather than looping.
+        assert_eq!(
+            collect_excerpt(1024, scripted(vec![Ok(Received::Bytes(0))].into_iter())),
+            ""
+        );
     }
 }

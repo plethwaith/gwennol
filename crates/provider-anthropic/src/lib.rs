@@ -148,11 +148,12 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             // Wind down without an `end` event: the consumer reads the
             // early end-of-stream as a failed turn, which a cancelled
             // turn is. Polling here catches cancellation between chunks;
-            // a read blocked on a stalled vendor is caught by the
-            // `Received::Cancelled` arm below, and one blocked on a
-            // stalled vendor the token never reaches ends when the
-            // fetch's streaming idle timeout ends the body. A parked
-            // write is released the same way, as `Delivery::Cancelled`.
+            // a read blocked on a stalled vendor is caught instead by
+            // the token releasing it as `Received::Cancelled` below, or
+            // by the fetch's streaming idle timeout ending the body,
+            // which ends the read, if the token never reaches it first.
+            // A write parked on a full channel is released by the very
+            // same token, as `Delivery::Cancelled`.
             upstream.close();
             output.close();
             return Ok(Value::Null);
@@ -176,8 +177,8 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             }
         };
         // A byte stream that is not an event stream at all (the parser's
-        // line and event caps) fails the step; the consumer sees early
-        // end-of-stream, as for any relay failure.
+        // line and event caps) fails the step; the consumer sees it as a
+        // reported read error carrying this step's own text.
         for event in parser.feed(&buf[..n])? {
             let emitted = translator.accept(&event.event, &event.data);
             for note in translator.take_notes() {

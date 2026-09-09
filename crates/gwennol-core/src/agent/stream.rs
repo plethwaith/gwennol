@@ -77,12 +77,22 @@ impl EventReader {
     /// read itself, which releases a read parked on a source that has
     /// *not yet* yielded — the kernel polls the source before the
     /// token, so bytes, an error, or EOF already available still win.
-    /// A source that is instead *always immediately ready* would
-    /// outrun a fired token indefinitely under that alone, so `next`
-    /// also checks the token immediately before issuing each read and
-    /// declines to start one once it has fired. Both checks sit after
-    /// the buffer scan, so an event already whole in the buffer is
-    /// still returned before either stops the read.
+    /// A source that is instead *always immediately ready with data*
+    /// would outrun a fired token indefinitely under that alone, so
+    /// `next` also checks the token immediately before issuing each
+    /// read and declines to start one once it has fired. Both checks
+    /// sit after the buffer scan, so an event already whole in the
+    /// buffer is still returned before either stops the read.
+    ///
+    /// Neither guard bounds a source that is always immediately ready
+    /// with **empty** chunks: gwead's own `read_async` skips those
+    /// inside one call rather than returning to ask again, so a fired
+    /// token cannot win the race until the source finally yields
+    /// something or ends. Unreachable from any of this crate's own
+    /// guests — `Stream::write_all` never commits a zero-length
+    /// write — so this is a residual bound on a third-party `LLM_CHAT`
+    /// guest, not a gap in these two checks; tracked upstream as
+    /// gwead#22.
     pub(crate) async fn next(
         &mut self,
         cancel: &CancellationToken,
@@ -351,8 +361,14 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut reader = EventReader::new(streams, id, 1 << 20);
-        // A reverted D3 would spin forever rather than return: bound
-        // the wait so that failure is fast, not a hung suite.
+        // Without D3, this reads forever rather than returning
+        // `Cancelled` — but the buffer's 1 MiB cap trips first, after
+        // ~128 reads, failing the outcome assertion below in well
+        // under a second; the timeout here is a backstop, not the
+        // guard that actually catches a reverted D3. The poll counter
+        // is: it also catches a weaker fix that reads once and only
+        // then checks the token, which the timeout and cap alone
+        // would not distinguish from the real one.
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next(&cancel))
             .await
             .expect("a fired token must stop the reader without a source read");
@@ -403,8 +419,8 @@ mod tests {
     /// This makes the reader's EOF-under-cancel path unreachable — once
     /// cancelled, `next` declines to read again, so it never sees the
     /// `STREAM_EOF` that would otherwise arrive next. The turn's own
-    /// `cancel.is_cancelled()` guard (`agent/mod.rs:707`) is what ends
-    /// such a turn as cancelled instead.
+    /// `Ok(None) if cancel.is_cancelled()` arm in `consume_stream`
+    /// (`agent/mod.rs`) is what ends such a turn as cancelled instead.
     #[tokio::test]
     async fn an_end_of_stream_under_a_fired_token_stops_at_the_check() {
         let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
@@ -419,20 +435,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_consumed_by_a_release() {
-        let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
+    async fn a_release_puts_the_source_back_for_a_later_read() {
+        // An mpsc-backed source, not `readable`: keeping `tx` after
+        // registration lets the test tell a lost/dropped source (the
+        // bug row 3 names — "the swapped-out source goes back") from a
+        // merely quiet one instantly. `tx.send` fails the moment its
+        // receiver is dropped, so a regression here fails in
+        // milliseconds, not on a timer.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let source = Box::pin(gwead::futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/x-ndjson", source);
+        let streams = Arc::new(Mutex::new(registry));
         let cancel = CancellationToken::new();
+
+        tx.send(Ok(Bytes::from_static(
+            b"{\"type\":\"text\",\"text\":\"a\"}\n",
+        )))
+        .await
+        .unwrap();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        // Consume the queued event with a quiet token: the channel is
+        // now empty, so the reader's next read genuinely parks on
+        // `rx.recv()` rather than returning immediately.
+        assert!(reader.next(&cancel).await.unwrap().is_some());
+        let waiting = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let outcome = reader.next(&cancel).await;
+                (outcome, reader)
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         cancel.cancel();
-        let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
-        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
-        // A new reader over the same handle with a quiet token still
-        // finds the queued event: this pins gwead's put-back, not a
-        // gwennol path — gwennol never re-reads after a `Cancelled` in
-        // production (the caller drops the reader, closing the handle).
+        let (outcome, mut reader) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .expect("cancellation ends the parked read")
+                .unwrap();
+        assert_eq!(outcome, Err(ReadError::Cancelled));
+
+        // The source was put back, not lost: the sender still has a
+        // live receiver on the other end.
+        tx.send(Ok(Bytes::from_static(b"{\"type\":\"end\"}\n")))
+            .await
+            .expect("the release must put the source back, not drop it");
+        // And the handle is genuinely live, not merely holding a
+        // sender with nowhere for its bytes to go: reading it again,
+        // reader kept alive throughout, finds the new event.
         let quiet = CancellationToken::new();
-        let mut fresh = EventReader::new(streams, id, 1 << 20);
         assert_eq!(
-            fresh.next(&quiet).await.unwrap(),
+            reader.next(&quiet).await.unwrap(),
             Some(json!({"type": "end"}))
         );
     }

@@ -941,8 +941,8 @@ impl Cut {
 /// Never on its own a reason to treat a turn as cancelled — the turn's
 /// token is the authority — because `Cancelled` also arrives when the
 /// kernel's action ceiling cancels the invocation (gwead remaps only
-/// its own between-step `Cancelled` to a timeout), and because any
-/// plugin may throw `steps::CANCELLED_CODE` itself.
+/// its own `Cancelled` to a timeout), and because any plugin may throw
+/// `steps::CANCELLED_CODE` itself.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
