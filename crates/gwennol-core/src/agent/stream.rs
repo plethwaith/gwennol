@@ -312,9 +312,9 @@ mod tests {
 
         // Case 2: a source that fails with an empty message records
         // the kernel's placeholder, never `None`.
-        let source = Box::pin(gwead::futures::stream::iter([Err(
-            std::io::Error::other(""),
-        )]));
+        let source = Box::pin(gwead::futures::stream::iter([Err(std::io::Error::other(
+            "",
+        ))]));
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/x-ndjson", source);
         let streams = Arc::new(Mutex::new(registry));

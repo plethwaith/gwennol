@@ -814,7 +814,22 @@ fn plugins_and_trust_come_from_flags_too() {
     r.stderr_has(
         "gwennol: POST https://api.anthropic.com/v1/messages from provider-anthropic: denied: no rule matched",
     );
-    r.stderr_has("gwennol: turn failed: the stream ended before the turn did");
+    let failed = r
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("gwennol: turn failed: "))
+        .expect("outcome line");
+    // The kernel names the actual invoked-streaming action that
+    // failed, provider-anthropic's own sibling `stream_turn` action
+    // (`provider-anthropic/src/lib.rs`'s `STREAM_ACTION`), not the
+    // public `chat` entry point that spawned it.
+    assert!(
+        failed.contains(
+            "the stream failed before the turn did: provider-anthropic.stream_turn failed:"
+        ),
+        "{failed}"
+    );
+    assert!(failed.contains("operator denied"), "{failed}");
 
     // Without trust, the provider cannot register; the error names the
     // file.
