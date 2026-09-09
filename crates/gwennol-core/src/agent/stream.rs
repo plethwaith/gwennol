@@ -2,7 +2,7 @@
 //! handle, one at a time, cancellable, bounded.
 
 use gwead::kernel::streams::{
-    STREAM_EOF, SharedStreamRegistry, StreamId, lock_shared, read_async_shared,
+    STREAM_CANCELLED, STREAM_EOF, SharedStreamRegistry, StreamId, lock_shared, read_async_shared,
 };
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
@@ -10,7 +10,9 @@ use gwead::tokio_util::sync::CancellationToken;
 /// Why [`EventReader::next`] could not produce an event.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReadError {
-    /// The turn was cancelled while waiting for bytes.
+    /// The turn was cancelled: either the reader declined to start a
+    /// new read because the token had already fired, or a read parked
+    /// on a quiet source was released by it.
     #[error("cancelled")]
     Cancelled,
     /// One line grew past the cap without ending. Events can be
@@ -69,6 +71,18 @@ impl EventReader {
     /// event: the contract frames every event as a whole line, so a
     /// torn one is the failed-turn shape, and the caller's
     /// no-`end`-event rule reports it.
+    ///
+    /// Two guards keep a cancelled turn from reading past its token,
+    /// and neither replaces the other. The token is passed into the
+    /// read itself, which releases a read parked on a source that has
+    /// *not yet* yielded — the kernel polls the source before the
+    /// token, so bytes, an error, or EOF already available still win.
+    /// A source that is instead *always immediately ready* would
+    /// outrun a fired token indefinitely under that alone, so `next`
+    /// also checks the token immediately before issuing each read and
+    /// declines to start one once it has fired. Both checks sit after
+    /// the buffer scan, so an event already whole in the buffer is
+    /// still returned before either stops the read.
     pub(crate) async fn next(
         &mut self,
         cancel: &CancellationToken,
@@ -97,15 +111,22 @@ impl EventReader {
             if self.buf.len() - self.consumed > self.cap {
                 return Err(ReadError::TooLong { cap: self.cap });
             }
+            // No new read once the turn is cancelled. Only a read that has to
+            // *wait* is released by the token below; the kernel polls the
+            // source before the token by contract, so a source that is
+            // always immediately ready would otherwise outrun a fired
+            // token indefinitely. The scan above has already run, so an
+            // event that was fully buffered is still returned before this
+            // stops asking for more.
+            if cancel.is_cancelled() {
+                return Err(ReadError::Cancelled);
+            }
             let mut chunk = [0u8; CHUNK];
-            let n = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(ReadError::Cancelled),
-                n = read_async_shared(&self.streams, self.id, &mut chunk) => n,
-            };
+            let n = read_async_shared(&self.streams, self.id, &mut chunk, cancel).await;
             match n {
                 n if n > 0 => self.buf.extend_from_slice(&chunk[..n as usize]),
                 STREAM_EOF => self.eof = true,
+                STREAM_CANCELLED => return Err(ReadError::Cancelled),
                 code => return Err(ReadError::Io(code)),
             }
         }
@@ -120,9 +141,11 @@ impl Drop for EventReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gwead::bytes::Bytes;
+    use gwead::futures::StreamExt as _;
     use gwead::kernel::streams::{STREAM_CLOSED, StreamRegistry};
     use gwead::serde_json::json;
 
@@ -135,6 +158,23 @@ mod tests {
                 .into_iter()
                 .map(|c| Ok(Bytes::from_static(c.as_bytes()))),
         ));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/x-ndjson", source);
+        (Arc::new(Mutex::new(registry)), id)
+    }
+
+    /// A readable that yields `chunk` forever and never returns
+    /// `Pending` — the shape that outruns a fired token when nothing
+    /// bounds the reader. Counts how many times the source was polled
+    /// so a test can assert a bound rather than wait for one.
+    fn always_ready(
+        chunk: &'static str,
+        polls: Arc<AtomicUsize>,
+    ) -> (SharedStreamRegistry, StreamId) {
+        let source = Box::pin(gwead::futures::stream::repeat_with(move || {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(chunk.as_bytes()))
+        }));
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/x-ndjson", source);
         (Arc::new(Mutex::new(registry)), id)
@@ -254,17 +294,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_wins_and_dropping_the_reader_closes_the_handle() {
-        // A source that never yields: the read parks, and only the
-        // token can end it.
-        let source = Box::pin(gwead::futures::stream::pending::<
-            Result<Bytes, std::io::Error>,
-        >());
+    async fn cancellation_ends_a_parked_read() {
+        // One chunk, then a source that genuinely parks — never
+        // returning `Pending` forever without ending — so the release
+        // below can only come from the kernel unparking a real wait,
+        // never from D3's pre-read check.
+        let source = Box::pin(
+            gwead::futures::stream::iter([Ok(Bytes::from_static(
+                b"{\"type\":\"text\",\"text\":\"a\"}\n",
+            ))])
+            .chain(gwead::futures::stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()),
+        );
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/x-ndjson", source);
         let streams = Arc::new(Mutex::new(registry));
         let cancel = CancellationToken::new();
         let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
+        // Consume the first chunk with a quiet token: the source has
+        // now genuinely parked, and the read below has to wait on it.
+        assert!(reader.next(&cancel).await.unwrap().is_some());
         let waiting = tokio::spawn({
             let cancel = cancel.clone();
             async move {
@@ -284,8 +334,106 @@ mod tests {
         // reports closed, not a parked wait.
         let mut buf = [0u8; 8];
         assert_eq!(
-            read_async_shared(&streams, id, &mut buf).await,
+            read_async_shared(&streams, id, &mut buf, &CancellationToken::new()).await,
             STREAM_CLOSED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fired_token_stops_the_reader_on_an_always_ready_source() {
+        // A chunk that is not a complete line — no newline — so the
+        // reader can never return an event from it and only D3's
+        // pre-read check can stop the loop; under D2 alone, an
+        // always-ready source (the kernel polls it before the token)
+        // would be consumed forever.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let (streams, id) = always_ready("{\"type\":\"text\"", polls.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        // A reverted D3 would spin forever rather than return: bound
+        // the wait so that failure is fast, not a hung suite.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next(&cancel))
+            .await
+            .expect("a fired token must stop the reader without a source read");
+        assert_eq!(outcome, Err(ReadError::Cancelled));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "the source was never polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_fired_before_the_first_read_polls_no_source() {
+        let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
+        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+        // The reader never consumed the queued bytes: a direct,
+        // quietly-tokened read over the same handle still finds them.
+        let mut buf = [0u8; 64];
+        let n = read_async_shared(&streams, id, &mut buf, &CancellationToken::new()).await;
+        assert!(n > 0, "the queued event is still there: {n}");
+    }
+
+    #[tokio::test]
+    async fn an_event_already_buffered_is_returned_before_the_reader_stops() {
+        // One chunk holding two whole events.
+        let (streams, id) = readable(vec![
+            "{\"type\":\"text\",\"text\":\"a\"}\n{\"type\":\"end\"}\n",
+        ]);
+        let cancel = CancellationToken::new();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap(),
+            Some(json!({"type": "text", "text": "a"}))
+        );
+        cancel.cancel();
+        // The second event was already whole in the buffer: it is
+        // still returned before either guard stops the read.
+        assert_eq!(
+            reader.next(&cancel).await.unwrap(),
+            Some(json!({"type": "end"}))
+        );
+        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+    }
+
+    /// This makes the reader's EOF-under-cancel path unreachable — once
+    /// cancelled, `next` declines to read again, so it never sees the
+    /// `STREAM_EOF` that would otherwise arrive next. The turn's own
+    /// `cancel.is_cancelled()` guard (`agent/mod.rs:707`) is what ends
+    /// such a turn as cancelled instead.
+    #[tokio::test]
+    async fn an_end_of_stream_under_a_fired_token_stops_at_the_check() {
+        let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
+        let cancel = CancellationToken::new();
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap(),
+            Some(json!({"type": "end"}))
+        );
+        cancel.cancel();
+        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_consumed_by_a_release() {
+        let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
+        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+        // A new reader over the same handle with a quiet token still
+        // finds the queued event: this pins gwead's put-back, not a
+        // gwennol path — gwennol never re-reads after a `Cancelled` in
+        // production (the caller drops the reader, closing the handle).
+        let quiet = CancellationToken::new();
+        let mut fresh = EventReader::new(streams, id, 1 << 20);
+        assert_eq!(
+            fresh.next(&quiet).await.unwrap(),
+            Some(json!({"type": "end"}))
         );
     }
 }

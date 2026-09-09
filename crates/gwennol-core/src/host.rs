@@ -227,7 +227,7 @@ fn describe(access: &Access) -> String {
 }
 
 /// Ask the operator. A denial is a plain step failure; a withdrawal is
-/// the structured cancellation every host step reports
+/// the one cancellation a host step reports structurally
 /// ([`crate::steps::CANCELLED_CODE`]), marked as withdrawn at the
 /// approval ([`crate::steps::CANCELLED_AT_APPROVAL`]) since nothing
 /// was done.

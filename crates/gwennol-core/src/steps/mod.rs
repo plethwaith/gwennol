@@ -51,10 +51,12 @@ pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
     requested.min(ceiling) as usize
 }
 
-/// The error code a host step fails with when its invocation was
-/// cancelled: a `KernelError::PluginError` carrying it, so a consumer —
-/// the agent loop — recognises cancellation as data and never by
-/// reading error text or guessing from a token's state.
+/// The error code a host step's approval fails with when it was
+/// withdrawn: a `KernelError::PluginError` carrying it, so a consumer —
+/// the agent loop — recognises the withdrawal as data and never by
+/// reading error text or guessing from a token's state. The one
+/// cancellation a host step reports structurally, because it carries
+/// more than [`StepError::Cancelled`] can: nothing ran.
 pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 
 /// The `params.phase` value on a cancellation that withdrew the step's
@@ -63,24 +65,22 @@ pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 /// cannot say how far it got.
 pub const CANCELLED_AT_APPROVAL: &str = "approval";
 
-/// The structured error a cancelled host step returns from inside its
-/// work.
+/// The typed error a host step returns when it observed its
+/// cancellation token in the middle of its work: the kernel's watchdog
+/// remaps this to `ExecutionTimeout` when a deadline fired the token.
 pub(crate) fn cancelled() -> StepError {
-    cancelled_with(Value::Null)
+    StepError::Cancelled
 }
 
 /// The structured error a host step returns when its approval was
 /// withdrawn: [`CANCELLED_CODE`] with `params.phase` set to
-/// [`CANCELLED_AT_APPROVAL`].
+/// [`CANCELLED_AT_APPROVAL`]. Unlike [`cancelled`], this carries one
+/// thing more than the typed variant can: nothing ran.
 pub(crate) fn withdrawn() -> StepError {
-    cancelled_with(gwead::serde_json::json!({"phase": CANCELLED_AT_APPROVAL}))
-}
-
-fn cancelled_with(params: Value) -> StepError {
     StepError::Thrown(PluginErrorPayload {
         code: CANCELLED_CODE.to_string(),
         message: "cancelled".to_string(),
-        params,
+        params: gwead::serde_json::json!({"phase": CANCELLED_AT_APPROVAL}),
     })
 }
 

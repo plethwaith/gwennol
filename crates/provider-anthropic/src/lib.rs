@@ -28,7 +28,8 @@
 
 use gwennol_guest::sse::SseParser;
 use gwennol_guest::{
-    Args, Delivery, Level, Stream, Target, cancelled, entrypoints, invoke, invoke_streaming, log,
+    Args, Delivery, Level, Received, Stream, Target, cancelled, entrypoints, invoke,
+    invoke_streaming, log,
 };
 use serde_json::{Value, json};
 
@@ -147,21 +148,33 @@ fn relay_sse(args: Args) -> Result<Value, String> {
             // Wind down without an `end` event: the consumer reads the
             // early end-of-stream as a failed turn, which a cancelled
             // turn is. Polling here catches cancellation between chunks;
-            // a read blocked on a stalled vendor ends when the fetch's
-            // streaming idle timeout ends the body.
+            // a read blocked on a stalled vendor is caught by the
+            // `Received::Cancelled` arm below, and one blocked on a
+            // stalled vendor the token never reaches ends when the
+            // fetch's streaming idle timeout ends the body. A parked
+            // write is released the same way, as `Delivery::Cancelled`.
             upstream.close();
             output.close();
             return Ok(Value::Null);
         }
-        let n = upstream
+        let n = match upstream
             .read(&mut buf)
-            .map_err(|e| format!("upstream read failed: {e}"))?;
-        if n == 0 {
+            .map_err(|e| format!("upstream read failed: {e}"))?
+        {
+            Received::Bytes(n) => n,
             // Vendor end-of-stream before `message_stop`: the turn
             // failed with the cause lost, and the contract's shape for
             // that is end-of-stream without `end` — so just close.
-            break;
-        }
+            Received::End => break,
+            // The read was parked on the vendor and released by the
+            // step's own cancellation token: the same wind-down as the
+            // `cancelled()` poll above, reached from inside a read.
+            Received::Cancelled => {
+                upstream.close();
+                output.close();
+                return Ok(Value::Null);
+            }
+        };
         // A byte stream that is not an event stream at all (the parser's
         // line and event caps) fails the step; the consumer sees early
         // end-of-stream, as for any relay failure.
@@ -180,10 +193,12 @@ fn relay_sse(args: Args) -> Result<Value, String> {
                     // The contract makes `end` and `error` each the last
                     // event of its kind of turn, so the relay enforces
                     // it: emit, stop reading, close. A vendor straggler
-                    // after either is never relayed. And the consumer
-                    // closing its handle is a benign hangup: the same
-                    // wind-down, not a failed step.
-                    Delivery::Delivered | Delivery::ReaderGone => {
+                    // after either is never relayed. The consumer
+                    // closing its handle is a benign hangup, and a
+                    // write released by the step's own cancellation
+                    // token is the same wind-down: neither is a failed
+                    // step.
+                    Delivery::Delivered | Delivery::ReaderGone | Delivery::Cancelled => {
                         upstream.close();
                         output.close();
                         return Ok(Value::Null);

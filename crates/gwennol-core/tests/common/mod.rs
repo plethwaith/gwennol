@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use boon::{Compiler, SchemaIndex, Schemas};
 use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
 use gwead::serde_json::Value;
+use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn, spi};
 
 /// Allows everything, knows no secrets: contract and substrate dispatch
@@ -249,8 +250,9 @@ pub async fn drain_stream_events(streams: &Arc<Mutex<StreamRegistry>>, out: &Val
     let id = NonZeroU32::new(u32::try_from(handle).unwrap()).unwrap();
     let mut collected = Vec::new();
     let mut buf = [0u8; 7]; // small, so the body takes many reads
+    let cancel = CancellationToken::new();
     loop {
-        let n = read_async_shared(streams, id, &mut buf).await;
+        let n = read_async_shared(streams, id, &mut buf, &cancel).await;
         if n == STREAM_EOF {
             break;
         }

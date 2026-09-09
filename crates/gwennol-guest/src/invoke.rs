@@ -102,8 +102,12 @@ pub fn invoke(target: Target<'_>, action: &str, input: &Value) -> Result<Value, 
 /// stream table, so an entry point may either drain it or hand it back
 /// as part of its own result for the embedder to drain — the handle
 /// stays valid after the action returns when the embedder supplied the
-/// stream table. A callee failure mid-stream surfaces as early
-/// end-of-stream on the handle, not as an `Err` here.
+/// stream table. A callee failure mid-stream is not an `Err` here —
+/// only a rejection at dispatch is — and not a plain end-of-stream on
+/// the handle either: once the bytes the callee did write are drained,
+/// the next [`Stream::read`] reports the failure as
+/// [`StreamError::Io`](crate::StreamError::Io), text included, rather
+/// than an EOF a consumer could mistake for a clean end.
 pub fn invoke_streaming(target: Target<'_>, action: &str, input: &Value) -> Result<Stream, String> {
     let input_json = serde_json::to_vec(input)
         .map_err(|e| format!("invoke_streaming input failed to serialize: {e}"))?;

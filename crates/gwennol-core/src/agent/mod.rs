@@ -54,13 +54,15 @@
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a pending approval is
-//!   withdrawn, a running tool step is cancelled. The turn's own token
+//!   withdrawn, a running tool step observes the token and stops,
+//!   reported as the kernel's typed cancellation. The turn's own token
 //!   is the authority: once it has fired, whatever a step reports is
 //!   the cut arriving (its text goes to the log), and a cancellation
-//!   code arriving *without* it — the kernel's action ceiling ended
-//!   the step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
-//!   step failure, reported as such and logged. The code's part is to
-//!   say how far the step got: a withdrawn approval means nothing ran.
+//!   arriving *without* it — the kernel's action ceiling ended the
+//!   step, or a plugin threw `steps::CANCELLED_CODE` itself — is a
+//!   step failure, reported as such and logged. Only a withdrawn
+//!   approval carries more than the typed variant can: nothing ran,
+//!   which is why it alone stays the structured `steps::CANCELLED_CODE`.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as
@@ -904,9 +906,10 @@ enum Cut {
 
 impl Cut {
     /// Read how far the cancelled step got from what it reported. Only
-    /// a host step's own structured error can say it never started; a
-    /// cancellation flattened by a nested invoke, or the kernel's own,
-    /// is read as the cautious answer.
+    /// a withdrawn approval's structured error can say it never
+    /// started; the kernel's typed in-work cancellation, a cancellation
+    /// flattened by a nested invoke, or any other shape, is read as the
+    /// cautious answer.
     fn from_error(e: &KernelError) -> Self {
         match e {
             KernelError::PluginError { code, params, .. }
@@ -932,12 +935,14 @@ impl Cut {
 }
 
 /// Whether a kernel error carries a cancellation: the kernel's own
-/// between-step check, or a host step's structured
-/// `steps::CANCELLED_CODE`. Never on its own a reason to treat a turn
-/// as cancelled — the turn's token is the authority — because the code
-/// also arrives when the kernel's action ceiling cancels the invocation
-/// (gwead remaps only its own `Cancelled` to a timeout), and because
-/// any plugin may throw it.
+/// typed [`KernelError::Cancelled`] — an in-work host step stop, or the
+/// kernel's own between-step check — or a host step's structured
+/// `steps::CANCELLED_CODE`, which now names only a withdrawn approval.
+/// Never on its own a reason to treat a turn as cancelled — the turn's
+/// token is the authority — because `Cancelled` also arrives when the
+/// kernel's action ceiling cancels the invocation (gwead remaps only
+/// its own between-step `Cancelled` to a timeout), and because any
+/// plugin may throw `steps::CANCELLED_CODE` itself.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,

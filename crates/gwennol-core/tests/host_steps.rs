@@ -1163,6 +1163,45 @@ async fn cancelling_an_invocation_tears_a_running_step_down() {
     assert!(err.to_string().contains("cancelled"), "{err}");
 }
 
+/// A host step cancelled inside its work — after its approval, unlike
+/// [`a_cancelled_invocation_withdraws_its_pending_approval`] — surfaces
+/// as the kernel's own typed `KernelError::Cancelled`, not the
+/// structured `steps::CANCELLED_CODE` payload that only a withdrawn
+/// approval still uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_work_cancellation_is_the_kernels_typed_cancellation() {
+    let f = fixture();
+    let cancel = CancellationToken::new();
+    let kernel = f.kernel.clone();
+    let token = cancel.clone();
+    let handle = tokio::spawn(async move {
+        kernel
+            .execute(
+                "runner",
+                "go",
+                json!({"argv": ["sleep", "30"], "stdin": "", "timeout_ms": 60000, "max_output_bytes": 1024}),
+            )
+            .with_config(&json!({}))
+            .with_cancel(token)
+            .run()
+            .await
+    });
+    // The approval has resolved and the child is well into its sleep
+    // by the time this fires, unlike the approval-withdrawal pins,
+    // which cancel before the operator ever answers.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    cancel.cancel();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("cancellation did not tear the step down")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&err, KernelError::Cancelled { .. }),
+        "an in-work cancellation must not be the withdrawn-approval PluginError: {err}"
+    );
+}
+
 // ---------------------------------------------------------------- http
 
 #[tokio::test]
@@ -1206,7 +1245,7 @@ async fn http_get_streaming_returns_a_readable_handle() {
     let mut collected = Vec::new();
     let mut buf = [0u8; 7]; // small, so the body takes many reads
     loop {
-        let n = read_async_shared(&streams, id, &mut buf).await;
+        let n = read_async_shared(&streams, id, &mut buf, &CancellationToken::new()).await;
         if n == STREAM_EOF {
             break;
         }
@@ -1420,7 +1459,7 @@ async fn stalled_stream_ends_in_an_io_error_rather_than_hanging() {
     let mut buf = [0u8; 64];
     let mut seen = Vec::new();
     let code = loop {
-        let n = read_async_shared(&streams, id, &mut buf).await;
+        let n = read_async_shared(&streams, id, &mut buf, &CancellationToken::new()).await;
         if n < 0 {
             break n;
         }
@@ -1673,9 +1712,13 @@ async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError
         .unwrap()
         .expect_err("a cancelled invocation fails");
     // Cancellation is data — the code, not the text — so a consumer
-    // never has to read the message to know.
+    // never has to read the message to know. A withdrawn approval
+    // carries one thing more than the kernel's typed cancellation can:
+    // its phase says nothing ran.
     assert!(
-        matches!(&err, KernelError::PluginError { code, .. } if code == gwennol_core::steps::CANCELLED_CODE),
+        matches!(&err, KernelError::PluginError { code, params, .. }
+            if code == gwennol_core::steps::CANCELLED_CODE
+                && params["phase"] == gwennol_core::steps::CANCELLED_AT_APPROVAL),
         "{plugin}: {err}"
     );
     assert_eq!(

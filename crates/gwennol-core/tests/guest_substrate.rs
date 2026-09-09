@@ -23,9 +23,10 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gwead::kernel::streams::StreamRegistry;
+use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared};
 use gwead::kernel::{Kernel, KernelConfig};
 use gwead::serde_json::{Value, json};
+use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{HostConfig, ProcessEnv, spi};
 // The guest's own exported names: the manifest and these tests name the
 // plugin, its actions, and its entry points from the one declaration
@@ -439,16 +440,60 @@ async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
 }
 
 /// A relay step that *fails* (a non-JSON vendor payload) reaches the
-/// consumer as the contract's failed-turn shape: the events so far,
-/// then end-of-stream with no `end` and no `error` event. The relay
-/// does not close its output on this path — this pins the kernel's
-/// post-invocation drain doing it, which everything in
-/// `docs/SUBSTRATE.md` about `Err` surfacing as early EOF relies on.
+/// consumer as a reported stream failure, not a plain end-of-stream:
+/// gwead drains the bytes the step did write, then reports the
+/// failure itself as `STREAM_IO_ERROR` rather than an EOF a consumer
+/// could mistake for a clean end — the garbage line is not relayed,
+/// and the vendor's later `end` event never reaches the consumer. The
+/// relay does not close its output on this path; the kernel's
+/// post-invocation drain and failure reporting do.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failing_relay_step_surfaces_as_early_end_of_stream() {
+async fn a_failing_relay_step_surfaces_as_a_reported_stream_failure() {
     let f = fixture();
-    let events = stream_turn_events(f, "/garbage-turn").await;
+    let provider = f
+        .kernel
+        .role_candidates(None, spi::llm_chat::ROLE)
+        .into_iter()
+        .next()
+        .expect("an LLM_CHAT fulfiller");
+    let input = chat_input();
+    let config = json!({
+        "model": "m3-fixture",
+        "stream_url": format!("http://{}/garbage-turn", f.stub.addr)
+    });
+    let streams = Arc::new(Mutex::new(StreamRegistry::new()));
+    let out = f
+        .kernel
+        .execute(&provider, spi::llm_chat::CHAT, input)
+        .with_config(&config)
+        .with_streams(streams.clone())
+        .run()
+        .await
+        .expect("streamed chat dispatch succeeds")
+        .output;
+    assert_conforms(contracts().chat_output, &out);
+    let handle = out["stream"].as_u64().expect("streamed form") as u32;
+    let id = std::num::NonZeroU32::new(handle).unwrap();
 
+    let cancel = CancellationToken::new();
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 64];
+    let code = loop {
+        let n = read_async_shared(&streams, id, &mut buf, &cancel).await;
+        if n < 0 {
+            break n;
+        }
+        collected.extend_from_slice(&buf[..n as usize]);
+    };
+    assert_eq!(
+        code, STREAM_IO_ERROR,
+        "a failed relay step must be reported, not silently read as EOF"
+    );
+    let events: Vec<Value> = String::from_utf8(collected)
+        .unwrap()
+        .lines()
+        .map(|line| gwead::serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
         events,
         vec![json!({"type": "text", "text": "before the garbage"})],
@@ -645,11 +690,14 @@ async fn the_buffered_form_is_refused_with_a_readable_error() {
     assert!(msg.contains("streamed form"), "names the limitation: {msg}");
 }
 
-/// gwennol-guest re-declares the six STREAM_* return codes because it
-/// deliberately cannot depend on gwead — so nothing but this test keeps
-/// the copies equal. A gwead renumbering would otherwise silently
-/// misclassify stream errors in every guest (Closed decoded as Io turns
-/// "reader hung up, wind down" into a failed step).
+/// gwennol-guest re-declares the seven STREAM_* return codes and the
+/// `MAX_LAST_ERROR_BYTES` cap because it deliberately cannot depend on
+/// gwead — so nothing but this test keeps the copies equal. A gwead
+/// renumbering would otherwise silently misclassify stream errors in
+/// every guest: Closed decoded as Io turns "reader hung up, wind down"
+/// into a failed step, and a wrong `STREAM_CANCELLED` turns a relay's
+/// own cancellation into a reported failure instead of the clean stop
+/// it is.
 #[test]
 fn the_guest_stream_codes_match_gwead() {
     use gwead::kernel::streams as host;
@@ -663,6 +711,8 @@ fn the_guest_stream_codes_match_gwead() {
     assert_eq!(guest::STREAM_CLOSED, host::STREAM_CLOSED);
     assert_eq!(guest::STREAM_IO_ERROR, host::STREAM_IO_ERROR);
     assert_eq!(guest::STREAM_OOB, host::STREAM_OOB);
+    assert_eq!(guest::STREAM_CANCELLED, host::STREAM_CANCELLED);
+    assert_eq!(guest::MAX_LAST_ERROR_BYTES, host::MAX_LAST_ERROR_BYTES);
 }
 
 /// The two-key authorization holds, first key: the manifest's

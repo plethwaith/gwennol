@@ -26,6 +26,16 @@ pub const STREAM_CLOSED: i32 = -4;
 pub const STREAM_IO_ERROR: i32 = -5;
 /// Stream return code: the guest passed an out-of-bounds buffer.
 pub const STREAM_OOB: i32 = -6;
+/// Stream return code: a parked read or write released by the step's
+/// cancellation token; nothing was committed and the source is
+/// untouched.
+pub const STREAM_CANCELLED: i32 = -7;
+
+/// The kernel's cap on the text [`stream_last_error`] returns: a copy
+/// longer than this is truncated on the host side. The parity test
+/// (`the_guest_stream_codes_match_gwead`) is what keeps this equal to
+/// gwead's own `MAX_LAST_ERROR_BYTES`.
+pub const MAX_LAST_ERROR_BYTES: usize = 4096;
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
@@ -42,6 +52,7 @@ mod imp {
         fn stream_read(handle: i32, buf_ptr: i32, buf_len: i32) -> i32;
         fn stream_write(handle: i32, buf_ptr: i32, buf_len: i32) -> i32;
         fn stream_close(handle: i32) -> i32;
+        fn stream_last_error(handle: i32, buf_ptr: i32, buf_len: i32) -> i32;
         fn stream_output() -> i32;
         fn is_cancelled() -> i32;
         fn host_invoke(
@@ -104,6 +115,11 @@ mod imp {
     pub fn read(handle: i32, buf: &mut [u8]) -> i32 {
         let (ptr, len) = ptr_len_mut(buf);
         unsafe { stream_read(handle, ptr, len) }
+    }
+
+    pub fn last_error(handle: i32, buf: &mut [u8]) -> i32 {
+        let (ptr, len) = ptr_len_mut(buf);
+        unsafe { stream_last_error(handle, ptr, len) }
     }
 
     pub fn write(handle: i32, buf: &[u8]) -> i32 {
@@ -171,6 +187,9 @@ mod imp {
     pub fn read(_handle: i32, _buf: &mut [u8]) -> i32 {
         absent("read")
     }
+    pub fn last_error(_handle: i32, _buf: &mut [u8]) -> i32 {
+        absent("last_error")
+    }
     pub fn write(_handle: i32, _buf: &[u8]) -> i32 {
         absent("write")
     }
@@ -219,6 +238,17 @@ pub fn host_log(level: i32, message: &[u8]) {
 /// copied, [`STREAM_EOF`], or another negative `STREAM_*` code.
 pub fn stream_read(handle: i32, buf: &mut [u8]) -> i32 {
     imp::read(handle, buf)
+}
+
+/// Copy the text behind the last [`STREAM_IO_ERROR`] or
+/// [`STREAM_CANCELLED`] on `handle` into `buf`. Returns the text's
+/// **full** length — which may exceed `buf.len()` — `0` when nothing
+/// is recorded, or a negative `STREAM_*` failure for the probe itself
+/// (an invalid handle, say). The text is retained, not drained: key on
+/// the code a read or write just returned, never on whether text is
+/// present.
+pub fn stream_last_error(handle: i32, buf: &mut [u8]) -> i32 {
+    imp::last_error(handle, buf)
 }
 
 /// Write `buf` to a writable stream. Returns bytes committed (the whole
