@@ -2,7 +2,8 @@
 //! handle, one at a time, cancellable, bounded.
 
 use gwead::kernel::streams::{
-    STREAM_CANCELLED, STREAM_EOF, SharedStreamRegistry, StreamId, lock_shared, read_async_shared,
+    STREAM_CANCELLED, STREAM_EOF, STREAM_IO_ERROR, SharedStreamRegistry, StreamId, lock_shared,
+    read_async_shared,
 };
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
@@ -23,9 +24,22 @@ pub(crate) enum ReadError {
     /// A line was not a JSON document.
     #[error("a stream line is not JSON: {0}")]
     NotJson(String),
-    /// The read failed with a stream error code other than end-of-stream.
+    /// The source behind the handle failed (`STREAM_IO_ERROR`), with
+    /// the text the kernel recorded for it: the failing step's own for
+    /// a relayed stream, the fetch step's for a streamed body. `None`
+    /// only when the handle is not in the table the reader was given.
+    #[error("the stream's source failed: {}", recorded(.detail))]
+    SourceFailed { detail: Option<String> },
+    /// The read failed with a code about the handle itself — closed,
+    /// unknown, wrong direction — rather than about its source.
     #[error("stream read failed with code {0}")]
     Io(i32),
+}
+
+/// The recorded text behind a failed source, or the one sentence that
+/// says there is none.
+pub(crate) fn recorded(detail: &Option<String>) -> &str {
+    detail.as_deref().unwrap_or("the kernel recorded no text")
 }
 
 /// One-event-at-a-time reader over a readable handle in `streams`.
@@ -120,6 +134,13 @@ impl EventReader {
                 n if n > 0 => self.buf.extend_from_slice(&chunk[..n as usize]),
                 STREAM_EOF => self.eof = true,
                 STREAM_CANCELLED => return Err(ReadError::Cancelled),
+                STREAM_IO_ERROR => {
+                    // The registry guard is a temporary, gone before
+                    // the per-stream lock `last_error` takes.
+                    let state = lock_shared(&self.streams).get(self.id);
+                    let detail = state.and_then(|s| s.last_error());
+                    return Err(ReadError::SourceFailed { detail });
+                }
                 code => return Err(ReadError::Io(code)),
             }
         }
@@ -257,10 +278,16 @@ mod tests {
         assert_eq!(reader.next(&cancel).await.unwrap(), None);
     }
 
+    /// A failing source carries the kernel's recorded text; a
+    /// handle-shaped code carries none, even when the slot still holds
+    /// one.
     #[tokio::test]
     async fn read_failures_carry_the_streams_code() {
-        use gwead::kernel::streams::STREAM_IO_ERROR;
-        // A source that fails: the I/O code.
+        use gwead::kernel::streams::EMPTY_ERROR_TEXT;
+
+        // Case 1: a source that fails carries the recorded text. A
+        // later handle-shaped code on the same handle does not fetch
+        // it, even though the slot still holds it.
         let source = Box::pin(gwead::futures::stream::iter([
             Ok(Bytes::from_static(b"{\"type\":\"text\",\"text\":\"a\"}\n")),
             Err(std::io::Error::other("transport died")),
@@ -269,14 +296,38 @@ mod tests {
         let id = registry.register_readable("application/x-ndjson", source);
         let streams = Arc::new(Mutex::new(registry));
         let cancel = CancellationToken::new();
-        let mut reader = EventReader::new(streams, id, 1 << 20);
+        let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
         assert!(reader.next(&cancel).await.unwrap().is_some());
         assert_eq!(
             reader.next(&cancel).await.unwrap_err(),
-            ReadError::Io(STREAM_IO_ERROR)
+            ReadError::SourceFailed {
+                detail: Some("transport died".into())
+            }
+        );
+        lock_shared(&streams).close(id);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap_err(),
+            ReadError::Io(STREAM_CLOSED)
         );
 
-        // A handle closed under the reader: the closed code, not EOF.
+        // Case 2: a source that fails with an empty message records
+        // the kernel's placeholder, never `None`.
+        let source = Box::pin(gwead::futures::stream::iter([Err(
+            std::io::Error::other(""),
+        )]));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/x-ndjson", source);
+        let streams = Arc::new(Mutex::new(registry));
+        let mut reader = EventReader::new(streams, id, 1 << 20);
+        assert_eq!(
+            reader.next(&cancel).await.unwrap_err(),
+            ReadError::SourceFailed {
+                detail: Some(EMPTY_ERROR_TEXT.into())
+            }
+        );
+
+        // Case 3: a handle closed under the reader — the closed code,
+        // not EOF, and not a source failure at all.
         let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
         let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
         lock_shared(&streams).close(id);
