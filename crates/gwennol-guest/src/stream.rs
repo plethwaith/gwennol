@@ -127,6 +127,28 @@ fn classify_read(n: i32) -> Result<Received, i32> {
     }
 }
 
+/// Map one `stream_write` return value to a step of
+/// [`Stream::write_all`]'s loop. Pure and testable off-wasm, unlike
+/// `sys::stream_write` itself; mirrors `classify_read`.
+///
+/// `Ok(Delivery::Delivered)` means only that *this call* committed `n`
+/// bytes — the loop advances `rest` by `n` and keeps going, or, if
+/// `rest` is now empty, that is also the whole write's outcome. It is
+/// not itself a promise that the whole buffer is sent; `write_all`'s
+/// own `rest.is_empty()` decides that. Any other `Ok` is a terminal
+/// [`Delivery`] the loop returns immediately. `0` (`ZeroCommit`, not an
+/// ABI error code) and every other unclassified code are left for the
+/// caller: `0` needs no handle, and anything else is decoded through
+/// [`StreamError::from_code`].
+fn classify_write(n: i32) -> Result<Delivery, i32> {
+    match n {
+        n if n > 0 => Ok(Delivery::Delivered),
+        sys::STREAM_CANCELLED => Ok(Delivery::Cancelled),
+        sys::STREAM_CLOSED => Ok(Delivery::ReaderGone),
+        code => Err(code),
+    }
+}
+
 /// One Gwead stream handle: an index into the current invocation's
 /// stream registry, readable or writable (the registry knows which;
 /// calling the wrong direction returns
@@ -188,12 +210,12 @@ impl Stream {
         // loop is defensive against a future partial-commit revision.
         let mut rest = buf;
         while !rest.is_empty() {
-            match sys::stream_write(self.handle, rest) {
-                n if n > 0 => rest = &rest[(n as usize).min(rest.len())..],
-                sys::STREAM_CANCELLED => return Ok(Delivery::Cancelled),
-                sys::STREAM_CLOSED => return Ok(Delivery::ReaderGone),
-                0 => return Err(StreamError::ZeroCommit),
-                code => return Err(StreamError::from_code(self.handle, code)),
+            let n = sys::stream_write(self.handle, rest);
+            match classify_write(n) {
+                Ok(Delivery::Delivered) => rest = &rest[(n as usize).min(rest.len())..],
+                Ok(terminal) => return Ok(terminal),
+                Err(0) => return Err(StreamError::ZeroCommit),
+                Err(code) => return Err(StreamError::from_code(self.handle, code)),
             }
         }
         Ok(Delivery::Delivered)
@@ -373,6 +395,31 @@ mod tests {
         );
     }
 
+    /// `Stream::write_all`'s actual code-to-outcome mapping, table
+    /// tested the same way `classify_read` is: this is the seam plan
+    /// section 4's "a write released by the token part-way through
+    /// `write_all`'s loop" row pins, and the only thing standing
+    /// between `Delivery::Cancelled` and a silent regression back to
+    /// `Delivery::Delivered`.
+    #[test]
+    fn classify_write_maps_every_code_to_its_outcome() {
+        assert_eq!(classify_write(5), Ok(Delivery::Delivered));
+        assert_eq!(classify_write(1), Ok(Delivery::Delivered));
+        assert_eq!(
+            classify_write(sys::STREAM_CANCELLED),
+            Ok(Delivery::Cancelled)
+        );
+        assert_eq!(classify_write(sys::STREAM_CLOSED), Ok(Delivery::ReaderGone));
+        // `ZeroCommit` needs no handle, so the caller decodes it
+        // itself rather than through `StreamError::from_code`.
+        assert_eq!(classify_write(0), Err(0));
+        // Left to the caller to decode via `StreamError::from_code`.
+        assert_eq!(
+            classify_write(sys::STREAM_INVALID_HANDLE),
+            Err(sys::STREAM_INVALID_HANDLE)
+        );
+    }
+
     /// The handle-free branches of `from_code`: every code but
     /// `STREAM_IO_ERROR` needs no host call, so these are testable
     /// off-wasm with a handle value that is never touched.
@@ -442,6 +489,17 @@ mod tests {
                 scripted(vec![Ok(Received::Bytes(5)), Ok(Received::End)].into_iter())
             ),
             "xxx …(truncated)"
+        );
+
+        // Exactly `cap` bytes, then end: not truncated. `collected.len()
+        // > cap`, not `>=`, is what this pins — a body that just fits
+        // must not be falsely marked.
+        assert_eq!(
+            collect_excerpt(
+                5,
+                scripted(vec![Ok(Received::Bytes(5)), Ok(Received::End)].into_iter())
+            ),
+            "xxxxx"
         );
 
         // A read error before any byte: unreadable, not empty.

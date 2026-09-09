@@ -696,16 +696,19 @@ impl Session {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
                 // The turn's token is the authority once it has fired:
-                // a stream that ends then, or fails on the read itself
-                // with the relay's own I/O error, is the cut arriving,
-                // not a vendor hanging up. The http step's body guard
-                // ends the body the instant the step's token fires;
-                // whether the reader sees the token or the ended body
-                // first is a race, and the token settles it. The error
-                // it folds goes to the log, as at the other two sites.
-                // A contract violation coinciding with the cut — a
-                // line that is not JSON, a code the loop's own table
-                // does not carry — is still a contract violation.
+                // a stream that ends then, or fails on the read itself,
+                // is the cut arriving, not a vendor hanging up. A read
+                // parked on the fetch step's body is released by gwead
+                // itself as `STREAM_CANCELLED` the moment the token
+                // fires. A `STREAM_IO_ERROR` under a fired token instead
+                // means the vendor's own transport error arrived in the
+                // same poll as the cancellation and won it — gwead polls
+                // the source before the token — so both are read as the
+                // cut arriving here, and the error either one carries
+                // goes to the log, as at the other two sites. A contract
+                // violation coinciding with the cut — a line that is not
+                // JSON, a code the loop's own table does not carry — is
+                // still a contract violation.
                 Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Err(e @ (ReadError::Cancelled | ReadError::Io(STREAM_IO_ERROR)))
                     if cancel.is_cancelled() =>

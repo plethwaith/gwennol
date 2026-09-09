@@ -425,7 +425,7 @@ async fn the_guest_builds_the_vendor_request() {
 /// A vendor error event is relayed as the contract error event and is
 /// the last event: nothing after it — not even the vendor's own
 /// spurious `end` — reaches the consumer, and the stream ends without
-/// an `end` event, which is the contract's failed-turn shape.
+/// an `end` event, one of the contract's two failed-turn shapes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     let f = fixture();
@@ -712,10 +712,45 @@ async fn a_cancelled_streaming_turn_winds_the_relay_down_without_failing() {
         .await
         .expect("the relay winds down within 10s")
         .expect("the pipeline reports");
-    assert!(
-        outcome.is_ok(),
-        "a cancelled turn is a graceful stop for the relay, not a failed step: {outcome:?}"
+    // `is_ok()` alone cannot tell "the relay wound down" from "the
+    // relay raised and the kernel swallowed it under the invocation's
+    // own cancellation": both resolve `Ok`, but a raising relay never
+    // records its own step result, and the fetch step's raw
+    // `{status, body}` surfaces as the action's output in its place.
+    // The relay's `Ok(Value::Null)` recorded as `step_results["relay"]`
+    // is what only D11's actual wind-down produces.
+    let result =
+        outcome.expect("a cancelled turn is a graceful stop for the relay, not a failed step");
+    assert_eq!(
+        result.output,
+        Value::Null,
+        "the relay's own Ok(Value::Null) must be the action's output: {:?}",
+        result.step_results
     );
+    assert_eq!(
+        result.step_results.get("relay"),
+        Some(&Value::Null),
+        "the relay step itself must have completed, not been swallowed under the cancellation: {:?}",
+        result.step_results
+    );
+    // And the fetch step's own upstream connection is genuinely torn
+    // down, the same proof the reader-gone sibling test above uses —
+    // this is the test that most needs it, since the whole premise of
+    // this round's fix is that gwead's own release now does the
+    // teardown `guarded_body` used to do itself.
+    for _ in 0..250 {
+        if f.stub
+            .hangups
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "/slow-turn")
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the relay never closed its upstream: the vendor kept streaming");
 }
 
 /// The example implements only the streamed form and says so as a step

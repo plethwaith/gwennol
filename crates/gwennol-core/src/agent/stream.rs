@@ -84,15 +84,18 @@ impl EventReader {
     /// sit after the buffer scan, so an event already whole in the
     /// buffer is still returned before either stops the read.
     ///
-    /// Neither guard bounds a source that is always immediately ready
+    /// Neither guard stops a source that is always immediately ready
     /// with **empty** chunks: gwead's own `read_async` skips those
     /// inside one call rather than returning to ask again, so a fired
     /// token cannot win the race until the source finally yields
-    /// something or ends. Unreachable from any of this crate's own
-    /// guests — `Stream::write_all` never commits a zero-length
-    /// write — so this is a residual bound on a third-party `LLM_CHAT`
-    /// guest, not a gap in these two checks; tracked upstream as
-    /// gwead#22.
+    /// something or ends. No producer in this repo can trigger it — a
+    /// guest's `Stream::write_all` (in `gwennol-guest`) never commits a
+    /// zero-length write, and the native `host_http` step's own body
+    /// wrapper (`guarded_body`, in `steps/http.rs`) drops empty chunks
+    /// itself so gwead's loop never sees one — so this is a residual
+    /// gap only a third-party `LLM_CHAT` guest, or an embedder
+    /// registering a raw readable directly, could still hit; tracked
+    /// upstream as gwead#22, not fixed by either check here.
     pub(crate) async fn next(
         &mut self,
         cancel: &CancellationToken,
@@ -124,10 +127,10 @@ impl EventReader {
             // No new read once the turn is cancelled. Only a read that has to
             // *wait* is released by the token below; the kernel polls the
             // source before the token by contract, so a source that is
-            // always immediately ready would otherwise outrun a fired
-            // token indefinitely. The scan above has already run, so an
-            // event that was fully buffered is still returned before this
-            // stops asking for more.
+            // always immediately ready with data would otherwise outrun a
+            // fired token indefinitely. The scan above has already run, so
+            // an event that was fully buffered is still returned before
+            // this stops asking for more.
             if cancel.is_cancelled() {
                 return Err(ReadError::Cancelled);
             }
@@ -362,13 +365,14 @@ mod tests {
         cancel.cancel();
         let mut reader = EventReader::new(streams, id, 1 << 20);
         // Without D3, this reads forever rather than returning
-        // `Cancelled` — but the buffer's 1 MiB cap trips first, after
-        // ~128 reads, failing the outcome assertion below in well
-        // under a second; the timeout here is a backstop, not the
-        // guard that actually catches a reverted D3. The poll counter
-        // is: it also catches a weaker fix that reads once and only
-        // then checks the token, which the timeout and cap alone
-        // would not distinguish from the real one.
+        // `Cancelled` — but the buffer's 1 MiB cap trips first: each
+        // `read_async` call returns one source chunk (14 bytes here),
+        // not up to `CHUNK`, so the cap needs ~75k reads, not a fixed
+        // small count — still well under a second. The timeout here is
+        // a backstop, not the guard that actually catches a reverted
+        // D3. The poll counter is: it also catches a weaker fix that
+        // reads once and only then checks the token, which the timeout
+        // and cap alone would not distinguish from the real one.
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next(&cancel))
             .await
             .expect("a fired token must stop the reader without a source read");

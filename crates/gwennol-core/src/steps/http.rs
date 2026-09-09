@@ -134,24 +134,45 @@ fn redirect_target(
 /// pre-empt it — the wrapped source would resolve *ready* with an error
 /// item the instant the token fired, and gwead polls the source before
 /// the token, so the release would never be the one seen.
+///
+/// Empty chunks are dropped here rather than handed to the consumer, so
+/// gwead's own read loop never sees one: gwead skips an empty chunk
+/// *inside* one `read_async` call instead of returning to ask again, so
+/// a source that is always immediately ready with them never lets a
+/// fired token win the race (tracked upstream as gwead#22) — reachable
+/// here from a hostile or broken HTTP/2 peer flooding zero-length DATA
+/// frames, since this body is a raw `reqwest::bytes_stream()`, unlike a
+/// `gwennol-guest` guest's `Stream::write_all`, which never commits an
+/// empty write. `yield_now` between chunks gives the executor a chance
+/// to run the task racing this one on the cancellation token,
+/// mirroring gwead's own mitigation for the same
+/// hole in its skip loop.
 fn guarded_body(source: ReadableSource, idle: Duration) -> ReadableSource {
     Box::pin(gwead::futures::stream::unfold(
         Some(source),
         move |state| async move {
             let mut source = state?;
-            match tokio::time::timeout(idle, source.next()).await {
-                Ok(Some(item)) => {
-                    let keep = item.is_ok().then_some(source);
-                    Some((item, keep))
+            loop {
+                match tokio::time::timeout(idle, source.next()).await {
+                    Ok(Some(Ok(bytes))) if bytes.is_empty() => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Ok(Some(item)) => {
+                        let keep = item.is_ok().then_some(source);
+                        return Some((item, keep));
+                    }
+                    Ok(None) => return None,
+                    Err(_) => {
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("no response data for {idle:?}"),
+                            )),
+                            None,
+                        ));
+                    }
                 }
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("no response data for {idle:?}"),
-                    )),
-                    None,
-                )),
             }
         },
     ))
@@ -233,9 +254,12 @@ pub fn http_get<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
 /// # Time
 ///
 /// `timeout_ms` bounds reaching a response, redirect chain included, and
-/// the body as well when it is buffered. A streamed body is bounded instead
-/// by `idle_timeout_ms` between chunks, and by the invocation's cancel
-/// token.
+/// the body as well when it is buffered. A streamed body is bounded
+/// instead by `idle_timeout_ms` between chunks; the invocation's
+/// cancellation token bounds a *consumer's* read of it, releasing one
+/// parked on a quiet chunk as `STREAM_CANCELLED`, and the connection
+/// itself is torn down by the kernel's post-invocation drain once the
+/// action ends.
 pub fn http_post<'a>(
     ex: &'a mut (dyn PluginExecution + Send),
     params: &'a Value,
@@ -515,5 +539,34 @@ mod tests {
             redirect_target(&plain, 302, Some("http://other.example/x"), &Method::GET).is_ok(),
             "http to http is not a downgrade"
         );
+    }
+
+    /// A vendor body that never sends anything but empty chunks must
+    /// not starve a fired cancellation token the way an always-ready
+    /// source can (gwead#22): `guarded_body` drops empty chunks itself
+    /// so gwead's own read loop, which skips them *inside* one call
+    /// rather than returning to ask again, never sees one to skip.
+    #[tokio::test]
+    async fn an_always_empty_body_does_not_starve_a_fired_token() {
+        use gwead::bytes::Bytes;
+        use gwead::kernel::streams::{STREAM_CANCELLED, StreamRegistry, read_async_shared};
+        use gwead::tokio_util::sync::CancellationToken;
+
+        let source: ReadableSource =
+            Box::pin(gwead::futures::stream::repeat_with(|| Ok(Bytes::new())));
+        let guarded = guarded_body(source, Duration::from_secs(60));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/octet-stream", guarded);
+        let streams = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_async_shared(&streams, id, &mut buf, &cancel),
+        )
+        .await
+        .expect("a fired token must not be starved by an empty-chunk flood");
+        assert_eq!(n, STREAM_CANCELLED);
     }
 }
