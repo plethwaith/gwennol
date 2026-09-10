@@ -436,7 +436,8 @@ async fn the_guest_builds_the_vendor_request() {
 /// provider-authored `error` event, then end-of-stream, never `end` —
 /// distinct from the other two, which carry no such event: silent
 /// end-of-stream with the cause lost, or the read itself failing,
-/// which does still report the failing step's own text.
+/// which does still report the text the kernel recorded for the
+/// failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vendor_error_ends_the_stream_with_the_error_event_last() {
     let f = fixture();

@@ -24,9 +24,9 @@
 //!   the failure came back, in which case it is the cut arriving
 //!   ([`TurnError::Cancelled`]), carrying the source's text when it
 //!   was a failure the read found waiting. The reader reads the
-//!   token once with each read's code; a token that fires after that
-//!   reading is not seen by it, and the turn ends as what the read
-//!   saw.
+//!   token once with each read's code; by that reading's ordering, a
+//!   token that fires after it is not seen by it, and the turn ends
+//!   as what the read saw.
 //! - **A streamed assistant message is rebuilt** as the events in
 //!   order — adjacent text coalesced, `tool_use` and `opaque` blocks
 //!   whole and in place — and replayed verbatim on the next round. The
@@ -79,7 +79,8 @@
 //!   reports cancellation on a token that has not fired, which none
 //!   in this repo does.
 //!   Only a withdrawn approval carries more than the typed variant
-//!   can: nothing ran, which is why it alone stays the structured
+//!   can: nothing ran, which is why, among the host steps' own
+//!   cancellations, it alone stays the structured
 //!   `steps::CANCELLED_CODE`.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
@@ -291,16 +292,18 @@ pub enum TurnError {
     #[error("the stream ended before the turn did; the cause was lost")]
     StreamEnded,
     /// The stream's source failed before an `end` or `error` event,
-    /// and `detail` is the text the kernel recorded for the read. For
-    /// the turn's stream that source is the provider's relaying
-    /// action, and the text is the kernel's report of that action's
-    /// failure, `{plugin}.{action} failed: {e}`, whatever `e` was:
-    /// the relay's own error, or the streamed body it was reading
-    /// ending in the fetch step's idle guard or a transport fault.
+    /// and `detail` is the text the kernel recorded for the read.
+    /// For a relayed stream that text is the kernel's report of the
+    /// relaying action's failure, `{plugin}.{action} failed: {e}`,
+    /// with the action's own text as `e`; for a stream whose handle
+    /// is the fetch step's body directly, the guard's text or the
+    /// transport's error.
     #[error("the stream failed before the turn did: {}", stream::recorded(.detail))]
     StreamFailed {
-        /// The text the kernel recorded for the failing read, or
-        /// `None` when the handle was not in the reader's table.
+        /// The text the kernel recorded for the failing read.
+        /// `None` only if the kernel ever reported the failure with
+        /// no recorded text, which does not happen today; kept as a
+        /// canary, not a live case.
         detail: Option<String>,
     },
     /// The model kept asking for tools past [`SessionConfig::max_rounds`].
@@ -997,7 +1000,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, or the plugin reported one itself");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 
