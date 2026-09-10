@@ -239,6 +239,13 @@ fn config(route: &str) -> SessionConfig {
         STREAM_LLM.to_string(),
         json!({
             "url": format!("http://{}{route}", f.stub.addr),
+            // Not decorative: the fixture's manifest resolves
+            // `{{$config.idle_timeout_ms}}` for its fetch step, and
+            // gwead renders a missing `$config` key as the empty
+            // string rather than null, which `u64_param` refuses.
+            // Without this key every streamed session here fails
+            // with `param 'idle_timeout_ms' must be a non-negative
+            // integer`.
             "idle_timeout_ms": DEFAULT_IDLE_TIMEOUT_MS,
         }),
     );
