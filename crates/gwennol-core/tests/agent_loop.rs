@@ -27,6 +27,7 @@ use std::time::Duration;
 use gwead::kernel::Kernel;
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
+use gwennol_core::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_core::{
     Access, ApprovalRequest, Decision, Event, Operator, Session, SessionConfig, SessionError,
     StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
@@ -236,7 +237,10 @@ fn config(route: &str) -> SessionConfig {
     let mut configs = BTreeMap::new();
     configs.insert(
         STREAM_LLM.to_string(),
-        json!({"url": format!("http://{}{route}", f.stub.addr)}),
+        json!({
+            "url": format!("http://{}{route}", f.stub.addr),
+            "idle_timeout_ms": DEFAULT_IDLE_TIMEOUT_MS,
+        }),
     );
     SessionConfig {
         provider: Some(STREAM_LLM.into()),
@@ -320,6 +324,8 @@ fn fixture_plugins() -> Vec<Value> {
             "actions": {"chat": {"steps": [
                 {"id": "fetch", "type": "host_http.post", "params": {
                     "url": "{{$config.url}}",
+                    // idle_timeout_ms is per-session so one route can lower it.
+                    "idle_timeout_ms": "{{$config.idle_timeout_ms}}",
                     // Field by field: `$input` alone resolves to the
                     // whole template namespace. Every session in this
                     // suite sets system and max_tokens, and the tool
@@ -608,6 +614,10 @@ fn stub() -> &'static Stub {
                 slow_stream(stub, &mut socket, &path);
                 return;
             }
+            if path == "/stall" {
+                stalled_stream(&mut socket);
+                return;
+            }
             let events = script(&path, &body, asked);
             let _ = socket.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n",
@@ -638,6 +648,20 @@ fn slow_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let _ = socket.write_all(format!("{}\n", end("end_turn")).as_bytes());
+}
+
+/// One text event, then silence past the session's idle timeout. The
+/// `end` after the pause reaches a client that has already gone; if it
+/// does not, the guard did not fire and the turn succeeds, which the
+/// test reads as a failure within the pause.
+fn stalled_stream(socket: &mut TcpStream) {
+    let _ = socket.write_all(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n",
+    );
+    let _ = socket.write_all(format!("{}\n", text("hel")).as_bytes());
+    let _ = socket.flush();
+    std::thread::sleep(Duration::from_secs(2));
     let _ = socket.write_all(format!("{}\n", end("end_turn")).as_bytes());
 }
 
@@ -1202,6 +1226,29 @@ async fn off_contract_streams_fail_the_turn_closed() {
         TurnError::Contract(msg) => assert!(msg.contains("4096-byte cap"), "{msg}"),
         other => panic!("{other}"),
     }
+}
+
+/// A streamed body whose guard ends it mid-turn fails the turn with the
+/// text the kernel recorded for the read, shown to the operator and
+/// kept out of the transcript: what the stub streamed is shown, nothing
+/// is stored, and the next turn starts from the user message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
+    let mut cfg = config("/stall");
+    cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] = json!(500);
+    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
+    let (outcome, events) = with_events(async { turn(&mut s, "stall").await }).await;
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(&err, TurnError::StreamFailed { detail: Some(d) } if d == "no response data for 500ms"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the stream failed before the turn did: no response data for 500ms"
+    );
+    assert_eq!(events, vec![Event::Text("hel".into())]);
+    assert_eq!(s.transcript(), &[user("stall")]);
 }
 
 /// Refusal ends the turn unretried; `max_tokens` is a completed turn;
