@@ -149,9 +149,10 @@ impl EventReader {
             let n = read_async_shared(&self.streams, self.id, &mut chunk, cancel).await;
             match n {
                 n if n > 0 => self.buf.extend_from_slice(&chunk[..n as usize]),
-                // An end or a failure that was already there when the token
-                // fired is what the read reports; the token, read here with
-                // the code, says what it means to the turn.
+                // The source's end or failure won the read's poll over
+                // a token that fired while the read was out; the
+                // token, read here with the code, says what it means
+                // to the turn.
                 STREAM_EOF if cancel.is_cancelled() => {
                     return Err(ReadError::Cancelled { detail: None });
                 }
@@ -162,6 +163,15 @@ impl EventReader {
                     // the per-stream lock `last_error` takes.
                     let state = lock_shared(&self.streams).get(self.id);
                     let detail = state.and_then(|s| s.last_error());
+                    if cancel.is_cancelled() && detail.is_none() {
+                        // Latent: today `io_error` implies a recorded
+                        // text, so this never fires. If the kernel ever
+                        // reports a source failure with no text, it
+                        // must not vanish behind a plain `cancelled`.
+                        tracing::warn!(
+                            "the stream's source failed under the turn's cancellation with no recorded text"
+                        );
+                    }
                     return Err(if cancel.is_cancelled() {
                         ReadError::Cancelled { detail }
                     } else {
@@ -224,11 +234,13 @@ mod tests {
         (Arc::new(Mutex::new(registry)), id)
     }
 
-    /// An mpsc-backed readable, built exactly as
-    /// `a_release_puts_the_source_back_for_a_later_read`'s: `tx` stays
-    /// live so a case can `try_send` an item with no await between it
-    /// landing and the token firing, which is what makes which of the
-    /// two the kernel's select saw first pinnable.
+    /// An mpsc-backed readable: `tx` stays live so a case can
+    /// `try_send` an item with no await between it landing and the
+    /// token firing, or drop it to make the source empty instead. What
+    /// makes which of the two the kernel's select saw first pinnable
+    /// is `poll_once` driving the read by hand, not this source;
+    /// keeping `tx` live is what makes `try_send` and the
+    /// source-put-back assertion possible.
     fn mpsc_readable() -> (
         SharedStreamRegistry,
         StreamId,
@@ -506,10 +518,11 @@ mod tests {
         );
     }
 
-    /// Once cancelled, `next` declines to read again, so an end that
-    /// arrives *after* the token is never seen this way. An end that
-    /// was already there when the token fired is reported by the
-    /// read's own arm as `Cancelled` instead (see
+    /// The token firing between two `next` calls stops at the pre-read
+    /// check: `next` declines to read again, so the end waiting on the
+    /// source is never polled, whether or not it was already there. An
+    /// end that wins the poll of a read already parked when the token
+    /// fires is reported by the read's own arm instead (see
     /// `an_end_or_failure_already_there_when_the_token_fires_is_the_cut`,
     /// case 2).
     #[tokio::test]

@@ -1413,7 +1413,10 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
         until("the slow tool's child to start", move || marker.exists())
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled { .. }));
+    assert!(matches!(
+        outcome.unwrap_err(),
+        TurnError::Cancelled { detail: None }
+    ));
     let slow = tool_call("c1", "slow", json!({}));
     assert_eq!(
         events,
@@ -1459,7 +1462,10 @@ async fn cancelling_at_an_open_approval_withdraws_it() {
         asked.arrived.notified().await
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled { .. }));
+    assert!(matches!(
+        outcome.unwrap_err(),
+        TurnError::Cancelled { detail: None }
+    ));
     // The host step said it was withdrawn at the approval, so the model
     // is told nothing ran — not the cautious "may have run".
     let gated = tool_call("c1", "gated", json!({"path": "hello.txt"}));
@@ -1497,7 +1503,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     let mut streamed = session("/text");
     assert!(matches!(
         streamed.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled { .. }
+        TurnError::Cancelled { detail: None }
     ));
     assert_eq!(streamed.transcript(), &[user("never")]);
     assert!(
@@ -1514,7 +1520,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     })]);
     assert!(matches!(
         buffered.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled { .. }
+        TurnError::Cancelled { detail: None }
     ));
     assert_eq!(buffered.transcript(), &[user("never")]);
 }

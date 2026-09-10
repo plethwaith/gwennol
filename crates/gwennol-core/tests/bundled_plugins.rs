@@ -970,7 +970,10 @@ async fn cancelling_a_buffered_round_against_the_bundled_provider_is_a_cancel() 
         .expect("the cancel ends the stalled round promptly")
         .unwrap();
     assert!(
-        matches!(outcome, Err(gwennol_core::TurnError::Cancelled { .. })),
+        matches!(
+            outcome,
+            Err(gwennol_core::TurnError::Cancelled { detail: None })
+        ),
         "{outcome:?}"
     );
     assert_eq!(session.transcript().len(), 1, "nothing partial is kept");
