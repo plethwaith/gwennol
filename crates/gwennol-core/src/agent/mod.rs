@@ -282,11 +282,21 @@ pub enum TurnError {
     /// The provider's output is not the contract's.
     #[error("provider output violates the LLM_CHAT contract: {0}")]
     Contract(String),
-    /// The stream ended before an `end` or `error` event.
+    /// The stream ended before an `end` or `error` event: the source
+    /// reached its end with the turn unfinished, so the kernel
+    /// recorded nothing and the cause is lost. The provider's relay
+    /// closes its output this way when the vendor's stream ends
+    /// early. A source that *fails* is [`TurnError::StreamFailed`],
+    /// which carries the text the kernel recorded.
     #[error("the stream ended before the turn did; the cause was lost")]
     StreamEnded,
-    /// The stream's source failed before an `end` or `error` event:
-    /// the relaying step failed, or a streamed body's guard ended it.
+    /// The stream's source failed before an `end` or `error` event,
+    /// and `detail` is the text the kernel recorded for the read. For
+    /// the turn's stream that source is the provider's relaying
+    /// action, and the text is the kernel's report of that action's
+    /// failure, `{plugin}.{action} failed: {e}`, whatever `e` was:
+    /// the relay's own error, or the streamed body it was reading
+    /// ending in the fetch step's idle guard or a transport fault.
     #[error("the stream failed before the turn did: {}", stream::recorded(.detail))]
     StreamFailed {
         /// The text the kernel recorded for the failing read, or

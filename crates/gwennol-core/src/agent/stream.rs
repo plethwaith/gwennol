@@ -29,9 +29,12 @@ pub(crate) enum ReadError {
     #[error("a stream line is not JSON: {0}")]
     NotJson(String),
     /// The source behind the handle failed (`STREAM_IO_ERROR`), with
-    /// the text the kernel recorded for it: the failing step's own for
-    /// a relayed stream, the fetch step's for a streamed body. `None`
-    /// only when the handle is not in the table the reader was given.
+    /// the text the kernel recorded for it. For a relayed stream that
+    /// is the kernel's report of the relaying action's failure,
+    /// `{plugin}.{action} failed: {e}`, with the action's own text as
+    /// `e`; for a streamed HTTP body read straight off the fetch
+    /// step, the guard's text or the transport's error. `None` only
+    /// when the handle is not in the table the reader was given.
     #[error("the stream's source failed: {}", recorded(.detail))]
     SourceFailed { detail: Option<String> },
     /// The read failed with a code about the handle itself — closed,
