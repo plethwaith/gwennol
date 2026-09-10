@@ -884,9 +884,17 @@ fn ctrl_c_cancels_the_turn() {
     eprintln!("--- stderr ---\n{stderr}\n---");
     assert_eq!(status.code(), Some(130), "{status:?}");
     assert!(stderr.contains("gwennol: interrupted; cancelling the turn"));
-    let cancelled = stderr.find("gwennol: cancelled").expect("outcome line");
-    let failed_write = stderr
-        .find("gwennol: transcript /nonexistent/dir/t.json: ")
+    // The whole line, not a prefix: a plain cancellation carries no
+    // text, and a detail leaking into a suffix must fail this, not
+    // slip past a `find` that only checks the start.
+    let lines: Vec<&str> = stderr.lines().collect();
+    let cancelled = lines
+        .iter()
+        .position(|&line| line == "gwennol: cancelled")
+        .expect("outcome line, exactly, carrying no leaked text");
+    let failed_write = lines
+        .iter()
+        .position(|&line| line.starts_with("gwennol: transcript /nonexistent/dir/t.json: "))
         .expect("transcript failure line");
     assert!(cancelled < failed_write, "{stderr}");
 }

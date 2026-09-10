@@ -163,7 +163,8 @@ impl EventReader {
                     // the per-stream lock `last_error` takes.
                     let state = lock_shared(&self.streams).get(self.id);
                     let detail = state.and_then(|s| s.last_error());
-                    if cancel.is_cancelled() && detail.is_none() {
+                    let cancelled = cancel.is_cancelled();
+                    if cancelled && detail.is_none() {
                         // Latent: today `io_error` implies a recorded
                         // text, so this never fires. If the kernel ever
                         // reports a source failure with no text, it
@@ -172,7 +173,7 @@ impl EventReader {
                             "the stream's source failed under the turn's cancellation with no recorded text"
                         );
                     }
-                    return Err(if cancel.is_cancelled() {
+                    return Err(if cancelled {
                         ReadError::Cancelled { detail }
                     } else {
                         ReadError::SourceFailed { detail }
@@ -236,11 +237,11 @@ mod tests {
 
     /// An mpsc-backed readable: `tx` stays live so a case can
     /// `try_send` an item with no await between it landing and the
-    /// token firing, or drop it to make the source empty instead. What
-    /// makes which of the two the kernel's select saw first pinnable
-    /// is `poll_once` driving the read by hand, not this source;
-    /// keeping `tx` live is what makes `try_send` and the
-    /// source-put-back assertion possible.
+    /// token firing, or drop it to end the source instead, so the next
+    /// poll finds an end already there. What makes which of the two
+    /// the kernel's select saw first pinnable is `poll_once` driving
+    /// the read by hand, not this source; keeping `tx` live is what
+    /// makes `try_send` and the source-put-back assertion possible.
     fn mpsc_readable() -> (
         SharedStreamRegistry,
         StreamId,
