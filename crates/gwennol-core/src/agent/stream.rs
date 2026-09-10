@@ -11,11 +11,15 @@ use gwead::tokio_util::sync::CancellationToken;
 /// Why [`EventReader::next`] could not produce an event.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ReadError {
-    /// The turn was cancelled: either the reader declined to start a
-    /// new read because the token had already fired, or a read parked
-    /// on a quiet source was released by it.
-    #[error("cancelled")]
-    Cancelled,
+    /// The turn was cancelled: the reader declined to start a new read
+    /// because the token had already fired, a read parked on a quiet
+    /// source was released by it, or the source's end or failure won
+    /// the read's poll over a token that fired while the read was out.
+    /// `detail` is the text the kernel recorded when it was a failure
+    /// that won — the cut hid it, and the turn reports it beside the
+    /// cancellation — and `None` otherwise.
+    #[error("cancelled{}", beside_the_cut(.detail))]
+    Cancelled { detail: Option<String> },
     /// One line grew past the cap without ending. Events can be
     /// arbitrarily long by contract, so the cap is the consumer's
     /// bound on buffering, not a contract limit.
@@ -40,6 +44,15 @@ pub(crate) enum ReadError {
 /// says there is none.
 pub(crate) fn recorded(detail: &Option<String>) -> &str {
     detail.as_deref().unwrap_or("the kernel recorded no text")
+}
+
+/// What a cancellation carries beside itself: nothing, or the text
+/// of the source failure it hid.
+pub(crate) fn beside_the_cut(detail: &Option<String>) -> String {
+    detail
+        .as_deref()
+        .map(|text| format!("; the stream's source failed with: {text}"))
+        .unwrap_or_default()
 }
 
 /// One-event-at-a-time reader over a readable handle in `streams`.
@@ -85,15 +98,19 @@ impl EventReader {
     /// event: the contract frames every event as a whole line, so a torn
     /// one falls to the caller's no-`end`-event rule.
     ///
-    /// Two guards keep a cancelled turn from reading past its token. The
-    /// token goes into the read, which releases only a read that has to
-    /// wait: the kernel polls the source before the token, so bytes, an
-    /// error, or EOF already available still win. And `next` checks the
-    /// token before issuing each read, since a source always ready would
-    /// otherwise outrun a fired token. Both sit after the buffer scan, so
-    /// a whole buffered event returns first. Neither bounds a source
-    /// always ready with *empty* chunks; the relay writing this handle
-    /// never sends one (`gwennol-guest`'s `write_all`); `guarded_body` in
+    /// Three readings of the token keep a cancelled turn from reading
+    /// past it. `next` checks it before issuing each read, since a
+    /// source always ready would otherwise outrun a fired token. The
+    /// token also goes into the read itself, which releases only a
+    /// read that has to wait: the kernel polls the source before the
+    /// token, so bytes, an error, or an end already there still win.
+    /// And the read's own returned code is checked against the token
+    /// once the read comes back: an end or a failure that won that
+    /// poll is reported as the cut, a failure with its recorded text.
+    /// All three sit after the buffer scan, so a whole buffered event
+    /// returns first. None of them bounds a source always ready with
+    /// *empty* chunks; the relay writing this handle never sends one
+    /// (`gwennol-guest`'s `write_all`); `guarded_body` in
     /// `steps/http.rs` covers the HTTP-body case.
     pub(crate) async fn next(
         &mut self,
@@ -126,20 +143,30 @@ impl EventReader {
             // No new read once the turn is cancelled; the scan above has run, so
             // a whole event already buffered was returned first.
             if cancel.is_cancelled() {
-                return Err(ReadError::Cancelled);
+                return Err(ReadError::Cancelled { detail: None });
             }
             let mut chunk = [0u8; CHUNK];
             let n = read_async_shared(&self.streams, self.id, &mut chunk, cancel).await;
             match n {
                 n if n > 0 => self.buf.extend_from_slice(&chunk[..n as usize]),
+                // An end or a failure that was already there when the token
+                // fired is what the read reports; the token, read here with
+                // the code, says what it means to the turn.
+                STREAM_EOF if cancel.is_cancelled() => {
+                    return Err(ReadError::Cancelled { detail: None });
+                }
                 STREAM_EOF => self.eof = true,
-                STREAM_CANCELLED => return Err(ReadError::Cancelled),
+                STREAM_CANCELLED => return Err(ReadError::Cancelled { detail: None }),
                 STREAM_IO_ERROR => {
                     // The registry guard is a temporary, gone before
                     // the per-stream lock `last_error` takes.
                     let state = lock_shared(&self.streams).get(self.id);
                     let detail = state.and_then(|s| s.last_error());
-                    return Err(ReadError::SourceFailed { detail });
+                    return Err(if cancel.is_cancelled() {
+                        ReadError::Cancelled { detail }
+                    } else {
+                        ReadError::SourceFailed { detail }
+                    });
                 }
                 code => return Err(ReadError::Io(code)),
             }
@@ -155,8 +182,11 @@ impl Drop for EventReader {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
 
     use gwead::bytes::Bytes;
     use gwead::futures::StreamExt as _;
@@ -192,6 +222,25 @@ mod tests {
         let mut registry = StreamRegistry::new();
         let id = registry.register_readable("application/x-ndjson", source);
         (Arc::new(Mutex::new(registry)), id)
+    }
+
+    /// An mpsc-backed readable, built exactly as
+    /// `a_release_puts_the_source_back_for_a_later_read`'s: `tx` stays
+    /// live so a case can `try_send` an item with no await between it
+    /// landing and the token firing, which is what makes which of the
+    /// two the kernel's select saw first pinnable.
+    fn mpsc_readable() -> (
+        SharedStreamRegistry,
+        StreamId,
+        tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let source = Box::pin(gwead::futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        let mut registry = StreamRegistry::new();
+        let id = registry.register_readable("application/x-ndjson", source);
+        (Arc::new(Mutex::new(registry)), id, tx)
     }
 
     #[tokio::test]
@@ -373,7 +422,7 @@ mod tests {
             .await
             .expect("cancellation ends the read")
             .unwrap();
-        assert_eq!(outcome.unwrap_err(), ReadError::Cancelled);
+        assert_eq!(outcome.unwrap_err(), ReadError::Cancelled { detail: None });
         // The handle is closed behind the dropped reader: a later read
         // reports closed, not a parked wait.
         let mut buf = [0u8; 8];
@@ -407,7 +456,7 @@ mod tests {
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next(&cancel))
             .await
             .expect("a fired token must stop the reader without a source read");
-        assert_eq!(outcome, Err(ReadError::Cancelled));
+        assert_eq!(outcome, Err(ReadError::Cancelled { detail: None }));
         assert_eq!(
             polls.load(Ordering::SeqCst),
             0,
@@ -421,7 +470,10 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut reader = EventReader::new(streams.clone(), id, 1 << 20);
-        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+        assert_eq!(
+            reader.next(&cancel).await,
+            Err(ReadError::Cancelled { detail: None })
+        );
         // The reader never consumed the queued bytes: a direct,
         // quietly-tokened read over the same handle still finds them.
         let mut buf = [0u8; 64];
@@ -448,14 +500,18 @@ mod tests {
             reader.next(&cancel).await.unwrap(),
             Some(json!({"type": "end"}))
         );
-        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+        assert_eq!(
+            reader.next(&cancel).await,
+            Err(ReadError::Cancelled { detail: None })
+        );
     }
 
-    /// This makes the reader's EOF-under-cancel path unreachable — once
-    /// cancelled, `next` declines to read again, so it never sees the
-    /// `STREAM_EOF` that would otherwise arrive next. The turn's own
-    /// `Ok(None) if cancel.is_cancelled()` arm in `consume_stream`
-    /// (`agent/mod.rs`) is what ends such a turn as cancelled instead.
+    /// Once cancelled, `next` declines to read again, so an end that
+    /// arrives *after* the token is never seen this way. An end that
+    /// was already there when the token fired is reported by the
+    /// read's own arm as `Cancelled` instead (see
+    /// `an_end_or_failure_already_there_when_the_token_fires_is_the_cut`,
+    /// case 2).
     #[tokio::test]
     async fn an_end_of_stream_under_a_fired_token_stops_at_the_check() {
         let (streams, id) = readable(vec!["{\"type\":\"end\"}\n"]);
@@ -466,7 +522,10 @@ mod tests {
             Some(json!({"type": "end"}))
         );
         cancel.cancel();
-        assert_eq!(reader.next(&cancel).await, Err(ReadError::Cancelled));
+        assert_eq!(
+            reader.next(&cancel).await,
+            Err(ReadError::Cancelled { detail: None })
+        );
     }
 
     #[tokio::test]
@@ -510,7 +569,7 @@ mod tests {
                 .await
                 .expect("cancellation ends the parked read")
                 .unwrap();
-        assert_eq!(outcome, Err(ReadError::Cancelled));
+        assert_eq!(outcome, Err(ReadError::Cancelled { detail: None }));
 
         // The source was put back, not lost: the sender still has a
         // live receiver on the other end.
@@ -525,5 +584,73 @@ mod tests {
             reader.next(&quiet).await.unwrap(),
             Some(json!({"type": "end"}))
         );
+    }
+
+    /// One poll of `fut` with a waker that wakes nothing: the test
+    /// drives every step itself, so no ordering depends on the runtime.
+    fn poll_once<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+        fut.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[tokio::test]
+    async fn an_end_or_failure_already_there_when_the_token_fires_is_the_cut() {
+        // Case 1, failure wins: the source has an error item queued
+        // when the token fires, and the reader carries its text.
+        {
+            let (streams, id, tx) = mpsc_readable();
+            let cancel = CancellationToken::new();
+            let mut reader = EventReader::new(streams, id, 1 << 20);
+            let mut fut = std::pin::pin!(reader.next(&cancel));
+            assert_eq!(
+                poll_once(fut.as_mut()),
+                Poll::Pending,
+                "the read must park: the channel is empty"
+            );
+            tx.try_send(Err(std::io::Error::other("transport died")))
+                .unwrap();
+            cancel.cancel();
+            assert_eq!(
+                poll_once(fut.as_mut()),
+                Poll::Ready(Err(ReadError::Cancelled {
+                    detail: Some("transport died".into())
+                }))
+            );
+            // Nothing is asserted past the cut: the loop never re-reads
+            // a handle it has already reported.
+        }
+
+        // Case 2, end wins: the source is closed when the token fires,
+        // and the reader reports a plain cut.
+        {
+            let (streams, id, tx) = mpsc_readable();
+            let cancel = CancellationToken::new();
+            let mut reader = EventReader::new(streams, id, 1 << 20);
+            let mut fut = std::pin::pin!(reader.next(&cancel));
+            assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+            drop(tx);
+            cancel.cancel();
+            assert_eq!(
+                poll_once(fut.as_mut()),
+                Poll::Ready(Err(ReadError::Cancelled { detail: None }))
+            );
+        }
+
+        // Case 3, nothing there: the token fires on a source with
+        // nothing queued, releasing the read and putting the source
+        // back for a caller who reads the handle again.
+        {
+            let (streams, id, tx) = mpsc_readable();
+            let cancel = CancellationToken::new();
+            let mut reader = EventReader::new(streams, id, 1 << 20);
+            let mut fut = std::pin::pin!(reader.next(&cancel));
+            assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+            cancel.cancel();
+            assert_eq!(
+                poll_once(fut.as_mut()),
+                Poll::Ready(Err(ReadError::Cancelled { detail: None }))
+            );
+            tx.try_send(Ok(Bytes::from_static(b"\n")))
+                .expect("the source was put back, not lost");
+        }
     }
 }

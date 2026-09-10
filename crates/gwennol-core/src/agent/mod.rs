@@ -21,7 +21,8 @@
 //!   [`TurnError::StreamFailed`], carrying the text the kernel recorded
 //!   for the read — never a short answer either way — unless the
 //!   turn's token has fired, in which case it is the cut arriving
-//!   ([`TurnError::Cancelled`]).
+//!   ([`TurnError::Cancelled`]), carrying the source's text when its
+//!   failure was already there when the token fired.
 //! - **A streamed assistant message is rebuilt** as the events in
 //!   order — adjacent text coalesced, `tool_use` and `opaque` blocks
 //!   whole and in place — and replayed verbatim on the next round. The
@@ -59,7 +60,9 @@
 //!   withdrawn, a running tool step observes the token and stops,
 //!   reported as the kernel's typed cancellation. The turn's own token
 //!   is the authority: once it has fired, whatever a step reports is
-//!   the cut arriving (its text goes to the log), and a cancellation
+//!   the cut arriving (a step's text goes to the log; a stream
+//!   source's failure the cut hid travels on
+//!   [`TurnError::Cancelled`]), and a cancellation
 //!   arriving *without* it is a step failure, reported as such and
 //!   logged — the kernel's typed cancellation is never the ceiling,
 //!   since its watchdog reports a step it stopped as
@@ -243,9 +246,18 @@ pub struct TurnOutcome {
 /// docs describe: whole exchanges kept, the partial one dropped.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
-    /// The token was cancelled.
-    #[error("turn cancelled")]
-    Cancelled,
+    /// The token was cancelled. `detail` is the text the kernel
+    /// recorded for a stream source whose failure was already there
+    /// when the token fired — the cut hid a real failure, and this is
+    /// it — and `None` for a plain cancellation. Displays as
+    /// `cancelled`, alone or followed by the text, so a frontend's
+    /// `<name>: {e}` is its own outcome line.
+    #[error("cancelled{}", stream::beside_the_cut(.detail))]
+    Cancelled {
+        /// The stream source's recorded failure text, when the cut
+        /// hid one; `None` for a plain cancellation.
+        detail: Option<String>,
+    },
     /// The vendor refused, and the failure is not one to repeat — or
     /// was, and the retries ran out.
     #[error("provider refused the turn: {0}")]
@@ -477,7 +489,7 @@ impl Session {
         loop {
             let turn = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(TurnError::Cancelled),
+                () = cancel.cancelled() => return Err(TurnError::Cancelled { detail: None }),
                 turn = self.operator.input() => turn,
             };
             let Some(turn) = turn else {
@@ -560,7 +572,7 @@ impl Session {
             self.transcript.push_assistant(round.message);
             self.transcript.push_tool_results(results);
             if cancel.is_cancelled() {
-                return Err(TurnError::Cancelled);
+                return Err(TurnError::Cancelled { detail: None });
             }
         }
         Err(TurnError::RoundLimit(max_rounds))
@@ -639,7 +651,7 @@ impl Session {
                     let wait = backoff.min(self.config.retry.max_backoff);
                     tokio::select! {
                         biased;
-                        () = cancel.cancelled() => return Err(TurnError::Cancelled),
+                        () = cancel.cancelled() => return Err(TurnError::Cancelled { detail: None }),
                         () = tokio::time::sleep(wait) => {}
                     }
                     backoff = backoff.saturating_mul(2);
@@ -663,7 +675,7 @@ impl Session {
         let fatal = |e: KernelError| {
             if cancel.is_cancelled() {
                 tracing::info!(error = %e, "provider round ended by the turn's cancellation");
-                TurnError::Cancelled
+                TurnError::Cancelled { detail: None }
             } else {
                 warn_if_unrequested(&e);
                 TurnError::Step(e)
@@ -708,9 +720,8 @@ impl Session {
         loop {
             let event = match reader.next(cancel).await {
                 Ok(Some(event)) => event,
-                Ok(None) if cancel.is_cancelled() => return Err(TurnError::Cancelled),
                 Ok(None) => return Err(TurnError::StreamEnded),
-                Err(e) => return Err(stream_read_failure(e, cancel.is_cancelled())),
+                Err(e) => return Err(stream_read_failure(e)),
             };
             let Some(fields) = event.as_object() else {
                 return Err(TurnError::Contract(format!(
@@ -962,24 +973,28 @@ fn warn_if_unrequested(e: &KernelError) {
 /// refused to continue.
 const REFUSED: &str = "not run: the model's turn ended in a refusal";
 
-/// What a failed stream read means for the turn. The turn's token is
-/// the authority once it has fired: a source that fails then is the
-/// cut arriving, not a vendor hanging up — the kernel releases a read
-/// parked on the handle as `STREAM_CANCELLED` when the token fires,
-/// and a source that failed first (the fetch step's idle timeout, a
-/// transport fault mid-body, a failing relay) reads the same way, its
-/// text kept in the log. Without the token, the source's failure ends
-/// the turn with the text the kernel recorded for it. A handle-shaped
-/// code — closed, wrong direction, unknown — cannot arise from a table
-/// the loop owns, and a contract violation coinciding with the cut is
-/// still a contract violation: both are reported as what they are.
-fn stream_read_failure(e: ReadError, cancelled: bool) -> TurnError {
+/// What a failed stream read means for the turn. The reader reads the
+/// turn's token with each read's code, so a cancellation arrives
+/// already decided — a plain one, or one that hid a source failure,
+/// whose recorded text is carried beside it and warned about; without
+/// the token, the source's failure ends the turn with the text the
+/// kernel recorded for it. A handle-shaped code — closed, wrong
+/// direction, unknown — cannot arise from a table the loop owns, and a
+/// contract violation is reported as what it is, cut or no cut.
+fn stream_read_failure(e: ReadError) -> TurnError {
     match e {
-        ReadError::Cancelled => TurnError::Cancelled,
-        ReadError::SourceFailed { .. } if cancelled => {
-            tracing::info!(error = %e, "stream ended by the turn's cancellation");
-            TurnError::Cancelled
+        ReadError::Cancelled {
+            detail: Some(detail),
+        } => {
+            tracing::warn!(
+                detail = %detail,
+                "the stream's source failed under the turn's cancellation"
+            );
+            TurnError::Cancelled {
+                detail: Some(detail),
+            }
         }
+        ReadError::Cancelled { detail: None } => TurnError::Cancelled { detail: None },
         ReadError::SourceFailed { detail } => {
             tracing::warn!(
                 detail = stream::recorded(&detail),
@@ -1128,36 +1143,29 @@ mod tests {
     fn a_stream_read_failure_is_read_by_its_code() {
         use gwead::kernel::streams::{STREAM_CLOSED, STREAM_INVALID_HANDLE};
 
-        // The turn's token is the authority once fired: `Cancelled`
-        // stays `Cancelled` whether or not the token itself fired,
-        // and a source failure under a fired token is folded into
-        // `Cancelled` too, its text logged rather than surfaced.
-        assert!(matches!(
-            stream_read_failure(ReadError::Cancelled, false),
-            TurnError::Cancelled
-        ));
-        assert!(matches!(
-            stream_read_failure(ReadError::Cancelled, true),
-            TurnError::Cancelled
-        ));
-        assert!(matches!(
-            stream_read_failure(
-                ReadError::SourceFailed {
-                    detail: Some("x".into())
-                },
-                true
-            ),
-            TurnError::Cancelled
-        ));
+        // The reader has already read the token with the code, so a
+        // cancellation arrives decided; the loop carries the text it
+        // hid and nothing else changes.
+        let cancelled = stream_read_failure(ReadError::Cancelled { detail: None });
+        assert!(matches!(cancelled, TurnError::Cancelled { detail: None }));
+        assert_eq!(cancelled.to_string(), "cancelled");
+
+        let cancelled = stream_read_failure(ReadError::Cancelled {
+            detail: Some("no response data for 50ms".into()),
+        });
+        assert!(
+            matches!(&cancelled, TurnError::Cancelled { detail: Some(d) } if d == "no response data for 50ms")
+        );
+        assert_eq!(
+            cancelled.to_string(),
+            "cancelled; the stream's source failed with: no response data for 50ms"
+        );
 
         // Without a fired token, a source failure ends the turn with
         // the recorded text, or the fallback when none was recorded.
-        let failed = stream_read_failure(
-            ReadError::SourceFailed {
-                detail: Some("no response data for 50ms".into()),
-            },
-            false,
-        );
+        let failed = stream_read_failure(ReadError::SourceFailed {
+            detail: Some("no response data for 50ms".into()),
+        });
         assert!(
             matches!(&failed, TurnError::StreamFailed { detail: Some(d) } if d == "no response data for 50ms")
         );
@@ -1165,27 +1173,26 @@ mod tests {
             failed.to_string(),
             "the stream failed before the turn did: no response data for 50ms"
         );
-        let failed = stream_read_failure(ReadError::SourceFailed { detail: None }, false);
+        let failed = stream_read_failure(ReadError::SourceFailed { detail: None });
         assert!(matches!(&failed, TurnError::StreamFailed { detail: None }));
         assert!(failed.to_string().contains("the kernel recorded no text"));
 
         // A handle-shaped code is about the handle, not its source,
         // and cannot arise from a table the loop owns.
         for code in [STREAM_CLOSED, STREAM_INVALID_HANDLE] {
-            match stream_read_failure(ReadError::Io(code), false) {
+            match stream_read_failure(ReadError::Io(code)) {
                 TurnError::Contract(msg) => assert!(msg.contains(&code.to_string()), "{msg}"),
                 other => panic!("{other}"),
             }
         }
 
-        // A contract violation coinciding with the cut is still a
-        // contract violation.
+        // A contract violation is still a contract violation.
         assert!(matches!(
-            stream_read_failure(ReadError::NotJson("x".into()), true),
+            stream_read_failure(ReadError::NotJson("x".into())),
             TurnError::Contract(_)
         ));
         assert!(matches!(
-            stream_read_failure(ReadError::TooLong { cap: 8 }, false),
+            stream_read_failure(ReadError::TooLong { cap: 8 }),
             TurnError::Contract(_)
         ));
     }

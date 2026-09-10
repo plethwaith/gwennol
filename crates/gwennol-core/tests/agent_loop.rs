@@ -1379,7 +1379,11 @@ async fn cancelling_mid_stream_tears_the_turn_down() {
         sink.wait_for(|e| matches!(e, Event::Text(_))).await
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(&err, TurnError::Cancelled { detail: None }),
+        "a plain mid-stream cancel carries no text: {err}"
+    );
     assert!(
         events.iter().all(|e| matches!(e, Event::Text(_))) && !events.is_empty(),
         "some ticks were shown, nothing else: {events:?}"
@@ -1409,7 +1413,7 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
         until("the slow tool's child to start", move || marker.exists())
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled { .. }));
     let slow = tool_call("c1", "slow", json!({}));
     assert_eq!(
         events,
@@ -1455,7 +1459,7 @@ async fn cancelling_at_an_open_approval_withdraws_it() {
         asked.arrived.notified().await
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled { .. }));
     // The host step said it was withdrawn at the approval, so the model
     // is told nothing ran — not the cautious "may have run".
     let gated = tool_call("c1", "gated", json!({"path": "hello.txt"}));
@@ -1493,7 +1497,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     let mut streamed = session("/text");
     assert!(matches!(
         streamed.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled
+        TurnError::Cancelled { .. }
     ));
     assert_eq!(streamed.transcript(), &[user("never")]);
     assert!(
@@ -1510,7 +1514,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     })]);
     assert!(matches!(
         buffered.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled
+        TurnError::Cancelled { .. }
     ));
     assert_eq!(buffered.transcript(), &[user("never")]);
 }

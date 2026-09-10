@@ -27,7 +27,8 @@ use std::sync::Arc;
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use gwennol_core::gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    Decision, HostConfig, ProcessEnv, Session, SessionConfig, TurnError, host, resolve_provider,
+    Decision, HostConfig, ProcessEnv, Session, SessionConfig, TurnError, TurnOutcome, host,
+    resolve_provider,
 };
 use serde_json::Value;
 
@@ -401,27 +402,8 @@ async fn run(cli: Cli, flag_rules: Vec<RuleSpec>) -> Result<ExitCode, Fatal> {
         });
     }
     let outcome = session.turn(&task, &cancel).await;
-    let code = match outcome {
-        Ok(outcome) => {
-            eprintln!(
-                "gwennol: done ({:?}): {} round{}, {} tokens in, {} out",
-                outcome.stop_reason,
-                outcome.rounds,
-                if outcome.rounds == 1 { "" } else { "s" },
-                outcome.usage.input_tokens,
-                outcome.usage.output_tokens
-            );
-            ExitCode::SUCCESS
-        }
-        Err(TurnError::Cancelled) => {
-            eprintln!("gwennol: cancelled");
-            ExitCode::from(EXIT_CANCELLED)
-        }
-        Err(e) => {
-            eprintln!("gwennol: turn failed: {e}");
-            ExitCode::from(EXIT_TURN_FAILED)
-        }
-    };
+    let (line, code) = outcome_line(&outcome);
+    eprintln!("{line}");
     // After the outcome is reported, so a transcript that cannot be
     // written never hides how the turn went. It is still a failure of
     // what was asked for — but the turn's own failure or cancellation
@@ -495,6 +477,32 @@ fn default_system_prompt(workspace: &Path) -> String {
     )
 }
 
+/// The outcome line and the exit status it decides. A cancelled turn
+/// prints the error's own text: `cancelled`, or `cancelled; the
+/// stream's source failed with: …` when the cut hid a failure.
+fn outcome_line(outcome: &Result<TurnOutcome, TurnError>) -> (String, ExitCode) {
+    match outcome {
+        Ok(outcome) => (
+            format!(
+                "gwennol: done ({:?}): {} round{}, {} tokens in, {} out",
+                outcome.stop_reason,
+                outcome.rounds,
+                if outcome.rounds == 1 { "" } else { "s" },
+                outcome.usage.input_tokens,
+                outcome.usage.output_tokens
+            ),
+            ExitCode::SUCCESS,
+        ),
+        Err(e @ TurnError::Cancelled { .. }) => {
+            (format!("gwennol: {e}"), ExitCode::from(EXIT_CANCELLED))
+        }
+        Err(e) => (
+            format!("gwennol: turn failed: {e}"),
+            ExitCode::from(EXIT_TURN_FAILED),
+        ),
+    }
+}
+
 /// The whole chat input, pretty-printed: what the provider was handed
 /// on the last round plus its answer, so the file is a request someone
 /// can read or replay, not just the messages.
@@ -540,5 +548,52 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_outcome_line_carries_a_failure_the_cut_hid() {
+        use gwennol_core::{StopReason, Usage};
+
+        let (line, code) = outcome_line(&Ok(TurnOutcome {
+            stop_reason: StopReason::EndTurn,
+            rounds: 1,
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+            },
+        }));
+        assert_eq!(
+            (line.as_str(), code),
+            (
+                "gwennol: done (EndTurn): 1 round, 3 tokens in, 4 out",
+                ExitCode::SUCCESS
+            )
+        );
+
+        let (line, code) = outcome_line(&Err(TurnError::Cancelled { detail: None }));
+        assert_eq!(
+            (line.as_str(), code),
+            ("gwennol: cancelled", ExitCode::from(EXIT_CANCELLED))
+        );
+
+        let (line, code) = outcome_line(&Err(TurnError::Cancelled {
+            detail: Some("no response data for 500ms".into()),
+        }));
+        assert_eq!(
+            (line.as_str(), code),
+            (
+                "gwennol: cancelled; the stream's source failed with: no response data for 500ms",
+                ExitCode::from(EXIT_CANCELLED)
+            )
+        );
+
+        let (line, code) = outcome_line(&Err(TurnError::StreamEnded));
+        assert_eq!(
+            (line.as_str(), code),
+            (
+                "gwennol: turn failed: the stream ended before the turn did; the cause was lost",
+                ExitCode::from(EXIT_TURN_FAILED)
+            )
+        );
     }
 }
