@@ -20,9 +20,13 @@
 //!   turn ([`TurnError::StreamEnded`]), and one whose source fails is
 //!   [`TurnError::StreamFailed`], carrying the text the kernel recorded
 //!   for the read — never a short answer either way — unless the
-//!   turn's token has fired, in which case it is the cut arriving
-//!   ([`TurnError::Cancelled`]), carrying the source's text when its
-//!   failure was already there when the token fired.
+//!   turn's token had fired by the time the read that met the end or
+//!   the failure came back, in which case it is the cut arriving
+//!   ([`TurnError::Cancelled`]), carrying the source's text when it
+//!   was a failure the read found waiting. The reader reads the
+//!   token once with each read's code; a token that fires after that
+//!   reading is not seen by it, and the turn ends as what the read
+//!   saw.
 //! - **A streamed assistant message is rebuilt** as the events in
 //!   order — adjacent text coalesced, `tool_use` and `opaque` blocks
 //!   whole and in place — and replayed verbatim on the next round. The
@@ -252,11 +256,14 @@ pub struct TurnOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
     /// The token was cancelled. `detail` is the text the kernel
-    /// recorded for a stream source whose failure was already there
-    /// when the token fired — the cut hid a real failure, and this is
-    /// it — and `None` for a plain cancellation. Displays as
-    /// `cancelled`, alone or followed by the text, so a frontend's
-    /// `<name>: {e}` is its own outcome line.
+    /// recorded for a stream source whose failure the read that met
+    /// the cut found waiting: the kernel polls the source before the
+    /// token on every poll of a read, so a failure that is there is
+    /// what the read reports, and the reader reads the token with
+    /// that code. The cut hid a real failure, and this is it; `None`
+    /// is a plain cancellation. Displays as `cancelled`, alone or
+    /// followed by the text, so a frontend's `<name>: {e}` is its own
+    /// outcome line.
     #[error("cancelled{}", stream::beside_the_cut(.detail))]
     Cancelled {
         /// The stream source's recorded failure text, when the cut

@@ -165,10 +165,15 @@ impl EventReader {
                     let detail = state.and_then(|s| s.last_error());
                     let cancelled = cancel.is_cancelled();
                     if cancelled && detail.is_none() {
-                        // Latent: today `io_error` implies a recorded
-                        // text, so this never fires. If the kernel ever
-                        // reports a source failure with no text, it
-                        // must not vanish behind a plain `cancelled`.
+                        // Latent: `detail` is `None` only when the
+                        // handle is not in the table — the kernel's
+                        // `close` keeps an entry, only its `drain`
+                        // and `take` remove one, and the loop's own
+                        // table sees neither — or when the kernel
+                        // reported `STREAM_IO_ERROR` with no recorded
+                        // text, which a failed read never does today.
+                        // Either way a source failure must not vanish
+                        // behind a plain `cancelled`.
                         tracing::warn!(
                             "the stream's source failed under the turn's cancellation with no recorded text"
                         );
