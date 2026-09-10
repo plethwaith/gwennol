@@ -29,9 +29,15 @@ pub(crate) enum ReadError {
     #[error("a stream line is not JSON: {0}")]
     NotJson(String),
     /// The source behind the handle failed (`STREAM_IO_ERROR`), with
-    /// the text the kernel recorded for it: the failing step's own for
-    /// a relayed stream, the fetch step's for a streamed body. `None`
-    /// only when the handle is not in the table the reader was given.
+    /// the text the kernel recorded for it. For a relayed stream that
+    /// is the kernel's report of the relaying action's failure,
+    /// `{plugin}.{action} failed: {e}`, with the action's own text as
+    /// `e`; for a streamed HTTP body read straight off the fetch
+    /// step, the guard's text or the transport's error. `None` would
+    /// need an absent handle or an empty recorded text; today
+    /// neither happens here — an absent handle fails earlier with
+    /// `STREAM_INVALID_HANDLE`, and a failed read never leaves the
+    /// text empty — so this is a canary, not a live case.
     #[error("the stream's source failed: {}", recorded(.detail))]
     SourceFailed { detail: Option<String> },
     /// The read failed with a code about the handle itself — closed,
@@ -165,10 +171,19 @@ impl EventReader {
                     let detail = state.and_then(|s| s.last_error());
                     let cancelled = cancel.is_cancelled();
                     if cancelled && detail.is_none() {
-                        // Latent: today `io_error` implies a recorded
-                        // text, so this never fires. If the kernel ever
-                        // reports a source failure with no text, it
-                        // must not vanish behind a plain `cancelled`.
+                        // Latent: reaching STREAM_IO_ERROR already rules
+                        // out an absent handle (that fails earlier with
+                        // STREAM_INVALID_HANDLE), and the kernel's
+                        // `close` keeps an entry — only `drain` and
+                        // `take` remove one, and the loop's own table
+                        // calls neither — so `detail` is `None` only if
+                        // the kernel ever reported the code with no
+                        // recorded text, which a failed read never does
+                        // today (gwead `kernel/streams.rs:201-203`,
+                        // "Never empty once set"). Kept as a canary:
+                        // either invariant changing must not let a
+                        // source failure vanish behind a plain
+                        // `cancelled`.
                         tracing::warn!(
                             "the stream's source failed under the turn's cancellation with no recorded text"
                         );

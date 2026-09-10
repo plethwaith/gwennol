@@ -239,6 +239,13 @@ fn config(route: &str) -> SessionConfig {
         STREAM_LLM.to_string(),
         json!({
             "url": format!("http://{}{route}", f.stub.addr),
+            // Not decorative: the fixture's manifest resolves
+            // `{{$config.idle_timeout_ms}}` for its fetch step, and
+            // gwead renders a missing `$config` key as the empty
+            // string rather than null, which `u64_param` refuses.
+            // Without this key every streamed session here fails
+            // with a step error naming `param 'idle_timeout_ms'
+            // must be a non-negative integer`.
             "idle_timeout_ms": DEFAULT_IDLE_TIMEOUT_MS,
         }),
     );
@@ -1009,11 +1016,11 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
             json!({"path": "hello.txt"}),
             "operator denied",
         ),
-        // The code without the turn's token is not a cancel: the
-        // kernel's typed cancellation is never the ceiling (that
-        // reports a timeout), but ending a held approval under the
-        // ceiling still throws this same code, the same as a plugin
-        // doing it itself.
+        // The code without the turn's token is not a cancel: a plugin
+        // may throw it itself, as this one does, and the kernel's
+        // action ceiling withdrawing a held approval throws the same
+        // code (within the kernel's drop grace; past it, the
+        // timeout). The ceiling never produces the typed shape.
         (
             "/forged-cancel",
             "forger",

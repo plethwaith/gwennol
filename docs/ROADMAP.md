@@ -263,11 +263,13 @@ written, and it must be settled before a provider exists.
   either way: once it has fired, whatever a step reports is the cut
   arriving (a nested invoke flattens the code to text, and the text
   goes to the log), and either shape arriving without it is a step
-  failure, reported and logged — the kernel's typed cancellation is
-  never the ceiling, since its watchdog reports a step it stopped as
-  `ExecutionTimeout`, but ending a held approval under the ceiling
-  still throws the structured code, the same as a plugin doing it
-  itself. The structured code's part is to say how far the step got:
+  failure, reported and logged. The kernel's action ceiling never
+  produces the typed shape, since its watchdog reports a step it
+  stopped as `ExecutionTimeout`; withdrawing a held approval under
+  the ceiling throws the structured code when the step unwinds within
+  the kernel's drop grace past the deadline (and the timeout past
+  that), the same code a plugin may throw itself. The structured
+  code's part is to say how far the step got:
   withdrawn at the approval means nothing ran. The process step's own
   select is biased the other way, work first: a child that has
   already finished has acted, and its result is the truth about that.

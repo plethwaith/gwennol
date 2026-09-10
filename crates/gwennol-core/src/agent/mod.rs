@@ -20,9 +20,13 @@
 //!   turn ([`TurnError::StreamEnded`]), and one whose source fails is
 //!   [`TurnError::StreamFailed`], carrying the text the kernel recorded
 //!   for the read — never a short answer either way — unless the
-//!   turn's token has fired, in which case it is the cut arriving
-//!   ([`TurnError::Cancelled`]), carrying the source's text when its
-//!   failure was already there when the token fired.
+//!   turn's token had fired by the time the read that met the end or
+//!   the failure came back, in which case it is the cut arriving
+//!   ([`TurnError::Cancelled`]), carrying the source's text when it
+//!   was a failure the read found waiting. The reader reads the
+//!   token once with each read's code; by that reading's ordering, a
+//!   token that fires after it is not seen by it, and the turn ends
+//!   as what the read saw.
 //! - **A streamed assistant message is rebuilt** as the events in
 //!   order — adjacent text coalesced, `tool_use` and `opaque` blocks
 //!   whole and in place — and replayed verbatim on the next round. The
@@ -64,13 +68,19 @@
 //!   source's failure the cut hid travels on
 //!   [`TurnError::Cancelled`]), and a cancellation
 //!   arriving *without* it is a step failure, reported as such and
-//!   logged — the kernel's typed cancellation is never the ceiling,
-//!   since its watchdog reports a step it stopped as
-//!   `ExecutionTimeout`, but ending a held approval under the ceiling
-//!   still throws the structured `steps::CANCELLED_CODE`, the same as
-//!   a plugin doing it itself.
+//!   logged. The kernel's action ceiling never produces the typed
+//!   shape — its watchdog reports a step it stopped as
+//!   `ExecutionTimeout` — and produces the structured
+//!   `steps::CANCELLED_CODE` only by withdrawing a held approval,
+//!   which the turn sees as that code when the step unwinds within
+//!   the kernel's drop grace past the deadline and as the timeout
+//!   otherwise; a plugin may throw the code itself; and the typed
+//!   shape arrives without the turn's token only from a step that
+//!   reports cancellation on a token that has not fired, which none
+//!   in this repo does.
 //!   Only a withdrawn approval carries more than the typed variant
-//!   can: nothing ran, which is why it alone stays the structured
+//!   can: nothing ran, which is why, among the host steps' own
+//!   cancellations, it alone stays the structured
 //!   `steps::CANCELLED_CODE`.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
@@ -247,11 +257,14 @@ pub struct TurnOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
     /// The token was cancelled. `detail` is the text the kernel
-    /// recorded for a stream source whose failure was already there
-    /// when the token fired — the cut hid a real failure, and this is
-    /// it — and `None` for a plain cancellation. Displays as
-    /// `cancelled`, alone or followed by the text, so a frontend's
-    /// `<name>: {e}` is its own outcome line.
+    /// recorded for a stream source whose failure the read that met
+    /// the cut found waiting: the kernel polls the source before the
+    /// token on every poll of a read, so a failure that is there is
+    /// what the read reports, and the reader reads the token with
+    /// that code. The cut hid a real failure, and this is it; `None`
+    /// is a plain cancellation. Displays as `cancelled`, alone or
+    /// followed by the text, so a frontend's `<name>: {e}` is its own
+    /// outcome line.
     #[error("cancelled{}", stream::beside_the_cut(.detail))]
     Cancelled {
         /// The stream source's recorded failure text, when the cut
@@ -270,15 +283,27 @@ pub enum TurnError {
     /// The provider's output is not the contract's.
     #[error("provider output violates the LLM_CHAT contract: {0}")]
     Contract(String),
-    /// The stream ended before an `end` or `error` event.
+    /// The stream ended before an `end` or `error` event: the source
+    /// reached its end with the turn unfinished, so the kernel
+    /// recorded nothing and the cause is lost. The provider's relay
+    /// closes its output this way when the vendor's stream ends
+    /// early. A source that *fails* is [`TurnError::StreamFailed`],
+    /// which carries the text the kernel recorded.
     #[error("the stream ended before the turn did; the cause was lost")]
     StreamEnded,
-    /// The stream's source failed before an `end` or `error` event:
-    /// the relaying step failed, or a streamed body's guard ended it.
+    /// The stream's source failed before an `end` or `error` event,
+    /// and `detail` is the text the kernel recorded for the read.
+    /// For a relayed stream that text is the kernel's report of the
+    /// relaying action's failure, `{plugin}.{action} failed: {e}`,
+    /// with the action's own text as `e`; for a stream whose handle
+    /// is the fetch step's body directly, the guard's text or the
+    /// transport's error.
     #[error("the stream failed before the turn did: {}", stream::recorded(.detail))]
     StreamFailed {
-        /// The text the kernel recorded for the failing read, or
-        /// `None` when the handle was not in the reader's table.
+        /// The text the kernel recorded for the failing read.
+        /// `None` only if the kernel ever reported the failure with
+        /// no recorded text, which does not happen today; kept as a
+        /// canary, not a live case.
         detail: Option<String>,
     },
     /// The model kept asking for tools past [`SessionConfig::max_rounds`].
@@ -829,12 +854,14 @@ impl Session {
                             return Err(Interrupted(Cut::from_error(&e)));
                         }
                         // A cancellation nobody asked for is a failure
-                        // to report, not a cut: the kernel's typed
-                        // cancellation is never the ceiling — that
-                        // reports itself as a timeout — but ending a
-                        // held approval under the ceiling still throws
-                        // this same structured code, the same as a
-                        // plugin doing it itself.
+                        // to report, not a cut. The structured code
+                        // comes from the kernel's action ceiling
+                        // withdrawing a held approval (within the
+                        // kernel's drop grace; past it, the timeout)
+                        // or from a plugin throwing it; the typed
+                        // shape only from a step reporting
+                        // cancellation on a token that has not fired,
+                        // which none here does.
                         Err(e) if reports_cancellation(&e) => {
                             warn_if_unrequested(&e);
                             Err(format!(
@@ -949,11 +976,19 @@ impl Cut {
 /// or the kernel's own between-step check — or a host step's
 /// structured `steps::CANCELLED_CODE`, which names a withdrawn
 /// approval. Never on its own a reason to treat a turn as cancelled:
-/// the turn's token is the authority. The kernel's action ceiling
-/// never produces the typed shape — its watchdog reports a step it
-/// stopped as [`KernelError::ExecutionTimeout`] — but ending a held
-/// approval still throws the structured code, the same as a plugin
-/// doing it itself.
+/// the turn's token is the authority. Without it, the structured
+/// code has two sources: the kernel's action ceiling withdrawing a
+/// held approval, which arrives as the code when the step unwinds
+/// within the kernel's drop grace
+/// (100 ms past the deadline in gwead 0.2.0) and as
+/// [`KernelError::ExecutionTimeout`] otherwise, and a plugin throwing
+/// the code itself. The ceiling never produces the typed shape — its
+/// watchdog reports a step it stopped as the timeout — so without
+/// the turn's token that shape can only come from a step that
+/// reports cancellation on a token that has not fired, which the
+/// kernel warns about and reports as cancelled all the same,
+/// directly or through a callee. No step in this repo does, and a
+/// guest cannot.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
@@ -965,7 +1000,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling ended the step, or the plugin threw the code itself");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 

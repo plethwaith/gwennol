@@ -183,10 +183,11 @@ the tool call it led to.
 A turn can fail mid-stream three ways: a provider-authored `error`
 event (above), always followed by end-of-stream and never by `end`;
 end-of-stream with no `end` or `error` event at all, the cause lost; or
-the read itself failing, reporting the failing step's own text rather
-than a misleadingly clean end. A failure before any bytes flow is an
-ordinary step error. Whichever shape it takes, consumers must treat a
-stream that did not reach `end` as a failed turn, not a short answer.
+the read itself failing, reporting the text the kernel recorded for
+the failure rather than a misleadingly clean end. A failure before any
+bytes flow is an ordinary step error. Whichever shape it takes,
+consumers must treat a stream that did not reach `end` as a failed
+turn, not a short answer.
 Events can be arbitrarily long — a `tool_use` event carries its whole
 `input` on one line — so consumers must not assume bounded lines.
 
