@@ -560,7 +560,7 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
             json!({"type": "error", "message": "overloaded", "retryable": true, "kind": "overloaded_error"}),
         ],
         "/retry" | "/retry-once" | "/retry-clamped" => vec![text("recovered"), end("end_turn")],
-        "/always-retryable" | "/always-retryable-saturating" => {
+        "/always-retryable" | "/always-retryable-saturating" | "/always-retryable-cancelled" => {
             vec![json!({"type": "error", "message": "still overloaded", "retryable": true})]
         }
         "/fatal" => vec![
@@ -1379,7 +1379,11 @@ async fn cancelling_mid_stream_tears_the_turn_down() {
         sink.wait_for(|e| matches!(e, Event::Text(_))).await
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(&err, TurnError::Cancelled { detail: None }),
+        "a plain mid-stream cancel carries no text: {err}"
+    );
     assert!(
         events.iter().all(|e| matches!(e, Event::Text(_))) && !events.is_empty(),
         "some ticks were shown, nothing else: {events:?}"
@@ -1409,7 +1413,10 @@ async fn cancelling_during_a_tool_call_answers_the_rest_as_interrupted() {
         until("the slow tool's child to start", move || marker.exists())
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    assert!(matches!(
+        outcome.unwrap_err(),
+        TurnError::Cancelled { detail: None }
+    ));
     let slow = tool_call("c1", "slow", json!({}));
     assert_eq!(
         events,
@@ -1455,7 +1462,10 @@ async fn cancelling_at_an_open_approval_withdraws_it() {
         asked.arrived.notified().await
     })
     .await;
-    assert!(matches!(outcome.unwrap_err(), TurnError::Cancelled));
+    assert!(matches!(
+        outcome.unwrap_err(),
+        TurnError::Cancelled { detail: None }
+    ));
     // The host step said it was withdrawn at the approval, so the model
     // is told nothing ran — not the cautious "may have run".
     let gated = tool_call("c1", "gated", json!({"path": "hello.txt"}));
@@ -1493,7 +1503,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     let mut streamed = session("/text");
     assert!(matches!(
         streamed.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled
+        TurnError::Cancelled { detail: None }
     ));
     assert_eq!(streamed.transcript(), &[user("never")]);
     assert!(
@@ -1510,7 +1520,74 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     })]);
     assert!(matches!(
         buffered.turn("never", &cancel).await.unwrap_err(),
-        TurnError::Cancelled
+        TurnError::Cancelled { detail: None }
     ));
     assert_eq!(buffered.transcript(), &[user("never")]);
+}
+
+/// `Session::run`'s own select — cancelling before it reads the next
+/// turn from the operator — ends `run` as a plain cancellation, not as
+/// a turn failure: the site the loop itself owns, beside every one
+/// `Session::turn` guards above.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_is_cancelled_before_it_reads_the_next_turn() {
+    let mut s = session("/text");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (outcome, events) = with_events(async { s.run(&cancel).await }).await;
+    assert!(
+        matches!(&outcome, Err(TurnError::Cancelled { detail: None })),
+        "{outcome:?}"
+    );
+    assert!(events.is_empty(), "no turn was ever started: {events:?}");
+}
+
+/// Cancelling while `round_with_retry` is waiting out the backoff ends
+/// the turn as `Cancelled`, the same as every other cut: the retry
+/// loop's own select is not exempt from the rule that a fired token is
+/// the authority.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_during_the_retry_backoff_ends_the_turn_cancelled() {
+    let f = fixture();
+    let mut s = Session::new(
+        f.kernel.clone(),
+        SessionConfig {
+            retry: gwennol_core::RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::from_secs(3600),
+                max_backoff: Duration::from_secs(3600),
+            },
+            ..config("/always-retryable-cancelled")
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(Sink::default());
+    let mut running = tokio::spawn({
+        let cancel = cancel.clone();
+        let sink = sink.clone();
+        async move {
+            EVENTS
+                .scope(sink, async move { s.turn("stuck", &cancel).await })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = sink.wait_for(|e| matches!(e, Event::Retry { .. })) => cancel.cancel(),
+            early = &mut running => panic!(
+                "the turn ended before the retry backoff began: {early:?}"
+            ),
+        }
+    })
+    .await
+    .expect("the point to cancel at never came");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("cancellation ends the turn promptly")
+        .unwrap();
+    assert!(
+        matches!(&outcome, Err(TurnError::Cancelled { detail: None })),
+        "a plain cancel during the retry backoff carries no text: {outcome:?}"
+    );
 }

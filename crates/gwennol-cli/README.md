@@ -206,8 +206,11 @@ never invented, so the vendor's refusal is what ends that turn.
 
 Ctrl-C cancels the turn through the loop's token: a pending approval
 is withdrawn, a running tool step is cancelled, a stream being read is
-closed, and the process exits 130 once the exchange is stored. A second
-Ctrl-C exits at once.
+closed, and the process exits 130 once the exchange is stored. When the
+cut hid a failure of the stream itself — the vendor's body went quiet
+past its idle timeout in the same instant — the line says so:
+`gwennol: cancelled; the stream's source failed with:
+provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at once.
 
 `--transcript FILE` writes the conversation as the provider saw it —
 the whole chat input: the system prompt, the tools as harvested from
