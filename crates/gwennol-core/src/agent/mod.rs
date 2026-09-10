@@ -64,11 +64,16 @@
 //!   source's failure the cut hid travels on
 //!   [`TurnError::Cancelled`]), and a cancellation
 //!   arriving *without* it is a step failure, reported as such and
-//!   logged — the kernel's typed cancellation is never the ceiling,
-//!   since its watchdog reports a step it stopped as
-//!   `ExecutionTimeout`, but ending a held approval under the ceiling
-//!   still throws the structured `steps::CANCELLED_CODE`, the same as
-//!   a plugin doing it itself.
+//!   logged. The kernel's action ceiling never produces the typed
+//!   shape — its watchdog reports a step it stopped as
+//!   `ExecutionTimeout` — and produces the structured
+//!   `steps::CANCELLED_CODE` only by withdrawing a held approval,
+//!   which the turn sees as that code when the step unwinds within
+//!   the kernel's drop grace past the deadline and as the timeout
+//!   otherwise; a plugin may throw the code itself; and the typed
+//!   shape arrives without the turn's token only from a step that
+//!   reports cancellation on a token that has not fired, which none
+//!   in this repo does.
 //!   Only a withdrawn approval carries more than the typed variant
 //!   can: nothing ran, which is why it alone stays the structured
 //!   `steps::CANCELLED_CODE`.
@@ -829,12 +834,14 @@ impl Session {
                             return Err(Interrupted(Cut::from_error(&e)));
                         }
                         // A cancellation nobody asked for is a failure
-                        // to report, not a cut: the kernel's typed
-                        // cancellation is never the ceiling — that
-                        // reports itself as a timeout — but ending a
-                        // held approval under the ceiling still throws
-                        // this same structured code, the same as a
-                        // plugin doing it itself.
+                        // to report, not a cut. The structured code
+                        // comes from the kernel's action ceiling
+                        // withdrawing a held approval (within the
+                        // kernel's drop grace; past it, the timeout)
+                        // or from a plugin throwing it; the typed
+                        // shape only from a step reporting
+                        // cancellation on a token that has not fired,
+                        // which none here does.
                         Err(e) if reports_cancellation(&e) => {
                             warn_if_unrequested(&e);
                             Err(format!(
@@ -949,11 +956,19 @@ impl Cut {
 /// or the kernel's own between-step check — or a host step's
 /// structured `steps::CANCELLED_CODE`, which names a withdrawn
 /// approval. Never on its own a reason to treat a turn as cancelled:
-/// the turn's token is the authority. The kernel's action ceiling
-/// never produces the typed shape — its watchdog reports a step it
-/// stopped as [`KernelError::ExecutionTimeout`] — but ending a held
-/// approval still throws the structured code, the same as a plugin
-/// doing it itself.
+/// the turn's token is the authority. Without it, the structured
+/// code has two sources: the kernel's action ceiling withdrawing a
+/// held approval, which arrives as the code when the step unwinds
+/// within the kernel's drop grace
+/// (100 ms past the deadline in gwead 0.2.0) and as
+/// [`KernelError::ExecutionTimeout`] otherwise, and a plugin throwing
+/// the code itself. The ceiling never produces the typed shape — its
+/// watchdog reports a step it stopped as the timeout — so without
+/// the turn's token that shape can only come from a step that
+/// reports cancellation on a token that has not fired, which the
+/// kernel warns about and reports as cancelled all the same,
+/// directly or through a callee. No step in this repo does, and a
+/// guest cannot.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
@@ -965,7 +980,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling ended the step, or the plugin threw the code itself");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, or the plugin reported one itself");
     }
 }
 
