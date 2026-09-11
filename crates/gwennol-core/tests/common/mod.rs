@@ -151,7 +151,9 @@ pub fn assert_conforms(schema: SchemaIndex, instance: &Value) {
 /// load) skips that connection with a stderr note rather than killing
 /// the loop — but bails after 16 consecutive failures so a persistent
 /// fault surfaces as connection-refused in the tests instead of a
-/// silent spin.
+/// silent spin. The one-thread-per-connection shape is what lets a
+/// handler (`agent_loop.rs`'s `stalled_stream`, for one) block on a
+/// socket read for seconds without stalling any other connection.
 pub fn serve<F>(listener: TcpListener, handler: F)
 where
     F: Fn(TcpStream) + Send + Sync + 'static,

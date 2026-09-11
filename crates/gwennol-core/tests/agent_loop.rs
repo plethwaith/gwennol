@@ -676,9 +676,11 @@ fn slow_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
 /// the session's idle guard ends the read, the reader is dropped, and
 /// the connection closes, which is what the blocking read returns on.
 /// The socket's read timeout is the tell for a guard that never
-/// fired: the `end` written then reaches a client that has gone, and
-/// if it has not, the turn succeeds, which the test reads as a
-/// failure.
+/// fired: the client is still connected when the read times out, so
+/// the `end` written then reaches it and the turn succeeds, which the
+/// test reads as a failure. The blocking read is safe to hold open
+/// this long only because `serve` (`common/mod.rs`) runs each
+/// connection on its own thread.
 fn stalled_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
     let _ = socket.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n",
@@ -1320,7 +1322,8 @@ async fn a_failure_the_cut_finds_waiting_ends_the_turn_cancelled_with_its_text()
             polls += 1;
             assert!(
                 polls <= 200,
-                "the text never arrived in {polls} polls: {:?}",
+                "the text never arrived in {} polls: {:?}",
+                polls - 1,
                 sink.snapshot()
             );
             if let Poll::Ready(early) = turn.as_mut().poll(&mut cx) {
@@ -1334,18 +1337,23 @@ async fn a_failure_the_cut_finds_waiting_ends_the_turn_cancelled_with_its_text()
                 .await
                 .expect("nothing under the turn woke it within 10s");
         };
-        // Phase 2: the stub holds the socket silent, so the next wake is
-        // the guard's; the test's own clock is the bound on it. Then the
-        // token fires with the read still out, and the poll that finds
-        // the failure reads the fired token with it.
+        // Phase 2: the stub holds the socket silent, so only the guard
+        // should wake the parked read from here. `Notify::notify_one`
+        // stores a permit, though, so this wait proves only that
+        // something woke it within 10s, not that it was the guard; the
+        // test's own clock (`sleep_until` below) is the real bound.
+        // Then the token fires with the read still out, and the poll
+        // that finds the failure reads the fired token with it.
         tokio::time::timeout(Duration::from_secs(10), woken.0.notified())
             .await
-            .expect("the idle guard never woke the parked read");
+            .expect("nothing woke the parked read within 10s");
         tokio::time::sleep_until(parked + IDLE).await;
         cancel.cancel();
         match turn.as_mut().poll(&mut cx) {
             Poll::Ready(outcome) => outcome,
-            Poll::Pending => panic!("the cut must end the turn in the poll that finds the failure"),
+            Poll::Pending => panic!(
+                "this pins single-poll completion after the cut (stricter than the regression itself); a later .await added on the unwind path would fail here with no behaviour change"
+            ),
         }
     };
     let err = outcome.unwrap_err();
