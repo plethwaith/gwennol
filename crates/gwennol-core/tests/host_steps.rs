@@ -2348,6 +2348,17 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 /// watchdog fires, and returns the approval as withdrawn rather than
 /// the step's own typed cancellation, so this arrives as the
 /// structured `steps::CANCELLED_CODE`, not `ExecutionTimeout`.
+///
+/// That shape rides the kernel's drop grace: the watchdog fires the
+/// invocation's token at the deadline and drops a step still running
+/// one `WALLCLOCK_DROP_GRACE` later (gwead 0.2.0), reporting the
+/// timeout, so the code arrives only when the step unwinds inside the
+/// grace. The figure, with the version it holds for, is in
+/// `reports_cancellation`'s doc in `src/agent/mod.rs`. A parked
+/// approval unwinds at once, so the window is not close here; a
+/// fixture that unwound slower would flip this test to
+/// `ExecutionTimeout` for a reason unrelated to what it pins, which the
+/// elapsed-time assertion below would show as a gross slowdown.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ceiling_can_still_withdraw_a_held_approval() {
     let f = fixture();

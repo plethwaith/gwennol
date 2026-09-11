@@ -823,6 +823,11 @@ fn plugins_and_trust_come_from_flags_too() {
     // failed, provider-anthropic's own sibling `stream_turn` action
     // (`provider-anthropic/src/lib.rs`'s `STREAM_ACTION`), not the
     // public `chat` entry point that spawned it.
+    // Both needles are matched within the one outcome line on purpose:
+    // two `stderr_has` calls would not pin that they share it. A
+    // recorded text carrying a newline would split the line and fail
+    // here for an unrelated reason; none of the texts this test can
+    // see carries one.
     assert!(
         failed.contains(
             "the stream failed before the turn did: provider-anthropic.stream_turn failed:"

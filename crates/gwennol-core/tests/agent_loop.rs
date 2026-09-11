@@ -19,9 +19,10 @@
 //! from canned responses in its `$config`.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use gwead::kernel::Kernel;
@@ -144,6 +145,19 @@ async fn cancelled_at<F: Future<Output = ()>>(
         .expect("cancellation ends the turn promptly")
         .unwrap();
     (s, outcome, sink.snapshot())
+}
+
+/// A waker that only notifies. A turn polled by hand under it moves
+/// when the test polls it and at no other time, and the test polls
+/// it when something under it woke — so the test can act *between*
+/// a leaf becoming ready and the poll that observes it, the ordering
+/// `cancelled_at` cannot give with the turn on a task of its own.
+struct Woken(tokio::sync::Notify);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
 }
 
 /// Approves everything except plugins named `denied*`; holds approvals
@@ -621,8 +635,8 @@ fn stub() -> &'static Stub {
                 slow_stream(stub, &mut socket, &path);
                 return;
             }
-            if path == "/stall" {
-                stalled_stream(&mut socket);
+            if path == "/stall" || path == "/hold" {
+                stalled_stream(stub, &mut socket, &path);
                 return;
             }
             let events = script(&path, &body, asked);
@@ -658,18 +672,30 @@ fn slow_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
     let _ = socket.write_all(format!("{}\n", end("end_turn")).as_bytes());
 }
 
-/// One text event, then silence past the session's idle timeout. The
-/// `end` after the pause reaches a client that has already gone; if it
-/// does not, the guard did not fire and the turn succeeds, which the
-/// test reads as a failure within the pause.
-fn stalled_stream(socket: &mut TcpStream) {
+/// One text event, then silence until the client hangs up (recorded):
+/// the session's idle guard ends the read, the reader is dropped, and
+/// the connection closes, which is what the blocking read returns on.
+/// The socket's read timeout is the tell for a guard that never
+/// fired: the `end` written then reaches a client that has gone, and
+/// if it has not, the turn succeeds, which the test reads as a
+/// failure.
+fn stalled_stream(stub: &Stub, socket: &mut TcpStream, path: &str) {
     let _ = socket.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n",
     );
     let _ = socket.write_all(format!("{}\n", text("hel")).as_bytes());
     let _ = socket.flush();
-    std::thread::sleep(Duration::from_secs(2));
-    let _ = socket.write_all(format!("{}\n", end("end_turn")).as_bytes());
+    match socket.read(&mut [0u8; 1]) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            let _ = socket.write_all(format!("{}\n", end("end_turn")).as_bytes());
+        }
+        _ => stub.hangups.lock().unwrap().push(path.to_string()),
+    }
 }
 
 /// Wait for the stub to record a hangup on `path`.
@@ -1237,8 +1263,9 @@ async fn off_contract_streams_fail_the_turn_closed() {
 
 /// A streamed body whose guard ends it mid-turn fails the turn with the
 /// text the kernel recorded for the read, shown to the operator and
-/// kept out of the transcript: what the stub streamed is shown, nothing
-/// is stored, and the next turn starts from the user message.
+/// kept out of the transcript: what the stub streamed is shown, the
+/// request is not retried, nothing is stored, and the next turn starts
+/// from the user message.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
     let mut cfg = config("/stall");
@@ -1254,8 +1281,86 @@ async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
         err.to_string(),
         "the stream failed before the turn did: no response data for 500ms"
     );
+    assert_eq!(
+        fixture().stub.requests_for("/stall").len(),
+        1,
+        "not retried"
+    );
     assert_eq!(events, vec![Event::Text("hel".into())]);
     assert_eq!(s.transcript(), &[user("stall")]);
+    wait_for_hangup("/stall").await;
+}
+
+/// The loop hands the reader's cancellation to `stream_read_failure`
+/// with its text intact, when the read that meets the cut finds a
+/// failure already waiting rather than the token alone: the seam
+/// nothing else here drives. The turn is polled by hand, under a waker
+/// that only notifies, so the test can act between the text being
+/// shown and the read that parks after it, and between that read's
+/// deadline coming due and the poll that finds what it yielded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_the_cut_finds_waiting_ends_the_turn_cancelled_with_its_text() {
+    const IDLE: Duration = Duration::from_millis(500);
+    let mut cfg = config("/hold");
+    cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] =
+        json!(IDLE.as_millis() as u64);
+    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(Sink::default());
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    let outcome = {
+        let mut turn = std::pin::pin!(EVENTS.scope(sink.clone(), s.turn("hold", &cancel)));
+        // Phase 1: drive the turn until the text has been shown and the
+        // read after it is parked. The poll that parks it takes the
+        // guard's deadline, so `parked` is no earlier than that.
+        let mut polls = 0;
+        let parked = loop {
+            polls += 1;
+            assert!(
+                polls <= 200,
+                "the text never arrived in {polls} polls: {:?}",
+                sink.snapshot()
+            );
+            if let Poll::Ready(early) = turn.as_mut().poll(&mut cx) {
+                panic!("the turn ended before the source went quiet: {early:?}");
+            }
+            let parked = tokio::time::Instant::now();
+            if sink.snapshot().iter().any(|e| matches!(e, Event::Text(_))) {
+                break parked;
+            }
+            tokio::time::timeout(Duration::from_secs(10), woken.0.notified())
+                .await
+                .expect("nothing under the turn woke it within 10s");
+        };
+        // Phase 2: the stub holds the socket silent, so the next wake is
+        // the guard's; the test's own clock is the bound on it. Then the
+        // token fires with the read still out, and the poll that finds
+        // the failure reads the fired token with it.
+        tokio::time::timeout(Duration::from_secs(10), woken.0.notified())
+            .await
+            .expect("the idle guard never woke the parked read");
+        tokio::time::sleep_until(parked + IDLE).await;
+        cancel.cancel();
+        match turn.as_mut().poll(&mut cx) {
+            Poll::Ready(outcome) => outcome,
+            Poll::Pending => panic!("the cut must end the turn in the poll that finds the failure"),
+        }
+    };
+    let err = outcome.unwrap_err();
+    assert!(
+        matches!(&err, TurnError::Cancelled { detail: Some(d) } if d == "no response data for 500ms"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "cancelled; the stream's source failed with: no response data for 500ms"
+    );
+    assert_eq!(fixture().stub.requests_for("/hold").len(), 1, "not retried");
+    assert_eq!(sink.snapshot(), vec![Event::Text("hel".into())]);
+    assert_eq!(s.transcript(), &[user("hold")]);
+    wait_for_hangup("/hold").await;
 }
 
 /// Refusal ends the turn unretried; `max_tokens` is a completed turn;
@@ -1541,12 +1646,31 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
     let mut s = session("/text");
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let (outcome, events) = with_events(async { s.run(&cancel).await }).await;
+    // With `biased`, the cancel arm is polled first and is ready, so the
+    // `input()` future is never polled. Without it, `select!` starts at
+    // a random branch and the ready `input()` arm wins half the time, so
+    // one run detects a lost `biased` with probability one half; sixteen
+    // runs miss it once in 65,536.
+    let (outcomes, events) = with_events(async {
+        let mut outcomes = Vec::new();
+        for _ in 0..16 {
+            outcomes.push(s.run(&cancel).await);
+        }
+        outcomes
+    })
+    .await;
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome, Err(TurnError::Cancelled { detail: None })),
+            "{outcome:?}"
+        );
+    }
+    assert!(events.is_empty(), "nothing was emitted: {events:?}");
     assert!(
-        matches!(&outcome, Err(TurnError::Cancelled { detail: None })),
-        "{outcome:?}"
+        s.transcript().is_empty(),
+        "no turn was ever started: {:?}",
+        s.transcript()
     );
-    assert!(events.is_empty(), "no turn was ever started: {events:?}");
 }
 
 /// Cancelling while `round_with_retry` is waiting out the backoff ends
