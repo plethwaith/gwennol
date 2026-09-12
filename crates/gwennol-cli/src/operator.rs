@@ -24,10 +24,10 @@ use std::sync::Mutex;
 use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn};
 
 use crate::policy::Policy;
-use crate::secrets::{Found, Secrets};
-use crate::show::{ShowAccess, ShowCall, preview};
+use crate::secrets::Secrets;
+use crate::show;
 
-/// The headless frontend.
+/// The print-mode frontend: no input, every decision by rule.
 pub struct Headless {
     policy: Policy,
     secrets: Secrets,
@@ -95,46 +95,12 @@ impl Headless {
 impl Operator for Headless {
     async fn approve(&self, request: ApprovalRequest) -> Decision {
         let judgement = self.policy.judge(&request);
-        let cause = match &request.cause {
-            Some(call) => format!(" (call {})", ShowCall(call)),
-            None => String::new(),
-        };
-        self.note(format_args!(
-            "{} from {}{cause}: {judgement}",
-            ShowAccess {
-                access: &request.access,
-                workspace: &self.workspace,
-            },
-            request.plugin,
-        ));
+        self.note(show::decision(&request, &judgement, &self.workspace));
         judgement.decision
     }
 
     async fn secret(&self, plugin: &str, name: &str) -> Option<String> {
-        match self.secrets.lookup(plugin, name) {
-            Some((value, found)) => {
-                match found {
-                    Found::Rule { origin, source } => {
-                        tracing::debug!(plugin, name, %origin, ?source, "secret supplied")
-                    }
-                    Found::Convention(var) => {
-                        tracing::debug!(plugin, name, var, "secret supplied by convention")
-                    }
-                }
-                Some(value)
-            }
-            None => {
-                // Warned once at startup, when the manifest was read;
-                // here it is the same fact per request.
-                tracing::info!(
-                    plugin,
-                    name,
-                    "no value for secret: set {}",
-                    self.secrets.describe_source(plugin, name)
-                );
-                None
-            }
-        }
+        self.secrets.supply(plugin, name)
     }
 
     fn emit(&self, event: Event) {
@@ -143,30 +109,14 @@ impl Operator for Headless {
             Event::ToolCall(call) => {
                 self.flush_round();
                 self.end_line();
-                self.note(format_args!(
-                    "-> {}: {}",
-                    ShowCall(&call),
-                    preview(&call.arguments)
-                ));
+                self.note(show::tool_call(&call));
             }
             Event::ToolResult {
                 call,
                 content,
                 is_error,
             } => {
-                let verdict = if is_error { "error" } else { "ok" };
-                self.note(format_args!(
-                    "<- {}: {verdict}, {} bytes",
-                    ShowCall(&call),
-                    content.len()
-                ));
-                if self.verbosity >= 1 {
-                    for line in content.lines() {
-                        eprintln!("    {line}");
-                    }
-                } else if !content.is_empty() {
-                    eprintln!("    {}", preview(&content));
-                }
+                self.note(show::tool_result(&call, &content, is_error, self.verbosity));
             }
             Event::ToolFailed { call, error } => {
                 // A call the loop never dispatched — cut off by a
@@ -176,7 +126,7 @@ impl Operator for Headless {
                 // text is owed to stdout, and before this line.
                 self.flush_round();
                 self.end_line();
-                self.note(format_args!("!! {}: {error}", ShowCall(&call)));
+                self.note(show::tool_failed(&call, &error));
             }
             Event::Retry {
                 attempt,
@@ -184,9 +134,7 @@ impl Operator for Headless {
                 failure,
             } => {
                 self.discard_round();
-                self.note(format_args!(
-                    "provider failure, retrying ({attempt}/{max_attempts}): {failure}"
-                ));
+                self.note(show::retry(attempt, max_attempts, &failure));
             }
             Event::TurnComplete => {
                 self.flush_round();

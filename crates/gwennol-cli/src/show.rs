@@ -4,14 +4,16 @@
 //! with the URL's userinfo, query and fragment scrubbed because
 //! the screen or the trace is a record and a rule judged the full
 //! URL; a tool call as name and id; a bounded one-line preview;
-//! the outcome line and the exit status it decides.
+//! the outcome line and the exit status it decides; and the trace's
+//! lines: a decision, a call, its result, its failure, a retry.
 
 use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use gwennol_core::{Access, ToolCall, TurnError, TurnOutcome};
+use gwennol_core::{Access, ApprovalRequest, Failure, ToolCall, TurnError, TurnOutcome};
 
+use crate::policy::Judgement;
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED};
 
 /// Most characters of a tool call's arguments, or of a result shown
@@ -94,6 +96,54 @@ pub fn preview(text: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// An approval decision, in the words `Headless::approve` used to print
+/// itself: the access, who asked, the call it was made for (if any),
+/// and the judgement.
+pub fn decision(request: &ApprovalRequest, judgement: &Judgement<'_>, workspace: &Path) -> String {
+    let cause = match &request.cause {
+        Some(call) => format!(" (call {})", ShowCall(call)),
+        None => String::new(),
+    };
+    format!(
+        "{} from {}{cause}: {judgement}",
+        ShowAccess {
+            access: &request.access,
+            workspace,
+        },
+        request.plugin,
+    )
+}
+
+/// A tool call about to run.
+pub fn tool_call(call: &ToolCall) -> String {
+    format!("-> {}: {}", ShowCall(call), preview(&call.arguments))
+}
+
+/// A tool's result: whole at `-v` and above, a one-line preview
+/// otherwise.
+pub fn tool_result(call: &ToolCall, content: &str, is_error: bool, verbosity: u8) -> String {
+    let verdict = if is_error { "error" } else { "ok" };
+    let mut out = format!("<- {}: {verdict}, {} bytes", ShowCall(call), content.len());
+    if verbosity >= 1 {
+        for line in content.lines() {
+            out.push_str(&format!("\n    {line}"));
+        }
+    } else if !content.is_empty() {
+        out.push_str(&format!("\n    {}", preview(content)));
+    }
+    out
+}
+
+/// A call that got no answer.
+pub fn tool_failed(call: &ToolCall, error: &str) -> String {
+    format!("!! {}: {error}", ShowCall(call))
+}
+
+/// A retried round: the provider's failure and which attempt is next.
+pub fn retry(attempt: u32, max_attempts: u32, failure: &Failure) -> String {
+    format!("provider failure, retrying ({attempt}/{max_attempts}): {failure}")
 }
 
 /// The outcome line and the exit status it decides. A cancelled turn

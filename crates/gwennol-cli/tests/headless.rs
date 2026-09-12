@@ -97,6 +97,18 @@ impl Fixture {
     /// The binary, in the workspace, with an empty environment apart
     /// from what a process needs and what the test sets.
     fn gwennol(&self) -> Command {
+        let mut cmd = self.gwennol_without_print();
+        // Print mode explicitly: the suite's stdio is never a
+        // terminal, so the binary would choose it anyway, but without
+        // -p it also prints the one-line notice that says so, which
+        // this suite's exact-stderr assertions do not expect.
+        cmd.arg("-p");
+        cmd
+    }
+
+    /// [`Self::gwennol`] without `-p`, for the tests that want the
+    /// no-terminal fallback itself.
+    fn gwennol_without_print(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_gwennol"));
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -672,6 +684,8 @@ fn help_documents_the_policy_surface() {
         "--secret",
         "--plugins",
         "read, write",
+        "--print",
+        "--log",
     ] {
         assert!(help.contains(needle), "help lacks {needle:?}:\n{help}");
     }
@@ -759,4 +773,49 @@ fn verbose_startup_log_carries_the_frontend_target_in_order() {
         "{}",
         r.stderr
     );
+}
+
+/// Without a terminal on stdin or stdout — this suite's stdio is
+/// never one — the binary runs in print mode even without `-p`, and
+/// says so once, first, before anything else on stderr. Guards D2.
+/// Mutation: `choose_mode` returns `Interactive` when `!cli.print` —
+/// the run tries raw mode on a pipe and exits 2.
+#[test]
+fn without_a_terminal_the_binary_runs_in_print_mode_and_says_so() {
+    let f = fixture();
+    let config = f.config("no-terminal", "/no-terminal", "");
+    let r = run(f
+        .gwennol_without_print()
+        .env(KEY_VAR, API_KEY)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .arg("What does hello.txt say?"));
+    assert!(r.status.success(), "{:?}", r.status);
+    assert_eq!(
+        r.stdout,
+        "Let me read it.\nIt says: hello from the workspace\n"
+    );
+    let first_line = r.stderr.lines().next().unwrap_or_default();
+    assert_eq!(first_line, gwennol::NO_TERMINAL_NOTICE);
+}
+
+/// At `-vv`, the per-request "no value for secret" line (distinct from
+/// the startup declared-secret warning) carries the target its body
+/// moved to when it became `Secrets::supply`. Guards D4's declared
+/// change. Mutation: leave the `tracing::info!` in the old
+/// `Headless::secret` body — the target stays `gwennol::operator`.
+#[test]
+fn the_per_request_secret_line_carries_the_secrets_target() {
+    let f = fixture();
+    let config = f.config("secrets-target", "", "");
+    let r = run(f
+        .gwennol()
+        .arg("-vv")
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(1), "{:?}", r.status);
+    r.stderr_has(" INFO gwennol::secrets: no value for secret");
 }
