@@ -1,12 +1,13 @@
-//! The stub Messages API and its SSE fixtures, shared by every suite in
-//! this directory. The opening turn thinks, says something, and asks
-//! to `read` hello.txt; the follow-up quotes the tool result it was
-//! given, saying whether it was an error. The special routes `/stall`,
-//! `/flaky`, and `/refusal` drive a stalled connection, a mid-round
-//! overload, and a model refusal; any other route gets the opening or
-//! closing turn depending on what the request carries. A wrong
-//! `x-api-key` gets a 401. Every suite compiles its own copy
-//! (`mod common;`).
+//! The stub Messages API and its SSE fixtures, for the suites in this
+//! directory; `headless.rs` uses it today. The opening turn thinks,
+//! says something, and asks to `read` hello.txt; the follow-up quotes
+//! the tool result it was given, saying whether it was an error. The
+//! special routes `/stall` and `/refusal` drive a stalled connection
+//! and a model refusal; `/flaky` overloads mid-round on its first
+//! request and answers normally after it, so a run retries once and
+//! finishes; any other route gets the opening or closing turn
+//! depending on what the request carries. A wrong `x-api-key` gets a
+//! 401. Every suite compiles its own copy (`mod common;`).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,10 +19,8 @@ use serde_json::{Value, json};
 /// The key the stub accepts; anything else is a 401.
 pub const API_KEY: &str = "sk-ant-headless";
 
-/// A Messages API stand-in: the opening turn thinks, says something,
-/// and asks to `read` hello.txt; the follow-up quotes the tool result
-/// it was given, saying whether it was an error. Records every
-/// request.
+/// A Messages API stand-in, listening at `addr` and recording every
+/// request it receives; see the module doc for what it answers.
 pub struct Stub {
     /// Where the stub listens.
     pub addr: std::net::SocketAddr,

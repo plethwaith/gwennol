@@ -27,7 +27,7 @@ use crate::policy::Policy;
 use crate::secrets::{Found, Secrets};
 use crate::show::{ShowAccess, ShowCall, preview};
 
-/// The frontend.
+/// The headless frontend.
 pub struct Headless {
     policy: Policy,
     secrets: Secrets,

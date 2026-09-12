@@ -13,14 +13,12 @@ use gwennol_core::{Access, ToolCall, TurnError, TurnOutcome};
 
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED};
 
-/// Most characters of a tool call's arguments or a result shown on one
-/// stderr line at the default verbosity. The transcript file holds
-/// everything.
+/// Most characters of a tool call's arguments or a result shown in
+/// one line, so a trace and a prompt cut it to the same length.
 pub const PREVIEW_CHARS: usize = 200;
 
-/// An access as the trace shows it — everything the operator would
-/// have been shown by a prompt, since the trace is the only review a
-/// headless run gets.
+/// An access in the words a prompt would use, so a trace and a prompt
+/// describe the same access the same way.
 pub struct ShowAccess<'a> {
     /// The access to show.
     pub access: &'a Access,

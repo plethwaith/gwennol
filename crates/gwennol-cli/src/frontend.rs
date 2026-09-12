@@ -1,10 +1,12 @@
 //! What a run settles before its `Operator` drives a turn, and which
-//! does not depend on which `Operator` that is: the workspace, the
-//! config and policy files, the compiled policy, the secret sources,
-//! the plugins and their manifests, the process environment, the
-//! kernel, and the session. The headless frontend calls this; a second
-//! frontend in this binary calls the same two functions and supplies
-//! its own `Operator` in the closure, and copies nothing.
+//! is the same for any `Operator`, except the default system prompt
+//! below, which describes a headless run and which an interactive
+//! frontend should replace: the workspace, the config and policy
+//! files, the compiled policy, the secret sources, the plugins and
+//! their manifests, the process environment, the kernel, and the
+//! session. A second frontend added to this binary calls the same two
+//! functions and supplies its own `Operator` in the closure, so it
+//! copies none of this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,9 +39,11 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// and their manifests, the process environment, the kernel, and the
 /// session. `operator` is called once, after the plugins are loaded
 /// and before the kernel boots, with the compiled policy, the secret
-/// sources — the frontend keeps them too, for the declared-secret
-/// warnings — and the canonical workspace. The returned session has
-/// run no turn.
+/// sources — this module keeps a copy, which is what the
+/// declared-secret warnings below consult — and the canonical
+/// workspace. `workspace` must already be canonical, as [`workspace`]
+/// returns it: the compiled policy is rooted at it verbatim. The
+/// returned session has run no turn.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
@@ -237,4 +241,59 @@ fn default_system_prompt(workspace: &Path) -> String {
          what you did.",
         workspace.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::operator::Headless;
+
+    /// `operator` is called after the plugins have loaded, not before:
+    /// a startup failure ahead of that point — here, `--plugins`
+    /// naming a directory that does not exist — never calls it.
+    #[test]
+    fn the_operator_factory_is_not_called_before_the_plugins_load() {
+        let cli = Cli {
+            task: None,
+            workspace: None,
+            config: None,
+            policy: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            plugins: Some(PathBuf::from("/nonexistent/plugins-dir")),
+            trust_runtime: Vec::new(),
+            secret: Vec::new(),
+            provider: None,
+            model: None,
+            system: None,
+            system_file: None,
+            max_tokens: None,
+            max_rounds: None,
+            no_stream: false,
+            transcript: None,
+            verbose: 0,
+        };
+        let called = AtomicBool::new(false);
+        let result = start(
+            &cli,
+            PathBuf::from("."),
+            Vec::new(),
+            |policy, secrets, workspace| {
+                called.store(true, Ordering::SeqCst);
+                Arc::new(Headless::new(
+                    policy,
+                    secrets.clone(),
+                    workspace.to_path_buf(),
+                    0,
+                ))
+            },
+        );
+        assert!(result.is_err(), "expected a startup failure");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "the operator factory ran before the plugins failed to load"
+        );
+    }
 }

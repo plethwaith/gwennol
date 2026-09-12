@@ -469,6 +469,7 @@ fn secrets_come_from_a_named_source_and_a_missing_one_is_said_so() {
         ])
         .arg("What does hello.txt say?"));
     assert!(r.status.success(), "{:?}", r.status);
+    assert!(!r.stderr.contains("no source has it"), "{}", r.stderr);
 
     // A file source, from the config.
     let key_file = f.scratch.join("anthropic.key");
@@ -487,6 +488,7 @@ fn secrets_come_from_a_named_source_and_a_missing_one_is_said_so() {
         .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
         .arg("What does hello.txt say?"));
     assert!(r.status.success(), "{:?}", r.status);
+    assert!(!r.stderr.contains("no source has it"), "{}", r.stderr);
 
     // No source at all: warned at startup, and the vendor's refusal
     // ends the turn — the key was never invented.
@@ -665,7 +667,9 @@ fn help_documents_the_policy_surface() {
 
 /// The workspace is settled before the task is read or any file is
 /// loaded, so a run that has both a workspace that does not exist and
-/// an empty task reports the workspace.
+/// an empty task reports the workspace, and a run with a workspace or
+/// task problem alongside a bad `--config` never reaches the config
+/// load that would report that instead.
 #[test]
 fn a_missing_workspace_is_reported_before_the_task_is_read() {
     let f = fixture();
@@ -673,4 +677,74 @@ fn a_missing_workspace_is_reported_before_the_task_is_read() {
     assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
     r.stderr_has("gwennol: workspace /nonexistent/ws: ");
     assert!(!r.stderr.contains("the task is empty"), "{}", r.stderr);
+
+    // A bad workspace beats a bad config too: the config is not read
+    // until `frontend::start`, well after the workspace check.
+    let r = run(f
+        .gwennol()
+        .args(["-C", "/nonexistent/ws", "--config", "/nonexistent.toml"])
+        .arg("hi"));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    r.stderr_has("gwennol: workspace /nonexistent/ws: ");
+    assert!(!r.stderr.contains("/nonexistent.toml"), "{}", r.stderr);
+
+    // An empty task beats a bad config too: the task is read before
+    // `frontend::start` loads anything.
+    let r = run(f
+        .gwennol()
+        .args(["--config", "/nonexistent.toml"])
+        .arg("  "));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    r.stderr_has("gwennol: the task is empty");
+    assert!(!r.stderr.contains("/nonexistent.toml"), "{}", r.stderr);
+}
+
+/// At `-vv`, the startup log carries the module's own target,
+/// `gwennol::frontend`, and the lines still print in the order the
+/// run reaches them.
+#[test]
+fn verbose_startup_log_carries_the_frontend_target_in_order() {
+    let f = fixture();
+    let config = f.config("verbose", "", "");
+    let r = run(f
+        .gwennol()
+        .arg("-vv")
+        .arg("--config")
+        .arg(&config)
+        .args(["--trust-runtime", PROVIDER])
+        .args(["--allow", "read:**"])
+        .arg("Say hi."));
+    let config_at = r
+        .stderr
+        .find(" INFO gwennol::frontend: config")
+        .expect("config line");
+    let rule_at = r
+        .stderr
+        .find(" INFO gwennol::frontend: rule")
+        .expect("rule line");
+    let plugins_at = r
+        .stderr
+        .find(" INFO gwennol::frontend: plugins")
+        .expect("plugins line");
+    let registered_at = r
+        .stderr
+        .find(" INFO gwennol::frontend: registered")
+        .expect("registered line");
+    let secret_at = r
+        .stderr
+        .find(" WARN gwennol::frontend: plugin")
+        .expect("declared-secret warning");
+    let session_at = r
+        .stderr
+        .find(" INFO gwennol::frontend: session")
+        .expect("session line");
+    assert!(
+        config_at < rule_at
+            && rule_at < plugins_at
+            && plugins_at < registered_at
+            && registered_at < secret_at
+            && secret_at < session_at,
+        "{}",
+        r.stderr
+    );
 }
