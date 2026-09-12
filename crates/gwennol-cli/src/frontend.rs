@@ -2,8 +2,7 @@
 //! is the same for any `Operator`, except the default system prompt
 //! below, which describes a headless run: an interactive frontend
 //! needs its own, and `start` would have to grow a parameter for it,
-//! since `system_prompt` is private and its sources are fixed — the
-//! flags, the config, else a default built from the workspace. What is
+//! since its sources are fixed (`system_prompt` states them). What is
 //! shared: the workspace, the config and policy files, the compiled
 //! policy, the secret sources, the plugins and their manifests, the
 //! process environment, the kernel, and the session. A second
@@ -37,16 +36,16 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
     Ok(workspace)
 }
 
-/// Everything a frontend needs before its first turn: the config and
-/// policy files, the compiled policy, the secret sources, the plugins
-/// and their manifests, the process environment, the kernel, and the
-/// session. `operator` is called at most once, after the plugins are loaded
-/// and before the kernel boots, with the compiled policy, which it
-/// takes; a borrow of the secret sources, which this module keeps
-/// and the declared-secret warnings below consult; and the canonical
-/// workspace. `workspace` must already be canonical, as [`workspace`]
-/// returns it: the compiled policy is rooted at it verbatim. The
-/// returned session has run no turn.
+/// Everything a frontend needs before its first turn: the config
+/// and policy files, the compiled policy, the secret sources,
+/// the plugins and their manifests, the process environment,
+/// the kernel, and the session. `operator` is called at most once,
+/// after the plugins are loaded and before the kernel boots, with the
+/// compiled policy, which it takes; a borrow of the secret sources,
+/// which this module keeps and the declared-secret warnings below
+/// consult; and the canonical workspace. `workspace` must already
+/// be canonical, as [`workspace`] returns it: the compiled policy
+/// is rooted at it verbatim. The returned session has run no turn.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
@@ -258,6 +257,11 @@ mod tests {
     /// naming a directory that does not exist — never calls it.
     #[test]
     fn the_operator_factory_is_not_called_before_the_plugins_load() {
+        // An empty file, not `config: None`: with `None`, `load_config`
+        // falls through to `default_path()`, so a real
+        // `$XDG_CONFIG_HOME/gwennol/config.toml` on the machine running
+        // this test would be read instead, and whatever it contains
+        // could fail before the plugins ever load.
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         std::fs::write(&config_path, "").unwrap();

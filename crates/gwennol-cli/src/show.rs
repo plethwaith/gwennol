@@ -1,10 +1,10 @@
-//! Rendering that does not depend on which `Operator` is in charge, so
-//! a trace line and a prompt say the same thing in the same words: an
-//! access in the words a prompt would use, with the URL's userinfo,
-//! query and fragment scrubbed because the screen or the trace is a
-//! record and a rule judged the full URL; a tool call as name and
-//! id; a bounded one-line preview; the outcome line and the exit
-//! status it decides.
+//! Rendering that does not depend on which `Operator` is in
+//! charge, so a trace line and a prompt say the same thing in
+//! the same words: an access in the words a prompt would use,
+//! with the URL's userinfo, query and fragment scrubbed because
+//! the screen or the trace is a record and a rule judged the full
+//! URL; a tool call as name and id; a bounded one-line preview;
+//! the outcome line and the exit status it decides.
 
 use std::fmt;
 use std::path::Path;
@@ -20,8 +20,9 @@ use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED};
 pub const PREVIEW_CHARS: usize = 200;
 
 /// An `Access` on one line, in the words a prompt would use: a URL's
-/// userinfo, query and fragment cut, with `?…` and `(credentials in
-/// the URL cut)` saying that something was.
+/// userinfo, query and fragment cut. A query or a fragment (either
+/// sets it) writes the `?…` marker; userinfo writes the
+/// `(credentials in the URL cut)` marker.
 pub struct ShowAccess<'a> {
     /// The access to show.
     pub access: &'a Access,
