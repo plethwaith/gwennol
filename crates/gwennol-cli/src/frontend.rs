@@ -45,12 +45,15 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// which this module keeps and the declared-secret warnings below
 /// consult; and the canonical workspace. `workspace` must already
 /// be canonical, as [`workspace`] returns it: the compiled policy
-/// is rooted at it verbatim. The returned session has run no turn.
+/// is rooted at it verbatim. `warnings` receives each startup warning
+/// a frontend without stderr shows itself, the same text the log line
+/// carries. The returned session has run no turn.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
     operator: impl FnOnce(Policy, &Secrets, &Path) -> Arc<dyn Operator>,
+    warnings: &mut Vec<String>,
 ) -> Result<Session, Fatal> {
     // ---- the files.
     let config = load_config(cli.config.as_deref())?;
@@ -137,10 +140,12 @@ pub fn start(
         for name in plugin.uses_secrets() {
             let plugin_name = plugin.name();
             if !secrets.is_available(&plugin_name, &name) {
-                tracing::warn!(
+                let message = format!(
                     "plugin {plugin_name} declares secret {name:?} but no source has it: set {}",
                     secrets.describe_source(&plugin_name, &name)
                 );
+                tracing::warn!("{message}");
+                warnings.push(message);
             }
         }
     }
@@ -266,7 +271,7 @@ mod tests {
         let config_path = config_dir.path().join("config.toml");
         std::fs::write(&config_path, "").unwrap();
         let cli = Cli {
-            task: None,
+            prompt: None,
             workspace: None,
             config: Some(config_path),
             policy: None,
@@ -283,6 +288,8 @@ mod tests {
             max_rounds: None,
             no_stream: false,
             transcript: None,
+            print: false,
+            log: None,
             verbose: 0,
         };
         let called = AtomicBool::new(false);
@@ -299,6 +306,7 @@ mod tests {
                     0,
                 ))
             },
+            &mut Vec::new(),
         );
         let err = result.expect_err("expected a startup failure");
         assert!(

@@ -8,8 +8,10 @@
 //! so only one run can see it — and answers normally after, so that
 //! run retries once and finishes; any other route gets the opening
 //! or closing turn depending on what the request carries. A wrong
-//! `x-api-key` gets a 401. Every suite compiles its own copy
-//! (`mod common;`).
+//! `x-api-key` gets a 401. `/scripted` (`tests/interactive.rs`) reads
+//! the first word of the turn's own text instead, so one session can
+//! ask for a different scenario on each turn. Every suite compiles its
+//! own copy (`mod common;`).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -72,11 +74,7 @@ fn handle(stub: &Stub, mut socket: TcpStream) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push((path.clone(), headers.clone(), parsed.clone()));
     if headers.get("x-api-key").and_then(Value::as_str) != Some(API_KEY) {
-        respond(
-            &mut socket,
-            "401 Unauthorized",
-            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
-        );
+        unauthorized(&mut socket);
         return;
     }
     let (route, _) = path
@@ -103,6 +101,7 @@ fn handle(stub: &Stub, mut socket: TcpStream) {
         }
         // The model speaks, asks for a tool, and ends in a refusal.
         "/refusal" => stream(&mut socket, REFUSAL_SSE),
+        "/scripted" => handle_scripted(stub, &mut socket, &parsed),
         _ => match tool_result_in(&parsed) {
             Some((content, is_error)) => {
                 let text = if is_error {
@@ -115,6 +114,88 @@ fn handle(stub: &Stub, mut socket: TcpStream) {
             None => stream(&mut socket, OPENING_SSE),
         },
     }
+}
+
+fn unauthorized(socket: &mut TcpStream) {
+    respond(
+        socket,
+        "401 Unauthorized",
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    );
+}
+
+/// The interactive suite's one route: what it answers depends on the
+/// first word of the turn's own text (a follow-up, whose last content
+/// block is a tool result rather than text, answers exactly as the
+/// default route's follow-up does), so one session can drive every
+/// scenario `tests/interactive.rs` needs by typing a different first
+/// word each turn.
+fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
+    let Some(text) = last_user_text(body) else {
+        // A follow-up turn: the last message is a tool result.
+        match tool_result_in(body) {
+            Some((content, is_error)) => {
+                let text = if is_error {
+                    format!("The read failed: {content}")
+                } else {
+                    format!("It says: {content}")
+                };
+                stream(socket, &closing_sse(&text));
+            }
+            None => stream(socket, OPENING_SSE),
+        }
+        return;
+    };
+    let first = text.split_whitespace().next().unwrap_or("");
+    match first {
+        // Never answers; the cancellation pin reads until the caller
+        // moves on and closes the connection.
+        "stall" => {
+            let mut sink = [0u8; 1];
+            let _ = socket.read(&mut sink);
+        }
+        // Streams a little text, then never finishes the round.
+        "stream-stall" => {
+            stream(socket, STREAM_STALL_SSE);
+            let mut sink = [0u8; 1];
+            let _ = socket.read(&mut sink);
+        }
+        // Overloaded on the first request carrying this exact text
+        // (the stub is shared across the whole test), normal after.
+        "flaky" => {
+            let count = stub
+                .requests()
+                .iter()
+                .filter(|(p, _, b)| {
+                    p.starts_with("/scripted")
+                        && last_user_text(b).as_deref() == Some(text.as_str())
+                })
+                .count();
+            if count <= 1 {
+                stream(socket, OVERLOADED_MIDSTREAM_SSE);
+            } else {
+                stream(socket, &closing_sse("It went fine."));
+            }
+        }
+        "refuse" => stream(socket, REFUSAL_SSE),
+        "fail" => unauthorized(socket),
+        "sleep" => stream(socket, &calling_sse("bash", r#"{"command": "sleep 30"}"#)),
+        _ => stream(socket, OPENING_SSE),
+    }
+}
+
+/// The last message's text, when it is the user's own turn (not a
+/// follow-up carrying a tool result).
+pub fn last_user_text(body: &Value) -> Option<String> {
+    let last = body.get("messages")?.as_array()?.last()?;
+    if last.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    let block = last.get("content")?.as_array()?.last()?;
+    if block.get("type")?.as_str()? != "text" {
+        return None;
+    }
+    block.get("text")?.as_str().map(str::to_string)
 }
 
 /// The first tool result in a request's last message, if it is a
@@ -235,6 +316,44 @@ event: message_stop
 data: {"type":"message_stop"}
 
 "#;
+
+/// A round that starts speaking and then never finishes: `/scripted`'s
+/// `stream-stall` scenario, shown before the cancellation pin cuts it.
+const STREAM_STALL_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_ss","type":"message","role":"assistant","content":[],"model":"claude-fixture","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"so far"}}
+
+"#;
+
+/// A round with a short text block, then a tool call the model waits
+/// on: `/scripted`'s way of asking for a specific tool without going
+/// through the read-and-answer shape the default route follows.
+fn calling_sse(name: &str, input: &str) -> String {
+    let text = json!("One moment.");
+    let name = json!(name);
+    let input = json!(input);
+    format!(
+        concat!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_s\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fixture\",\"stop_reason\":null,\"usage\":{{\"input_tokens\":12,\"output_tokens\":1}}}}}}\n\n",
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n",
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_s1\",\"name\":{name},\"input\":{{}}}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{input}}}}}\n\n",
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":9}}}}\n\n",
+            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        text = text,
+        name = name,
+        input = input,
+    )
+}
 
 fn closing_sse(text: &str) -> String {
     let text = json!(text);

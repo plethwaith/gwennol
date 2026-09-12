@@ -1,9 +1,13 @@
 # gwennol
 
-The non-interactive command-line frontend: one task, run headlessly,
-with every approval decided by a rule and traced to it. There is no
-prompt. The TUI ("7. TUI" in the roadmap) is a second `Operator`, not
-a mode of this one.
+`gwennol [options] [prompt]` opens an interactive session by default:
+the model's text streams into a transcript pane, a line editor takes
+the next turn, and every approval is still decided by a rule and
+traced into the pane, in the same words this file's examples show on
+stderr. `-p`/`--print` — what the rest of this file walks through — is
+one task run headlessly instead, with every approval decided by a rule
+and traced to it, and there is no prompt; a run with no terminal on
+stdin or stdout is print mode too, with one stderr line saying so.
 
 ## Quick start
 
@@ -14,7 +18,7 @@ cargo build -p gwennol-cli             # target/debug/gwennol
 
 export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/some/repo
-/path/to/gwennol/target/debug/gwennol \
+/path/to/gwennol/target/debug/gwennol -p \
     --trust-runtime provider-anthropic \
     --allow 'http:POST https://api.anthropic.com/*' \
     --allow 'read:**' --allow 'spawn:grep *' \
@@ -223,6 +227,8 @@ exit 2, while a failed or cancelled turn keeps its own status.
 
 ## What it does not do
 
-Persist or resume a conversation, manage the context window, install
-plugins from outside the bundle, or prompt: the roadmap's "Beyond the
-MVP" and "7. TUI" respectively.
+Persist or resume a conversation, manage the context window, or
+install plugins from outside the bundle: the roadmap's "Beyond the
+MVP". Prompt: every approval is still decided by a rule alone, in a
+session as in a print run; a request no rule matches is denied and
+traced, and the model routes around it or says what it could not do.

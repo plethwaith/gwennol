@@ -36,14 +36,14 @@ contracts ([docs/SPI.md](docs/SPI.md)), the plugin substrate (Rust
 guests compiled to wasm32, [docs/SUBSTRATE.md](docs/SUBSTRATE.md)),
 the bundled plugins (the Anthropic provider and the `read`, `write`,
 `grep` and `bash` tools, [plugins/](plugins/)), the agent loop
-(`gwennol_core::agent::Session`) and the non-interactive CLI
-(`gwennol`, every approval decided by a rule and traced to it,
+(`gwennol_core::agent::Session`) and the `gwennol` CLI (interactive by
+default, `-p` for a print run, every approval decided by a rule and
+traced,
 [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
 exercised by integration tests against a real kernel and a stubbed
 Messages API. Nothing is packaged yet: the CLI runs from a checkout
-with `cargo xtask bundle` beside it. The interactive TUI is
-"7. TUI" in the roadmap. The 0.0.0 release on crates.io is a name
-reservation.
+with `cargo xtask bundle` beside it. The 0.0.0 release on crates.io is
+a name reservation.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the architecture decisions, the
 naming rules, and the seven milestones to a usable harness.
@@ -86,7 +86,7 @@ file, where secrets come from and the exit statuses are in
 
 ```
 crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
-crates/gwennol-cli/    the `gwennol` binary: non-interactive frontend, rules instead of prompts
+crates/gwennol-cli/    the `gwennol` binary: interactive session or print run, rules instead of prompts
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
 crates/provider-anthropic/  the bundled model provider's guest code
