@@ -471,6 +471,18 @@ fn secrets_come_from_a_named_source_and_a_missing_one_is_said_so() {
     assert!(r.status.success(), "{:?}", r.status);
     assert!(!r.stderr.contains("no source has it"), "{}", r.stderr);
 
+    // The convention variable — the default source, and the one
+    // eight other tests in this file use.
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .arg("What does hello.txt say?"));
+    assert!(r.status.success(), "{:?}", r.status);
+    assert!(!r.stderr.contains("no source has it"), "{}", r.stderr);
+
     // A file source, from the config.
     let key_file = f.scratch.join("anthropic.key");
     std::fs::write(&key_file, format!("{API_KEY}\n")).unwrap();

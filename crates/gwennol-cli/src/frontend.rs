@@ -1,12 +1,14 @@
 //! What a run settles before its `Operator` drives a turn, and which
 //! is the same for any `Operator`, except the default system prompt
-//! below, which describes a headless run and which an interactive
-//! frontend should replace: the workspace, the config and policy
-//! files, the compiled policy, the secret sources, the plugins and
-//! their manifests, the process environment, the kernel, and the
-//! session. A second frontend added to this binary calls the same two
-//! functions and supplies its own `Operator` in the closure, so it
-//! copies none of this.
+//! below, which describes a headless run: an interactive frontend
+//! needs its own, and `start` would have to grow a parameter for it,
+//! since `system_prompt` reads only the flags and the config. What is
+//! shared: the workspace, the config and policy files, the compiled
+//! policy, the secret sources, the plugins and their manifests, the
+//! process environment, the kernel, and the session. A second
+//! frontend added to this binary calls the same two functions and
+//! supplies its own `Operator` in the closure, so it copies none of
+//! this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,9 +40,9 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// policy files, the compiled policy, the secret sources, the plugins
 /// and their manifests, the process environment, the kernel, and the
 /// session. `operator` is called once, after the plugins are loaded
-/// and before the kernel boots, with the compiled policy, the secret
-/// sources — this module keeps a copy, which is what the
-/// declared-secret warnings below consult — and the canonical
+/// and before the kernel boots, with the compiled policy, which it
+/// takes; a borrow of the secret sources, which this module keeps
+/// and the declared-secret warnings below consult; and the canonical
 /// workspace. `workspace` must already be canonical, as [`workspace`]
 /// returns it: the compiled policy is rooted at it verbatim. The
 /// returned session has run no turn.
@@ -278,7 +280,7 @@ mod tests {
         let called = AtomicBool::new(false);
         let result = start(
             &cli,
-            PathBuf::from("."),
+            PathBuf::from(".").canonicalize().unwrap(),
             Vec::new(),
             |policy, secrets, workspace| {
                 called.store(true, Ordering::SeqCst);
@@ -290,7 +292,12 @@ mod tests {
                 ))
             },
         );
-        assert!(result.is_err(), "expected a startup failure");
+        let err = result.expect_err("expected a startup failure");
+        assert!(
+            err.0.contains("/nonexistent/plugins-dir"),
+            "the run failed before the plugins were loaded: {}",
+            err.0
+        );
         assert!(
             !called.load(Ordering::SeqCst),
             "the operator factory ran before the plugins failed to load"

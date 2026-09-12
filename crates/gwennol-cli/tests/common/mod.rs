@@ -3,11 +3,13 @@
 //! says something, and asks to `read` hello.txt; the follow-up quotes
 //! the tool result it was given, saying whether it was an error. The
 //! special routes `/stall` and `/refusal` drive a stalled connection
-//! and a model refusal; `/flaky` overloads mid-round on its first
-//! request and answers normally after it, so a run retries once and
-//! finishes; any other route gets the opening or closing turn
-//! depending on what the request carries. A wrong `x-api-key` gets a
-//! 401. Every suite compiles its own copy (`mod common;`).
+//! and a model refusal; `/flaky` overloads mid-round on the first
+//! request the route gets in the test process — the stub is shared,
+//! so only one run can see it — and answers normally after, so that
+//! run retries once and finishes; any other route gets the opening
+//! or closing turn depending on what the request carries. A wrong
+//! `x-api-key` gets a 401. Every suite compiles its own copy
+//! (`mod common;`).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

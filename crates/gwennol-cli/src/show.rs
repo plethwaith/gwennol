@@ -13,12 +13,14 @@ use gwennol_core::{Access, ToolCall, TurnError, TurnOutcome};
 
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED};
 
-/// Most characters of a tool call's arguments or a result shown in
-/// one line, so a trace and a prompt cut it to the same length.
+/// Most characters of a tool call's arguments, or of a result shown
+/// as one line rather than whole, so a trace and a prompt cut to
+/// the same length.
 pub const PREVIEW_CHARS: usize = 200;
 
-/// An access in the words a prompt would use, so a trace and a prompt
-/// describe the same access the same way.
+/// An `Access` on one line, in the words a prompt would use: a URL's
+/// query and userinfo scrubbed, a spawn's cwd shown only when it is
+/// not the workspace.
 pub struct ShowAccess<'a> {
     /// The access to show.
     pub access: &'a Access,
