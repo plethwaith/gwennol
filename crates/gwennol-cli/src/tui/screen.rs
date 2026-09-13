@@ -26,9 +26,10 @@ const RAW: u8 = 1;
 const SCREEN: u8 = 2;
 const KITTY: u8 = 4;
 
-// A test that reads or writes this (directly, or through `Screen` or
-// the panic hook) must hold the `tests` module's `TEST_LOCK` first:
-// nothing about a process-wide static enforces that on its own.
+// A test in this module that reads or writes this (directly, or
+// through `Screen` or the panic hook) must hold the `tests` module's
+// `TEST_LOCK` first: nothing about a process-wide static enforces
+// that on its own.
 static ENTERED: AtomicU8 = AtomicU8::new(0);
 
 /// Whether to push the kitty keyboard protocol's disambiguation flag.
@@ -100,7 +101,7 @@ impl<W: Write> Screen<W> {
         if let Err(e) = outcome {
             // Undoes raw `bits` directly, unmasked: no `Screen` guard
             // exists yet for a panic hook to have raced with, so there
-            // is nothing to mask against here (unlike `Drop`, above).
+            // is nothing to mask against here (unlike `Drop`, below).
             undo(&mut out, bits);
             ENTERED.fetch_and(!bits, Ordering::SeqCst);
             return Err(e);

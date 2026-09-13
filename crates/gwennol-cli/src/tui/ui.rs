@@ -202,7 +202,7 @@ impl Ui {
                 self.open = None;
             }
             // Bounded and one-lined through `show::preview`, the
-            // treatment a tool result's own text gets at `-v0` (unlike
+            // treatment a tool result's own text gets without `-v` (unlike
             // a tool result, this stays previewed at `-v` and above);
             // the `{other:?}` form would otherwise go into the pane
             // whole.

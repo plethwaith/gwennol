@@ -336,9 +336,9 @@ mod tests {
 
     /// Guards the forced-exit path directly and deterministically: the
     /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
-    /// only pins `biased` in the running loop's `select!` intermittently
-    /// (run H survives the mutant most runs; see its comment), since the
-    /// key and the cancelled turn's own completion race. With a
+    /// does not pin `biased` in the running loop's `select!`: with it
+    /// removed the key and the cancelled turn's own completion race, and
+    /// the mutant survives most runs (see run H's own comment). With a
     /// cancel already pending from a first `/exit`, a second one
     /// returns `ForceExit` here regardless of any scheduling.
     /// Mutation: swap the branches of the `ui.exiting` check
@@ -380,9 +380,9 @@ mod tests {
 
     /// Guards `Input::Errored`: a read error is traced (rather than
     /// folded into `None`, the same as the source closing, and said
-    /// nowhere) and returns no `Action`, so the loop keeps running
-    /// rather than treating the trace as a hidden exit. Mutation: fold
-    /// `Input::Errored` into the `Input::Resize` arm (silently
+    /// nowhere) and `handle_key` returns no `Action`, so the loop keeps
+    /// running rather than treating the trace as a hidden exit.
+    /// Mutation: fold `Input::Errored` into the `Input::Resize` arm (silently
     /// discarded) — the first assertion below fails.
     #[test]
     fn a_read_error_is_traced_not_silently_treated_as_closed() {
@@ -414,7 +414,7 @@ mod tests {
     /// returns no `Action`, and leaves the editor's text in place
     /// rather than discarding it. Mutation: replace the whole
     /// `Submission::Turn` arm with an unconditional commit-and-submit
-    /// — both assertions below fail.
+    /// — the three assertions below fail.
     #[test]
     fn a_turn_typed_while_one_is_running_is_not_swallowed() {
         let shared = Shared::new();
@@ -492,15 +492,15 @@ mod tests {
     }
 
     /// Guards `idle_step`'s own `biased;` (distinct from the running
-    /// loop's, guarded only intermittently by run H in
+    /// loop's, whose mutant no test kills — see run H's comment in
     /// `tests/interactive.rs`): with a key and a pending redraw both
-    /// ready, the key arm runs first, reaching the editor. Racy like
-    /// run H's pin: without `biased;`, `tokio::select!`'s own per-call
+    /// ready, the key arm runs first, reaching the editor. Racy on its
+    /// own, as run H is: without `biased;`, `tokio::select!`'s own per-call
     /// rotation still sometimes starts at the key arm anyway (about
     /// half of local runs of the mutation below still green), so the
     /// check runs inside a 20-iteration loop with fresh state each
     /// time, which takes the mutant's survival from roughly 0.5 per
-    /// run to about 1e-7. Mutation: remove `biased;` from `idle_step`'s
+    /// run to about 1e-6. Mutation: remove `biased;` from `idle_step`'s
     /// `select!`.
     #[tokio::test]
     async fn idle_step_handles_a_ready_key_before_a_ready_change() {

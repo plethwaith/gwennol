@@ -1,6 +1,7 @@
 //! Keys come through here so the loop never touches the terminal: a
-//! real terminal's [`TerminalKeys`], or, in tests, a channel that
-//! implements the same trait.
+//! real terminal's [`TerminalKeys`], `TerminalKeys` driven by a
+//! scripted stream in unit tests, or a channel that implements the
+//! same trait.
 
 use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
 use futures_util::StreamExt;
@@ -40,9 +41,11 @@ pub trait KeySource {
 /// (`crossterm-0.29.0/src/event/stream.rs:104-137`), so `step`'s own
 /// `None` arm below is unreachable behind a real `EventStream`.
 ///
-/// This is not a latch: `step` resets `errors` to 0 on its own
-/// `Return` arms, so a caller that kept polling past a `None` and saw
-/// an `Ok` again would trace once more rather than staying closed.
+/// This is not a latch: `step` resets `errors` to 0 on the three arms
+/// that hand a successfully read event back (a key press or repeat, a
+/// paste, a resize), so a caller that kept polling past a `None` and
+/// saw one of those again would trace once more rather than staying
+/// closed.
 /// Unreachable today — both `drive`'s idle and running loops stop
 /// polling a `KeySource` the moment `next` returns `None` — but worth
 /// saying so a future caller does not assume otherwise.
@@ -57,9 +60,9 @@ const MAX_CONSECUTIVE_READ_ERRORS: u32 = 2;
 /// still returns exactly that.
 pub struct TerminalKeys<S = EventStream> {
     stream: S,
-    /// Consecutive read errors since the last successful event; reset
-    /// on the arms of `step` that return input to the caller. See
-    /// `MAX_CONSECUTIVE_READ_ERRORS`.
+    /// Consecutive read errors since the last event that reached
+    /// `next`'s caller; reset on `step`'s key-press, paste and resize
+    /// arms only. See `MAX_CONSECUTIVE_READ_ERRORS`.
     errors: u32,
 }
 
@@ -87,12 +90,14 @@ impl TerminalKeys {
 /// The mapping for one poll of the stream, pinned on its own (with a
 /// plain `Option<Result<..>>` standing in for the poll) so a test does
 /// not need a real, breakable `EventStream` to exercise it in
-/// isolation. `errors` is reset only on the arms that return input to
-/// the caller (`Step::Return`): the two arms that return
-/// `Step::Continue` (a key release; a focus or mouse event) do not
-/// touch it, so an `Err` run alternating with either still reaches
-/// `MAX_CONSECUTIVE_READ_ERRORS` instead of being masked by an
-/// event `next`'s caller never sees.
+/// isolation. `errors` is reset on three arms only — a key press or
+/// repeat, a paste, a resize — the reads that hand an `Input` back.
+/// The two arms that return `Step::Continue` (a key release; a focus
+/// or mouse event) leave it alone, so an `Err` run alternating with
+/// either still reaches `MAX_CONSECUTIVE_READ_ERRORS` instead of being
+/// masked by an event `next`'s caller never sees; the `Err` arm itself
+/// increments rather than resets, which is what lets a run of errors
+/// reach the threshold at all.
 fn step(errors: &mut u32, event: Option<Result<Event, std::io::Error>>) -> Step {
     match event {
         Some(Ok(Event::Key(key))) => {
@@ -190,10 +195,13 @@ mod tests {
         Some(Ok(Event::FocusGained))
     }
 
-    /// Guards the mapping `TerminalKeys::next` cannot be unit-tested
-    /// through directly (it reads a real `EventStream`): a first read
-    /// error is traced and the source stays open; a second consecutive
-    /// one closes it, the same as the source itself closing. Mutation:
+    /// Guards the per-poll mapping in isolation, with a bare `&mut u32`
+    /// and no stream at all: a first read error is traced and the source
+    /// stays open; a second consecutive one closes it, the same as the
+    /// source itself closing. The counter's own accumulation across
+    /// polls is pinned separately, through `next`, by
+    /// `a_second_consecutive_read_error_closes_the_source_across_polls`.
+    /// Mutation:
     /// raise `MAX_CONSECUTIVE_READ_ERRORS` to 3 — the second call below
     /// returns `Step::Return(Some(Errored(..)))` instead of
     /// `Step::Return(None)`.
@@ -209,7 +217,7 @@ mod tests {
 
     /// A successful read that reaches `next`'s caller (a key press, a
     /// paste, a resize) resets the count in between two errors: guards
-    /// `step`'s `*errors = 0` on each `Return` arm. Mutation: drop the
+    /// `step`'s `*errors = 0` on each of its three success arms. Mutation: drop the
     /// reset on the arm named in the failure — the third call below
     /// returns `Step::Return(None)` instead of tracing again.
     #[test]
@@ -237,7 +245,7 @@ mod tests {
     /// and must not reset the count: guards the arms that ignored this
     /// on purpose, so an fd alternating an error with one of these
     /// still reaches the threshold. Mutation: put `*errors = 0;` back
-    /// on the arm named in the failure — the second call below returns
+    /// on the arm named in the failure — the third call below returns
     /// `Step::Return(Some(Errored(..)))` instead of `Step::Return(None)`.
     #[test]
     fn an_ignored_event_between_errors_does_not_reset_the_count() {
@@ -265,8 +273,10 @@ mod tests {
     /// `TerminalKeys::next`, close the source — the `errors: u32` field
     /// and the `&mut self.errors` that threads it between polls. The
     /// tests above call `step` directly with a local counter, which
-    /// cannot exercise this: `next`'s loop, not `step`, is what carries
-    /// `errors` across `.await` points. Mutation: reset `self.errors`
+    /// cannot exercise this: it is the `errors` field on `TerminalKeys`,
+    /// not `step`, that carries the count across `.await` points — each
+    /// `next()` call below returns on its first poll, so the loop
+    /// itself never iterates. Mutation: reset `self.errors`
     /// to 0 at the top of `next`'s loop body — the second `next().await`
     /// below then returns `Some(Errored(..))` again instead of `None`.
     #[tokio::test]
@@ -280,5 +290,27 @@ mod tests {
         };
         assert_eq!(keys.next().await, Some(Input::Errored("boom".to_string())));
         assert_eq!(keys.next().await, None);
+    }
+
+    /// Guards `next`'s own loop, not just `step`'s mapping: a
+    /// `Step::Continue` must make the loop poll again rather than
+    /// return. Mutation: replace `Step::Continue => {}` with
+    /// `Step::Continue => return None,` — `next` then returns `None`
+    /// on the release below instead of polling again for the press.
+    #[tokio::test]
+    async fn an_ignored_event_does_not_end_the_source_through_next() {
+        let press = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let mut keys = TerminalKeys {
+            stream: futures_util::stream::iter([
+                Ok(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ))),
+                Ok(Event::Key(press)),
+            ]),
+            errors: 0,
+        };
+        assert_eq!(keys.next().await, Some(Input::Key(press)));
     }
 }

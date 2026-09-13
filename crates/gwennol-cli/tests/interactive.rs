@@ -196,7 +196,7 @@ async fn run_drive(
 /// leaves the draft in place rather than clearing it (D9), so an
 /// un-cleared editor could in principle carry text into the next run
 /// and have it read as one plain turn, even though every run in this
-/// suite today happens to end on a committed submission instead.
+/// suite today happens to leave the editor empty when it ends.
 fn reset_editor(shared: &std::sync::Arc<Shared>) {
     shared.update(|ui| {
         ui.editor = gwennol::tui::editor::Editor::default();
@@ -840,8 +840,10 @@ async fn scenario() {
     // touches the running loop's `biased;` too, but does not pin it: with
     // `biased;` removed the key and the cancelled turn's own completion
     // race, and the mutant survives most runs (17/20 and 23/25 in two
-    // local runs). The deterministic pin is
-    // `a_second_exit_forces_the_session_out_while_the_first_is_pending`.
+    // local runs). The forced-exit behaviour itself is pinned
+    // deterministically by
+    // `a_second_exit_forces_the_session_out_while_the_first_is_pending`;
+    // the running loop's `biased;` has no test that kills its mutant.
     let driver = tokio::spawn(async move {
         type_line(&tx, "sleep");
         type_line(&tx, "/exit");
