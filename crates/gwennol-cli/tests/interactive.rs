@@ -286,6 +286,16 @@ fn the_panic_hook_restores_the_terminal_before_the_panic_prints() {
         pop_at < boom_at && leave_at < boom_at,
         "the terminal was not restored before the panic printed:\n{merged}"
     );
+    // `find` above only locates the first occurrence: a `Drop` that
+    // repeats the panic hook's own undo would still pass it. Count
+    // instead: the kitty-pop bytes appear exactly once, from the panic
+    // hook; `Drop` running afterward on the same guard must not send
+    // them again.
+    assert_eq!(
+        merged.matches(pop_kitty).count(),
+        1,
+        "the kitty-pop bytes appeared more than once, so something undid them twice:\n{merged}"
+    );
 }
 
 // -------------------------------------------------------------- 6.3
@@ -311,10 +321,7 @@ async fn scenario() {
     // driver: if a driver panics (an `await_ui` timeout, a failed
     // assertion), dropping its one `tx` closes the channel, so
     // `run_drive`'s `keys.next()` sees the source close and the run
-    // ends in seconds rather than at the outer 180s timeout. Before
-    // this round, every run but the last two shared one `tx`/`rx`
-    // pair that outlived every driver, so a panicked driver's clone
-    // dropping changed nothing.
+    // ends in seconds rather than at the outer 180s timeout.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
@@ -755,11 +762,11 @@ async fn scenario() {
                 "run F: help printed",
             )
             .await;
-            // Guards the `/help` `commit`, pinned only by the 180s
-            // outer timeout before this round. Mutation:
-            // drop the `commit` in the `Command::Help` arm — the
-            // editor keeps "/help" and this fails fast instead of
-            // three runs downstream, at the 180s timeout.
+            // Guards the `/help` `commit`, otherwise pinned only by the
+            // 180s outer timeout. Mutation: drop the `commit` in the
+            // `Command::Help` arm — the editor keeps "/help" and this
+            // fails fast instead of three runs downstream, at the 180s
+            // timeout.
             assert!(
                 shared.lock().editor.text().is_empty(),
                 "run F: /help did not clear the editor"
@@ -792,14 +799,12 @@ async fn scenario() {
     }
 
     // ---- run G: the key source closing while a turn is running is
-    // treated as a running `/exit`: cancelled, then unwound. Nothing
-    // exercised this before this round — run F closes the source
-    // while idle, and the row's own name, "key source closes", had
-    // been credited to what is now run H below, which forces the
-    // session out through a second `/exit` before its channel closing
-    // would ever matter. A fresh channel, moved (not cloned) into the
-    // driver, so it is this run's only sender and closes the moment
-    // the driver task ends.
+    // treated as a running `/exit`: cancelled, then unwound. Distinct
+    // from run F (closes the source while idle) and run H below
+    // (forces the session out through a second `/exit` before its
+    // channel closing would ever matter). A fresh channel, moved (not
+    // cloned) into the driver, so it is this run's only sender and
+    // closes the moment the driver task ends.
     let start = shared.lock().entries.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let driver = tokio::spawn(async move {
@@ -832,10 +837,11 @@ async fn scenario() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
 
     // ---- run H: a second /exit forces the session out at once. This
-    // also, intermittently, pins the running loop's `biased;`
-    // (`drive.rs:205`): removing it leaves the key and the cancelled
-    // turn's own completion racing, so the mutant still passes some
-    // runs (3/10 in a local run) rather than being reliably killed.
+    // touches the running loop's `biased;` too, but does not pin it: with
+    // `biased;` removed the key and the cancelled turn's own completion
+    // race, and the mutant survives most runs (17/20 and 23/25 in two
+    // local runs). The deterministic pin is
+    // `a_second_exit_forces_the_session_out_while_the_first_is_pending`.
     let driver = tokio::spawn(async move {
         type_line(&tx, "sleep");
         type_line(&tx, "/exit");

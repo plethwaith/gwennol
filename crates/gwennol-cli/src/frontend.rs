@@ -45,10 +45,11 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// which this module keeps and the declared-secret warnings below
 /// consult; and the canonical workspace. `workspace` must already
 /// be canonical, as [`workspace`] returns it: the compiled policy
-/// is rooted at it verbatim. `warnings` receives the two startup
-/// warnings a frontend with no stderr should still show — the
-/// empty-policy one and each declared-secret one below — in the same
-/// words their log lines carry. Other warnings raised while starting
+/// is rooted at it verbatim. `warnings` receives the two kinds of
+/// startup warning a frontend with no stderr should still show — the
+/// empty-policy one, and one per declared secret with no source
+/// below — in the same words their log lines carry. Other warnings
+/// raised while starting
 /// (`policy::walk`'s unresolvable-prefix one) go only to the log. The
 /// returned session has run no turn.
 pub fn start(

@@ -366,17 +366,16 @@ mod tests {
         assert_eq!(submission_of("hi"), Submission::Turn("hi".to_string()));
     }
 
-    /// Guards bindings with no pin before this round: a `Char` key
-    /// with `SHIFT` still inserts (the char itself already carries the
-    /// case; `SHIFT` alone must not turn it into a different binding);
-    /// `Home`/`End` with no modifiers move to the line's start/end;
-    /// `commit` never pushes two identical entries back to back; Up
-    /// past the oldest entry stays there rather than wrapping.
-    /// Mutations (each named, each leaves the suite green before this
-    /// test): `plain_char` requires `key.modifiers == KeyModifiers::NONE`
-    /// exactly; `KeyCode::Home` becomes a no-op; history dedup becomes
-    /// unconditional; `Some(0) => 0` in `history_up` wraps to the
-    /// newest entry instead.
+    /// Guards these bindings: a `Char` key with `SHIFT` still inserts
+    /// (the char itself already carries the case; `SHIFT` alone must
+    /// not turn it into a different binding); `Home`/`End` with no
+    /// modifiers move to the line's start/end; `commit` never pushes
+    /// two identical entries back to back; Up past the oldest entry
+    /// stays there rather than wrapping. Mutations (each named, each
+    /// leaves the suite green without this test): `plain_char` requires
+    /// `key.modifiers == KeyModifiers::NONE` exactly; `KeyCode::Home`
+    /// becomes a no-op; history dedup becomes unconditional;
+    /// `Some(0) => 0` in `history_up` wraps to the newest entry instead.
     #[test]
     fn shift_home_end_dedup_and_the_oldest_history_entry() {
         // A shifted letter still inserts.
@@ -433,17 +432,20 @@ mod tests {
         );
     }
 
-    /// Before this round no deletion reset `browsing` (only `insert`,
-    /// `commit` and `history_down`'s restore arm did), so an edit made
-    /// to a history entry mid-browse did not detach from it, and a
-    /// later Down (with nothing newer in history) discarded the edit
-    /// and restored the pre-Up draft instead of leaving it alone.
+    /// Every deletion resets `browsing` (as `insert`, `commit` and
+    /// `history_down`'s restore arm already do), so an edit made to a
+    /// history entry mid-browse detaches from it, and a later Down
+    /// (with nothing newer in history) keeps the edit rather than
+    /// discarding it for the pre-Up draft.
     /// Looped over all four deletion keys: `delete_left` (Backspace),
     /// `delete_right` (Delete), `delete_word_left` (Ctrl-W) and
     /// `delete_word_right` (Alt-D) each reset `browsing` on their own;
     /// dropping any single `self.browsing = None;` line leaves that
     /// iteration's last assertion failing, `editor.text()` reading
-    /// back "draft".
+    /// back "draft". The rightward keys (`Delete`, `Alt+d`) get a
+    /// `Home` first: `history_up` leaves the cursor at the end of the
+    /// browsed text, where they would delete nothing and the test
+    /// would pin only the unconditional reset, not an actual deletion.
     #[test]
     fn deleting_while_browsing_history_detaches_from_it() {
         for (code, modifiers) in [
@@ -463,8 +465,19 @@ mod tests {
                 "{code:?}+{modifiers:?}: Up did not browse to history"
             );
 
+            if matches!(
+                (code, modifiers),
+                (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::ALT)
+            ) {
+                editor.key(&key(KeyCode::Home, KeyModifiers::NONE));
+            }
+
             editor.key(&key(code, modifiers));
             let after_delete = editor.text();
+            assert_ne!(
+                after_delete, "first",
+                "{code:?}+{modifiers:?}: nothing was deleted"
+            );
 
             // Down is now a plain no-op: the deletion detached
             // `browsing` above, so there is nothing left to navigate

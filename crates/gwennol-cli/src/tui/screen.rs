@@ -26,6 +26,9 @@ const RAW: u8 = 1;
 const SCREEN: u8 = 2;
 const KITTY: u8 = 4;
 
+// A test that reads or writes this (directly, or through `Screen` or
+// the panic hook) must hold the `tests` module's `TEST_LOCK` first:
+// nothing about a process-wide static enforces that on its own.
 static ENTERED: AtomicU8 = AtomicU8::new(0);
 
 /// Whether to push the kitty keyboard protocol's disambiguation flag.
@@ -38,8 +41,10 @@ pub enum Kitty {
     Off,
 }
 
-/// A guard over the terminal state a session enters. `Drop` undoes
-/// exactly what was entered, in reverse.
+/// A guard over the terminal state a session enters. `Drop` undoes, in
+/// reverse, whatever it entered that the shared bits still record as
+/// entered: a bit a panic hook already restored is not restored twice
+/// (see the module doc).
 pub struct Screen<W: Write> {
     out: W,
     bits: u8,
@@ -66,12 +71,17 @@ impl<W: Write> Screen<W> {
         };
         let outcome: io::Result<()> = (|| {
             // Marked before the write it covers is attempted, not
-            // after: `queue!`'s two commands can fail between them, and
-            // recording optimistically means `undo`'s matching pair
-            // (safe to send even over a partial write, unlike
-            // `PopKeyboardEnhancementFlags` below) is asked to clean up
-            // a byte sequence that might have been partly written,
-            // rather than one the accounting says never was.
+            // after: `queue!`'s commands can fail between them, and
+            // recording optimistically means `undo`'s matching pair is
+            // asked to clean up a byte sequence that might have been
+            // partly written, rather than one the accounting says
+            // never was. `SCREEN`'s undo (`DisableBracketedPaste`,
+            // `LeaveAlternateScreen`) is safe to send even over a
+            // partial write; `KITTY`'s (`PopKeyboardEnhancementFlags`,
+            // below) is not, but it is recorded exactly the same
+            // optimistic way — a repeat is prevented by the masked
+            // `Drop`/panic-hook accounting (see the module doc), not by
+            // this bit's undo being repeat-safe.
             bits |= SCREEN;
             ENTERED.fetch_or(SCREEN, Ordering::SeqCst);
             queue!(out, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -88,6 +98,9 @@ impl<W: Write> Screen<W> {
             out.flush()
         })();
         if let Err(e) = outcome {
+            // Undoes raw `bits` directly, unmasked: no `Screen` guard
+            // exists yet for a panic hook to have raced with, so there
+            // is nothing to mask against here (unlike `Drop`, above).
             undo(&mut out, bits);
             ENTERED.fetch_and(!bits, Ordering::SeqCst);
             return Err(e);

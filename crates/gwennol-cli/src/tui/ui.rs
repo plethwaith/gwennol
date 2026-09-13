@@ -142,10 +142,11 @@ impl Ui {
                         }
                     }
                     // Normally `open` is `None` and this opens the turn's next
-                    // `Assistant` entry. It could in principle name a
-                    // non-`Assistant` one — every event that sets `open` also closes
-                    // it (`push`) — which the assert below pins; either way the
-                    // text is kept rather than dropped silently.
+                    // `Assistant` entry. It cannot name a non-`Assistant` one:
+                    // `open` is only ever set by `push` on an `Assistant`
+                    // entry, so the `debug_assert` below is a tripwire for a
+                    // future edit, not a live case; either way the text is
+                    // kept rather than dropped silently.
                     _ => {
                         debug_assert!(self.open.is_none(), "open pointed at a non-Assistant entry");
                         self.push(Entry::Assistant(text));
@@ -201,8 +202,10 @@ impl Ui {
                 self.open = None;
             }
             // Bounded and one-lined through `show::preview`, the
-            // treatment a tool result's own text gets; the `{other:?}`
-            // form would otherwise go into the pane whole.
+            // treatment a tool result's own text gets at `-v0` (unlike
+            // a tool result, this stays previewed at `-v` and above);
+            // the `{other:?}` form would otherwise go into the pane
+            // whole.
             other => self.push(Entry::Trace(format!(
                 "gwennol: event this frontend cannot show: {}",
                 show::preview(&format!("{other:?}"))
@@ -817,11 +820,10 @@ mod tests {
         );
     }
 
-    /// Guards the pane's render cache (an unbounded rewrap on every
-    /// frame before this round): a render after `entries` changed shows
-    /// the new content, not a stale cached frame; the cache is keyed
-    /// on width too, so a resize is not served the old width's rows.
-    /// Mutation: drop `revision` (or `width`) from the cache key
+    /// Guards the pane's render cache: a render after `entries` changed
+    /// shows the new content, not a stale cached frame; the cache is
+    /// keyed on width too, so a resize is not served the old width's
+    /// rows. Mutation: drop `revision` (or `width`) from the cache key
     /// comparison in `render_pane` — the second draw below still
     /// shows only "first" (or the 20-column wrapping).
     #[test]

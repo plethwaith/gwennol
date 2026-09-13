@@ -337,7 +337,7 @@ mod tests {
     /// Guards the forced-exit path directly and deterministically: the
     /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
     /// only pins `biased` in the running loop's `select!` intermittently
-    /// (run H's own comment there records the measured rate), since the
+    /// (run H survives the mutant most runs; see its comment), since the
     /// key and the cancelled turn's own completion race. With a
     /// cancel already pending from a first `/exit`, a second one
     /// returns `ForceExit` here regardless of any scheduling.
@@ -378,12 +378,12 @@ mod tests {
         assert_eq!(second, Some(Action::ForceExit));
     }
 
-    /// Guards `Input::Errored`: before this round a read error folded
-    /// into `None`, the same as the source closing, said nowhere; it
-    /// traces the message instead and returns no `Action`, so the loop
-    /// keeps running rather than treating the trace as a hidden exit.
-    /// Mutation: fold `Input::Errored` into the `Input::Resize` arm
-    /// (silently discarded) — the first assertion below fails.
+    /// Guards `Input::Errored`: a read error is traced (rather than
+    /// folded into `None`, the same as the source closing, and said
+    /// nowhere) and returns no `Action`, so the loop keeps running
+    /// rather than treating the trace as a hidden exit. Mutation: fold
+    /// `Input::Errored` into the `Input::Resize` arm (silently
+    /// discarded) — the first assertion below fails.
     #[test]
     fn a_read_error_is_traced_not_silently_treated_as_closed() {
         let shared = Shared::new();
@@ -409,13 +409,12 @@ mod tests {
         );
     }
 
-    /// Guards the "a turn is running; Esc cancels it" branch (no test
-    /// before this round): submitting a turn while one is already
-    /// running sets the notice, returns no
-    /// `Action`, and leaves the editor's text in place rather than
-    /// discarding it. Mutation: replace the whole `Submission::Turn`
-    /// arm with an unconditional commit-and-submit — both assertions
-    /// below fail.
+    /// Guards the "a turn is running; Esc cancels it" branch:
+    /// submitting a turn while one is already running sets the notice,
+    /// returns no `Action`, and leaves the editor's text in place
+    /// rather than discarding it. Mutation: replace the whole
+    /// `Submission::Turn` arm with an unconditional commit-and-submit
+    /// — both assertions below fail.
     #[test]
     fn a_turn_typed_while_one_is_running_is_not_swallowed() {
         let shared = Shared::new();
@@ -497,30 +496,35 @@ mod tests {
     /// `tests/interactive.rs`): with a key and a pending redraw both
     /// ready, the key arm runs first, reaching the editor. Racy like
     /// run H's pin: without `biased;`, `tokio::select!`'s own per-call
-    /// rotation still sometimes starts at the key arm anyway (measured
-    /// this round: 5/10 local runs of the mutation below still green).
-    /// Mutation: remove `biased;` from `idle_step`'s `select!`.
+    /// rotation still sometimes starts at the key arm anyway (about
+    /// half of local runs of the mutation below still green), so the
+    /// check runs inside a 20-iteration loop with fresh state each
+    /// time, which takes the mutant's survival from roughly 0.5 per
+    /// run to about 1e-7. Mutation: remove `biased;` from `idle_step`'s
+    /// `select!`.
     #[tokio::test]
     async fn idle_step_handles_a_ready_key_before_a_ready_change() {
-        let shared = Shared::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
-        let mut changes = shared.changed.subscribe();
-        tx.send(Input::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        )))
-        .unwrap();
-        // A pending redraw, ready alongside the key above.
-        shared.update(|ui| ui.push(Entry::Trace("gwennol: bump".to_string())));
-        let backend = TestBackend::new(20, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-        idle_step(&shared, &mut terminal, &mut rx, &mut changes)
-            .await
+        for _ in 0..20 {
+            let shared = Shared::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+            let mut changes = shared.changed.subscribe();
+            tx.send(Input::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )))
             .unwrap();
-        assert_eq!(
-            shared.lock().editor.text(),
-            "a",
-            "the ready redraw was handled before the ready key"
-        );
+            // A pending redraw, ready alongside the key above.
+            shared.update(|ui| ui.push(Entry::Trace("gwennol: bump".to_string())));
+            let backend = TestBackend::new(20, 6);
+            let mut terminal = Terminal::new(backend).unwrap();
+            idle_step(&shared, &mut terminal, &mut rx, &mut changes)
+                .await
+                .unwrap();
+            assert_eq!(
+                shared.lock().editor.text(),
+                "a",
+                "the ready redraw was handled before the ready key"
+            );
+        }
     }
 }

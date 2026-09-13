@@ -15,10 +15,9 @@ pub enum Input {
     /// The terminal was resized.
     Resize,
     /// Reading the terminal's events failed. Not the source closing
-    /// (`next` returns `None` for that, also once errors repeat —
-    /// see `TerminalKeys`'s `MAX_CONSECUTIVE_READ_ERRORS`): the loop
-    /// is told about a lone error, rather than treating it as a
-    /// silent, unremarked exit.
+    /// (`next` returns `None` for that, also once errors repeat — see
+    /// `MAX_CONSECUTIVE_READ_ERRORS`): the loop is told about a lone
+    /// error, rather than treating it as a silent, unremarked exit.
     Errored(String),
 }
 
@@ -29,26 +28,38 @@ pub trait KeySource {
     async fn next(&mut self) -> Option<Input>;
 }
 
-/// How many consecutive read errors `TerminalKeys::next` traces before
-/// treating the source as closed. crossterm's `EventStream::poll_next`
-/// returns `Poll::Ready(Some(Ok(..)))`, `Poll::Ready(Some(Err(..)))` or
-/// `Poll::Pending`, and **never** `Poll::Ready(None)`
-/// (`crossterm-0.29.0/src/event/stream.rs:101-135`): a broken terminal
-/// fd surfaces only as a run of `Err`s, so this is the one place
-/// `TerminalKeys::next`'s `None => return None` arm can still be
-/// reached in production. A single error is traced and kept open (a
-/// transient one should not end the session); a second consecutive one
-/// is treated as the source closing, the same as `None`, rather than
-/// tracing forever at whatever rate the fd re-errors.
+/// The number of consecutive read errors at which
+/// `TerminalKeys::next` reports the source closed: the first is traced
+/// as `Input::Errored` and the source stays open (a transient error
+/// should not end the session), the second returns `None` instead of
+/// being traced, rather than tracing forever at whatever rate the fd
+/// re-errors. Bounding the run is the only way a dead terminal ends a
+/// session at all: crossterm's `EventStream::poll_next` returns
+/// `Poll::Ready(Some(Ok(..)))`, `Poll::Ready(Some(Err(..)))` or
+/// `Poll::Pending` and **never** `Poll::Ready(None)`
+/// (`crossterm-0.29.0/src/event/stream.rs:104-137`), so `step`'s own
+/// `None` arm below is unreachable behind a real `EventStream`.
+///
+/// This is not a latch: `step` resets `errors` to 0 on its own
+/// `Return` arms, so a caller that kept polling past a `None` and saw
+/// an `Ok` again would trace once more rather than staying closed.
+/// Unreachable today — both `drive`'s idle and running loops stop
+/// polling a `KeySource` the moment `next` returns `None` — but worth
+/// saying so a future caller does not assume otherwise.
 const MAX_CONSECUTIVE_READ_ERRORS: u32 = 2;
 
 /// Keys from a real terminal, over crossterm's `EventStream`. Release
 /// events are dropped (most terminals never send them; some do, and a
 /// release is not a new input), as are focus and mouse events.
-pub struct TerminalKeys {
-    stream: EventStream,
+/// Generic over the stream so a test can drive `next` more than once
+/// against a scripted sequence of polls: production code only ever
+/// names `TerminalKeys` (the default `S = EventStream`); `new()`
+/// still returns exactly that.
+pub struct TerminalKeys<S = EventStream> {
+    stream: S,
     /// Consecutive read errors since the last successful event; reset
-    /// on any `Ok`. See [`MAX_CONSECUTIVE_READ_ERRORS`].
+    /// on the arms of `step` that return input to the caller. See
+    /// `MAX_CONSECUTIVE_READ_ERRORS`.
     errors: u32,
 }
 
@@ -71,43 +82,45 @@ impl TerminalKeys {
             errors: 0,
         }
     }
+}
 
-    /// The mapping for one poll of the stream, pinned on its own (with
-    /// a plain `Option<Result<..>>` standing in for the poll) so a test
-    /// does not need a real, breakable `EventStream` to exercise it,
-    /// including the error counter's reset on success.
-    fn step(errors: &mut u32, event: Option<Result<Event, std::io::Error>>) -> Step {
-        match event {
-            Some(Ok(Event::Key(key))) => {
+/// The mapping for one poll of the stream, pinned on its own (with a
+/// plain `Option<Result<..>>` standing in for the poll) so a test does
+/// not need a real, breakable `EventStream` to exercise it in
+/// isolation. `errors` is reset only on the arms that return input to
+/// the caller (`Step::Return`): the two arms that return
+/// `Step::Continue` (a key release; a focus or mouse event) do not
+/// touch it, so an `Err` run alternating with either still reaches
+/// `MAX_CONSECUTIVE_READ_ERRORS` instead of being masked by an
+/// event `next`'s caller never sees.
+fn step(errors: &mut u32, event: Option<Result<Event, std::io::Error>>) -> Step {
+    match event {
+        Some(Ok(Event::Key(key))) => {
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 *errors = 0;
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    Step::Return(Some(Input::Key(key)))
-                } else {
-                    Step::Continue
-                }
-            }
-            Some(Ok(Event::Paste(text))) => {
-                *errors = 0;
-                Step::Return(Some(Input::Paste(text)))
-            }
-            Some(Ok(Event::Resize(_, _))) => {
-                *errors = 0;
-                Step::Return(Some(Input::Resize))
-            }
-            Some(Ok(Event::FocusGained | Event::FocusLost | Event::Mouse(_))) => {
-                *errors = 0;
+                Step::Return(Some(Input::Key(key)))
+            } else {
                 Step::Continue
             }
-            Some(Err(e)) => {
-                *errors += 1;
-                if *errors >= MAX_CONSECUTIVE_READ_ERRORS {
-                    Step::Return(None)
-                } else {
-                    Step::Return(Some(Input::Errored(e.to_string())))
-                }
-            }
-            None => Step::Return(None),
         }
+        Some(Ok(Event::Paste(text))) => {
+            *errors = 0;
+            Step::Return(Some(Input::Paste(text)))
+        }
+        Some(Ok(Event::Resize(_, _))) => {
+            *errors = 0;
+            Step::Return(Some(Input::Resize))
+        }
+        Some(Ok(Event::FocusGained | Event::FocusLost | Event::Mouse(_))) => Step::Continue,
+        Some(Err(e)) => {
+            *errors += 1;
+            if *errors >= MAX_CONSECUTIVE_READ_ERRORS {
+                Step::Return(None)
+            } else {
+                Step::Return(Some(Input::Errored(e.to_string())))
+            }
+        }
+        None => Step::Return(None),
     }
 }
 
@@ -118,10 +131,13 @@ impl Default for TerminalKeys {
 }
 
 #[async_trait::async_trait]
-impl KeySource for TerminalKeys {
+impl<S> KeySource for TerminalKeys<S>
+where
+    S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Unpin + Send,
+{
     async fn next(&mut self) -> Option<Input> {
         loop {
-            match Self::step(&mut self.errors, self.stream.next().await) {
+            match step(&mut self.errors, self.stream.next().await) {
                 Step::Continue => {}
                 Step::Return(input) => return input,
             }
@@ -139,7 +155,7 @@ impl KeySource for tokio::sync::mpsc::UnboundedReceiver<Input> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
     use super::*;
 
@@ -154,6 +170,26 @@ mod tests {
         ))))
     }
 
+    fn key_release() -> Option<Result<Event, std::io::Error>> {
+        Some(Ok(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ))))
+    }
+
+    fn paste() -> Option<Result<Event, std::io::Error>> {
+        Some(Ok(Event::Paste("hi".to_string())))
+    }
+
+    fn resize() -> Option<Result<Event, std::io::Error>> {
+        Some(Ok(Event::Resize(80, 24)))
+    }
+
+    fn focus() -> Option<Result<Event, std::io::Error>> {
+        Some(Ok(Event::FocusGained))
+    }
+
     /// Guards the mapping `TerminalKeys::next` cannot be unit-tested
     /// through directly (it reads a real `EventStream`): a first read
     /// error is traced and the source stays open; a second consecutive
@@ -165,34 +201,84 @@ mod tests {
     fn a_second_consecutive_read_error_closes_the_source() {
         let mut errors = 0;
         assert_eq!(
-            TerminalKeys::step(&mut errors, err()),
+            step(&mut errors, err()),
             Step::Return(Some(Input::Errored("boom".to_string())))
         );
-        assert_eq!(TerminalKeys::step(&mut errors, err()), Step::Return(None));
+        assert_eq!(step(&mut errors, err()), Step::Return(None));
     }
 
-    /// A successful read in between resets the count: guards
-    /// `*errors = 0` on `step`'s `Ok` arms. Mutation: drop the reset on
-    /// the `Event::Key` arm — the third call below returns
-    /// `Step::Return(None)` instead of tracing again.
+    /// A successful read that reaches `next`'s caller (a key press, a
+    /// paste, a resize) resets the count in between two errors: guards
+    /// `step`'s `*errors = 0` on each `Return` arm. Mutation: drop the
+    /// reset on the arm named in the failure — the third call below
+    /// returns `Step::Return(None)` instead of tracing again.
     #[test]
     fn a_success_between_errors_resets_the_count() {
-        let mut errors = 0;
-        assert_eq!(
-            TerminalKeys::step(&mut errors, err()),
-            Step::Return(Some(Input::Errored("boom".to_string())))
-        );
-        assert_eq!(
-            TerminalKeys::step(&mut errors, key_press()),
-            Step::Return(Some(Input::Key(KeyEvent::new(
-                KeyCode::Char('a'),
-                KeyModifiers::NONE
-            ))))
-        );
-        assert_eq!(
-            TerminalKeys::step(&mut errors, err()),
-            Step::Return(Some(Input::Errored("boom".to_string()))),
-            "a reset counter should trace again rather than closing"
-        );
+        for (label, reset) in [
+            ("key press", key_press()),
+            ("paste", paste()),
+            ("resize", resize()),
+        ] {
+            let mut errors = 0;
+            assert_eq!(
+                step(&mut errors, err()),
+                Step::Return(Some(Input::Errored("boom".to_string())))
+            );
+            step(&mut errors, reset);
+            assert_eq!(
+                step(&mut errors, err()),
+                Step::Return(Some(Input::Errored("boom".to_string()))),
+                "a reset counter should trace again rather than closing ({label})"
+            );
+        }
+    }
+
+    /// A key release or a focus/mouse event is dropped (`Step::Continue`)
+    /// and must not reset the count: guards the arms that ignored this
+    /// on purpose, so an fd alternating an error with one of these
+    /// still reaches the threshold. Mutation: put `*errors = 0;` back
+    /// on the arm named in the failure — the second call below returns
+    /// `Step::Return(Some(Errored(..)))` instead of `Step::Return(None)`.
+    #[test]
+    fn an_ignored_event_between_errors_does_not_reset_the_count() {
+        for (label, ignored) in [("key release", key_release()), ("focus", focus())] {
+            let mut errors = 0;
+            assert_eq!(
+                step(&mut errors, err()),
+                Step::Return(Some(Input::Errored("boom".to_string())))
+            );
+            assert_eq!(
+                step(&mut errors, ignored),
+                Step::Continue,
+                "{label} should be dropped, not returned"
+            );
+            assert_eq!(
+                step(&mut errors, err()),
+                Step::Return(None),
+                "an ignored event ({label}) reset the error count"
+            );
+        }
+    }
+
+    /// Guards the counter itself, not just the pure mapping above: two
+    /// consecutive errors polled off a real (if scripted) stream, via
+    /// `TerminalKeys::next`, close the source — the `errors: u32` field
+    /// and the `&mut self.errors` that threads it between polls. The
+    /// tests above call `step` directly with a local counter, which
+    /// cannot exercise this: `next`'s loop, not `step`, is what carries
+    /// `errors` across `.await` points. Mutation: reset `self.errors`
+    /// to 0 at the top of `next`'s loop body — the second `next().await`
+    /// below then returns `Some(Errored(..))` again instead of `None`.
+    #[tokio::test]
+    async fn a_second_consecutive_read_error_closes_the_source_across_polls() {
+        let mut keys = TerminalKeys {
+            stream: futures_util::stream::iter([
+                Err(std::io::Error::other("boom")),
+                Err(std::io::Error::other("boom")),
+            ]),
+            errors: 0,
+        };
+        assert_eq!(keys.next().await, Some(Input::Errored("boom".to_string())));
+        assert_eq!(keys.next().await, None);
     }
 }
