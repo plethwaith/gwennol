@@ -337,9 +337,9 @@ mod tests {
     /// Guards the forced-exit path directly and deterministically. The
     /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
     /// does not pin `biased` in the running loop's `select!`: with it
-    /// removed, the key and the cancelled turn's own completion race, and
-    /// the mutant survives most runs (see run H's own comment). With a
-    /// cancel already pending from a first `/exit`, a second one
+    /// removed, the key and the cancelled turn's own completion race,
+    /// and the mutant survives most runs (see run H's own comment).
+    /// With a cancel already pending from a first `/exit`, a second one
     /// returns `ForceExit` here regardless of any scheduling.
     /// Mutation: swap the branches of the `ui.exiting` check
     /// (`ForceExit` when *not* already exiting) — the *first* assertion
@@ -382,8 +382,8 @@ mod tests {
     /// folded into `None`, the same as the source closing, and said
     /// nowhere) and `handle_key` returns no `Action`, so the loop keeps
     /// running rather than treating the trace as a hidden exit.
-    /// Mutation: fold `Input::Errored` into the `Input::Resize` arm (silently
-    /// discarded) — the first assertion below fails.
+    /// Mutation: fold `Input::Errored` into the `Input::Resize` arm
+    /// (silently discarded) — the first assertion below fails.
     #[test]
     fn a_read_error_is_traced_not_silently_treated_as_closed() {
         let shared = Shared::new();

@@ -845,7 +845,7 @@ async fn scenario() {
     // `a_second_exit_forces_the_session_out_while_the_first_is_pending`;
     // no test kills the running loop's `biased;` mutant reliably — this
     // run catches it only in the minority the figures above leave over
-    // (3/20 and 2/25), which is not a pin.
+    // (3/20 and 2/25).
     let driver = tokio::spawn(async move {
         type_line(&tx, "sleep");
         type_line(&tx, "/exit");

@@ -61,8 +61,9 @@ const MAX_CONSECUTIVE_READ_ERRORS: u32 = 2;
 pub struct TerminalKeys<S = EventStream> {
     stream: S,
     /// Consecutive read errors since the last successfully read event
-    /// that reached `next`'s caller; reset on `step`'s key press-or-repeat,
-    /// paste and resize arms only. See `MAX_CONSECUTIVE_READ_ERRORS`.
+    /// that reached `next`'s caller; reset on `step`'s key
+    /// press-or-repeat, paste and resize arms only. See
+    /// `MAX_CONSECUTIVE_READ_ERRORS`.
     errors: u32,
 }
 
@@ -91,13 +92,13 @@ impl TerminalKeys {
 /// plain `Option<Result<..>>` standing in for the poll) so a test does
 /// not need a real, breakable `EventStream` to exercise it in
 /// isolation. `errors` is reset on three arms only — a key press or
-/// repeat, a paste, a resize — the successful reads.
-/// The two arms that return `Step::Continue` (a key release; a focus
-/// or mouse event) leave it alone, so an `Err` run alternating with
-/// either still reaches `MAX_CONSECUTIVE_READ_ERRORS` instead of being
-/// masked by an event `next`'s caller never sees; the `Err` arm itself
-/// increments rather than resets, which is what lets a run of errors
-/// reach the threshold at all.
+/// repeat, a paste, a resize — the successful reads that reach
+/// `next`'s caller. The two arms that return `Step::Continue` (a key
+/// release; a focus or mouse event) leave it alone, so an `Err` run
+/// alternating with either still reaches `MAX_CONSECUTIVE_READ_ERRORS`
+/// instead of being masked by an event `next`'s caller never sees; the
+/// `Err` arm itself increments rather than resets, which is what lets
+/// a run of errors reach the threshold at all.
 fn step(errors: &mut u32, event: Option<Result<Event, std::io::Error>>) -> Step {
     match event {
         Some(Ok(Event::Key(key))) => {
@@ -217,9 +218,10 @@ mod tests {
 
     /// A successful read that reaches `next`'s caller (a key press, a
     /// paste, a resize) resets the count in between two errors: guards
-    /// `step`'s `*errors = 0` on each of its three success arms. Mutation: drop the
-    /// reset on the arm named in the failure — the third call below
-    /// returns `Step::Return(None)` instead of tracing again.
+    /// `step`'s `*errors = 0` on each of its three success arms.
+    /// Mutation: drop the reset on the arm named in the failure — the
+    /// third call below returns `Step::Return(None)` instead of tracing
+    /// again.
     #[test]
     fn a_success_between_errors_resets_the_count() {
         for (label, reset) in [
