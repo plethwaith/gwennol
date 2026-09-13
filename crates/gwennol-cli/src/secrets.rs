@@ -148,6 +148,37 @@ impl Secrets {
         read(&source).is_some()
     }
 
+    /// The lookup every operator answers `Operator::secret` with: reads
+    /// the value and logs where it came from at debug level, or that
+    /// none was found at info level (the same fact a startup warning
+    /// gave once, per request here).
+    pub fn supply(&self, plugin: &str, name: &str) -> Option<String> {
+        match self.lookup(plugin, name) {
+            Some((value, found)) => {
+                match found {
+                    Found::Rule { origin, source } => {
+                        tracing::debug!(plugin, name, %origin, ?source, "secret supplied")
+                    }
+                    Found::Convention(var) => {
+                        tracing::debug!(plugin, name, var, "secret supplied by convention")
+                    }
+                }
+                Some(value)
+            }
+            None => {
+                // Warned once at startup, when the manifest was read;
+                // here it is the same fact per request.
+                tracing::info!(
+                    plugin,
+                    name,
+                    "no value for secret: set {}",
+                    self.describe_source(plugin, name)
+                );
+                None
+            }
+        }
+    }
+
     /// What a missing pair should be set as, for the warning.
     pub fn describe_source(&self, plugin: &str, name: &str) -> String {
         match self.source_for(plugin, name) {
