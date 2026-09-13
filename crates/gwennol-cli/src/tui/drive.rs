@@ -336,14 +336,15 @@ mod tests {
 
     /// Guards the forced-exit path directly and deterministically: the
     /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
-    /// only pins `biased` in the running loop's `select!` 5 times in
-    /// 20 (removing it there still leaves 15/20 runs green, since the
-    /// key and the cancelled turn's own completion race). With a
+    /// only pins `biased` in the running loop's `select!` intermittently
+    /// (run H's own comment there records the measured rate), since the
+    /// key and the cancelled turn's own completion race. With a
     /// cancel already pending from a first `/exit`, a second one
     /// returns `ForceExit` here regardless of any scheduling.
     /// Mutation: swap the branches of the `ui.exiting` check
-    /// (`ForceExit` when *not* already exiting) — the second assertion
-    /// below fails immediately.
+    /// (`ForceExit` when *not* already exiting) — the *first* assertion
+    /// below fails: with no cancel pending yet, the first `/exit`
+    /// returns `Some(ForceExit)` instead of `None`.
     #[test]
     fn a_second_exit_forces_the_session_out_while_the_first_is_pending() {
         let shared = Shared::new();
@@ -379,14 +380,15 @@ mod tests {
 
     /// Guards `Input::Errored`: before this round a read error folded
     /// into `None`, the same as the source closing, said nowhere; it
-    /// traces the message instead. Mutation: fold `Input::Errored`
-    /// into the `Input::Resize` arm (silently discarded) — the
-    /// assertion below fails.
+    /// traces the message instead and returns no `Action`, so the loop
+    /// keeps running rather than treating the trace as a hidden exit.
+    /// Mutation: fold `Input::Errored` into the `Input::Resize` arm
+    /// (silently discarded) — the first assertion below fails.
     #[test]
     fn a_read_error_is_traced_not_silently_treated_as_closed() {
         let shared = Shared::new();
         let cancel = CancellationToken::new();
-        handle_key(
+        let action = handle_key(
             &shared,
             &cancel,
             false,
@@ -400,6 +402,10 @@ mod tests {
                 .any(|e| matches!(e, Entry::Trace(t) if t.contains("the terminal went away"))),
             "the read error was not traced: {:?}",
             shared.lock().entries
+        );
+        assert_eq!(
+            action, None,
+            "a read error was treated as an action instead of just a trace"
         );
     }
 
@@ -484,5 +490,37 @@ mod tests {
             }
         }
         assert!(found, "the redraw did not show the pushed entry");
+    }
+
+    /// Guards `idle_step`'s own `biased;` (distinct from the running
+    /// loop's, guarded only intermittently by run H in
+    /// `tests/interactive.rs`): with a key and a pending redraw both
+    /// ready, the key arm runs first, reaching the editor. Racy like
+    /// run H's pin: without `biased;`, `tokio::select!`'s own per-call
+    /// rotation still sometimes starts at the key arm anyway (measured
+    /// this round: 5/10 local runs of the mutation below still green).
+    /// Mutation: remove `biased;` from `idle_step`'s `select!`.
+    #[tokio::test]
+    async fn idle_step_handles_a_ready_key_before_a_ready_change() {
+        let shared = Shared::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+        let mut changes = shared.changed.subscribe();
+        tx.send(Input::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        // A pending redraw, ready alongside the key above.
+        shared.update(|ui| ui.push(Entry::Trace("gwennol: bump".to_string())));
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        idle_step(&shared, &mut terminal, &mut rx, &mut changes)
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.lock().editor.text(),
+            "a",
+            "the ready redraw was handled before the ready key"
+        );
     }
 }

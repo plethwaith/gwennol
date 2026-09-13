@@ -4,9 +4,13 @@
 //! out a guard cannot see. Bits already entered are recorded in a
 //! process-wide `AtomicU8`; the panic hook clears them and undoes what
 //! they named on stdout directly, since no guard is reachable from a
-//! panic. Restoring twice is harmless (every crossterm undo command is
-//! idempotent), so the guard and the hook never coordinate beyond the
-//! shared bits.
+//! panic. Restoring is not harmless to repeat for every command
+//! (`PopKeyboardEnhancementFlags` pops one real entry off the
+//! terminal's keyboard-enhancement stack, not a no-op the second
+//! time), so the guard's `Drop` only undoes what the shared bits still
+//! say is entered: if the panic hook already cleared and undid a bit
+//! during unwind, `Drop` running afterward on the same guard leaves it
+//! alone.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -63,10 +67,11 @@ impl<W: Write> Screen<W> {
         let outcome: io::Result<()> = (|| {
             // Marked before the write it covers is attempted, not
             // after: `queue!`'s two commands can fail between them, and
-            // recording optimistically means `undo` (idempotent) is
-            // asked to clean up a byte sequence that might have been
-            // partly written, rather than one the accounting says
-            // never was.
+            // recording optimistically means `undo`'s matching pair
+            // (safe to send even over a partial write, unlike
+            // `PopKeyboardEnhancementFlags` below) is asked to clean up
+            // a byte sequence that might have been partly written,
+            // rather than one the accounting says never was.
             bits |= SCREEN;
             ENTERED.fetch_or(SCREEN, Ordering::SeqCst);
             queue!(out, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -93,7 +98,14 @@ impl<W: Write> Screen<W> {
 
 impl<W: Write> Drop for Screen<W> {
     fn drop(&mut self) {
-        undo(&mut self.out, self.bits);
+        // A panic hook may have already run and undone some or all of
+        // `self.bits` (clearing them from `ENTERED` as it does) before
+        // this `drop` runs during the same unwind: only undo what
+        // `ENTERED` still records as entered, so a bit the hook already
+        // restored is not restored a second time (`PopKeyboardEnhancementFlags`
+        // is not safe to repeat: see the module doc).
+        let still_entered = ENTERED.load(Ordering::SeqCst) & self.bits;
+        undo(&mut self.out, still_entered);
         ENTERED.fetch_and(!self.bits, Ordering::SeqCst);
     }
 }
@@ -131,10 +143,16 @@ fn undo(out: &mut impl Write, bits: u8) {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Mutex;
 
     use crossterm::Command;
 
     use super::*;
+
+    /// The tests below share the process-wide `ENTERED`; serialized so
+    /// one test's `Screen` cannot see or clear another's concurrently
+    /// running bits.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// A `Write` sink two owners can inspect: `Screen` takes one clone,
     /// the test keeps the other.
@@ -162,6 +180,8 @@ mod tests {
     /// `LeaveAlternateScreen` in `undo`.
     #[test]
     fn the_guard_undoes_what_it_entered_in_reverse() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ENTERED.store(0, Ordering::SeqCst);
         let sink = Sink::default();
         let recorder = sink.0.clone();
         let screen = Screen::enter(sink, false, Kitty::On).unwrap();
@@ -181,6 +201,8 @@ mod tests {
 
     #[test]
     fn kitty_off_writes_no_kitty_sequence() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ENTERED.store(0, Ordering::SeqCst);
         let sink = Sink::default();
         let recorder = sink.0.clone();
         let screen = Screen::enter(sink, false, Kitty::Off).unwrap();
@@ -191,5 +213,46 @@ mod tests {
         expect.extend(bytes_of(DisableBracketedPaste));
         expect.extend(bytes_of(LeaveAlternateScreen));
         assert_eq!(*recorder.borrow(), expect);
+    }
+
+    /// Guards the `Drop`/panic-hook coordination: once a panic hook has
+    /// undone a guard's bits (clearing them from `ENTERED`, as
+    /// [`install_panic_hook`] does, simulated here by doing the same
+    /// directly), the same guard's `Drop` running afterward during
+    /// unwind must not repeat them — the terminal's
+    /// keyboard-enhancement stack has only one real entry to pop.
+    /// Mutation: undo `self.bits` unconditionally in `Drop` instead of
+    /// masking against `ENTERED` — the pop-disable-leave sequence
+    /// reappears in `recorder` a second time.
+    #[test]
+    fn drop_after_a_panic_hook_already_undid_the_bits_does_not_repeat_them() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ENTERED.store(0, Ordering::SeqCst);
+        let sink = Sink::default();
+        let recorder = sink.0.clone();
+        let screen = Screen::enter(sink, false, Kitty::On).unwrap();
+        recorder.borrow_mut().clear();
+
+        // What `install_panic_hook`'s closure does: swap `ENTERED` to
+        // 0 and undo those bits itself, on its own writer (the same
+        // sink here, so the bytes it writes are visible below).
+        let bits = ENTERED.swap(0, Ordering::SeqCst);
+        undo(&mut Sink(recorder.clone()), bits);
+        let after_hook = recorder.borrow().clone();
+        assert!(
+            !after_hook.is_empty(),
+            "the simulated panic hook wrote nothing to undo"
+        );
+
+        // `Screen`'s own `Drop`, running afterward as the panic
+        // unwinds: must not write the same undo bytes again.
+        drop(screen);
+        assert_eq!(
+            *recorder.borrow(),
+            after_hook,
+            "Drop repeated the panic hook's own undo"
+        );
+
+        ENTERED.store(0, Ordering::SeqCst);
     }
 }

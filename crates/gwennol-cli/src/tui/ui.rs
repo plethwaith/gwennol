@@ -29,8 +29,9 @@ pub enum Entry {
     /// to the most recent open one rather than opening a new entry.
     Assistant(String),
     /// A trace line: a decision, a call, its result, its failure, a
-    /// retry, or a startup warning, each `gwennol: `-prefixed;
-    /// `/help`'s lines ([`HELP`]) are pushed as written.
+    /// retry, a startup warning, an input-read error, or an event this
+    /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s lines
+    /// ([`HELP`]) are pushed as written.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -59,7 +60,11 @@ pub enum TurnState {
 /// The pane's entries, the turn's state, and the editor: everything a
 /// frame is drawn from.
 pub struct Ui {
-    /// Every line the pane holds, oldest first.
+    /// Every line the pane holds, oldest first. Callers outside `Ui`
+    /// must only read this, never mutate it: `revision` below is kept
+    /// in step with it by `Ui::push` and `Ui::apply` alone, and the
+    /// type cannot enforce that — a direct `ui.entries.push(...)` would
+    /// compile and leave `render_pane`'s cache silently stale.
     pub entries: Vec<Entry>,
     /// The index of the open `Assistant` entry, if any: where the next
     /// `Text` event appends.
@@ -70,7 +75,7 @@ pub struct Ui {
     pub editor: Editor,
     /// A message that replaces the status text until the next key (a
     /// Ctrl-C hint, an unknown command): `drive` clears it only on
-    /// `Input::Key`, not on a resize or a paste.
+    /// `Input::Key`, not on a resize, a paste, or an input-read error.
     pub notice: Option<String>,
     /// The session ends once the running turn finishes: set by
     /// a `/exit` submitted while a turn is running, or by the key
@@ -90,8 +95,8 @@ pub struct Ui {
     pane_cache: std::cell::RefCell<Option<PaneCache>>,
 }
 
-/// One wrapped, styled row of `render_pane`'s output, cached against
-/// the `(revision, width)` it was computed at.
+/// `render_pane`'s wrapped, styled rows and the `(revision, width)`
+/// they were computed at.
 type PaneCache = (u64, u16, Vec<(String, Style)>);
 
 impl Default for Ui {
@@ -136,10 +141,11 @@ impl Ui {
                             existing.push_str(&text);
                         }
                     }
-                    // `open` names a non-`Assistant` entry: every
-                    // event that sets it also closes it (`push`), so
-                    // this should not happen; a new entry keeps the
-                    // text rather than dropping it silently.
+                    // Normally `open` is `None` and this opens the turn's next
+                    // `Assistant` entry. It could in principle name a
+                    // non-`Assistant` one — every event that sets `open` also closes
+                    // it (`push`) — which the assert below pins; either way the
+                    // text is kept rather than dropped silently.
                     _ => {
                         debug_assert!(self.open.is_none(), "open pointed at a non-Assistant entry");
                         self.push(Entry::Assistant(text));
@@ -194,9 +200,9 @@ impl Ui {
             Event::TurnComplete => {
                 self.open = None;
             }
-            // Unbounded and unscrubbed like every other trace line
-            // would be without it: `show::preview` bounds and
-            // one-lines it, the same treatment a tool result gets.
+            // Bounded and one-lined through `show::preview`, the
+            // treatment a tool result's own text gets; the `{other:?}`
+            // form would otherwise go into the pane whole.
             other => self.push(Entry::Trace(format!(
                 "gwennol: event this frontend cannot show: {}",
                 show::preview(&format!("{other:?}"))
@@ -859,5 +865,61 @@ mod tests {
             "a resize reused rows wrapped at the old, narrower width"
         );
         assert_eq!(row(wide_buf, 1, 40).trim_end(), "");
+    }
+
+    /// Guards the `revision` bump at the top of `apply` itself, load-
+    /// bearing for the two arms that mutate `entries` in place rather
+    /// than through `push`: a streamed `Text` chunk appended to an
+    /// already-open `Assistant` entry must invalidate the pane cache
+    /// the same as a `push` does.
+    /// `the_pane_cache_invalidates_on_new_entries_and_on_resize` does
+    /// not cover this: it only drives `Ui::push` and a width change.
+    /// Mutation: delete `self.revision = self.revision.wrapping_add(1);`
+    /// from `apply` — the second draw below still shows only "aaa".
+    #[test]
+    fn a_streamed_append_invalidates_the_pane_cache() {
+        let mut ui = Ui::default();
+        ui.apply(Event::Text("aaa".to_string()), 0);
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert!(row(terminal.backend().buffer(), 0, 20).contains("aaa"));
+
+        ui.apply(Event::Text("bbb".to_string()), 0);
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert!(
+            row(terminal.backend().buffer(), 0, 20).contains("aaabbb"),
+            "the pane showed a stale frame after a streamed append: {:?}",
+            row(terminal.backend().buffer(), 0, 20)
+        );
+    }
+
+    /// Same bump, the retraction side: `apply`'s `Event::Retry` arm
+    /// over an already-open entry also mutates `entries` in place.
+    /// Mutation: delete the same `revision` bump — the second draw
+    /// below still shows "partial" after the retraction.
+    #[test]
+    fn a_retry_over_an_open_entry_invalidates_the_pane_cache() {
+        let mut ui = Ui::default();
+        ui.apply(Event::Text("partial".to_string()), 0);
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert!(row(terminal.backend().buffer(), 0, 20).contains("partial"));
+
+        ui.apply(
+            Event::Retry {
+                attempt: 2,
+                max_attempts: 3,
+                failure: failure("overloaded"),
+            },
+            0,
+        );
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert!(
+            !row(terminal.backend().buffer(), 0, 20).contains("partial"),
+            "the retracted partial text is still on screen: {:?}",
+            row(terminal.backend().buffer(), 0, 20)
+        );
     }
 }

@@ -116,8 +116,9 @@ impl Editor {
     }
 
     /// Push the current text to history (unless it equals the last
-    /// entry) and clear the buffer. Called for every recognized
-    /// submission: a turn, `/help`, and `/exit`.
+    /// entry) and clear the buffer. Called for `/exit`, `/help`, and a
+    /// turn that is actually sent; a turn typed while one is running
+    /// is left in the buffer.
     pub fn commit(&mut self) {
         let text: String = self.text.iter().collect();
         if self.history.last() != Some(&text) {
@@ -432,30 +433,50 @@ mod tests {
         );
     }
 
-    /// Before this round, only `insert` reset `browsing`, so an edit
-    /// made to a history entry mid-browse (Backspace here) did not
-    /// detach from it, and a later Down (with nothing newer in
-    /// history) discarded the edit and restored the pre-Up draft
-    /// instead of leaving the edited text alone. Mutation: drop
-    /// `self.browsing = None;` from `delete_left` — the last assertion
-    /// below fails, `editor.text()` reading back "draft".
+    /// Before this round no deletion reset `browsing` (only `insert`,
+    /// `commit` and `history_down`'s restore arm did), so an edit made
+    /// to a history entry mid-browse did not detach from it, and a
+    /// later Down (with nothing newer in history) discarded the edit
+    /// and restored the pre-Up draft instead of leaving it alone.
+    /// Looped over all four deletion keys: `delete_left` (Backspace),
+    /// `delete_right` (Delete), `delete_word_left` (Ctrl-W) and
+    /// `delete_word_right` (Alt-D) each reset `browsing` on their own;
+    /// dropping any single `self.browsing = None;` line leaves that
+    /// iteration's last assertion failing, `editor.text()` reading
+    /// back "draft".
     #[test]
     fn deleting_while_browsing_history_detaches_from_it() {
-        let mut editor = Editor::default();
-        type_text(&mut editor, "first");
-        editor.commit();
-        type_text(&mut editor, "draft");
-        editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(editor.text(), "first");
+        for (code, modifiers) in [
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Delete, KeyModifiers::NONE),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::ALT),
+        ] {
+            let mut editor = Editor::default();
+            type_text(&mut editor, "first");
+            editor.commit();
+            type_text(&mut editor, "draft");
+            editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(
+                editor.text(),
+                "first",
+                "{code:?}+{modifiers:?}: Up did not browse to history"
+            );
 
-        editor.key(&key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(editor.text(), "firs");
+            editor.key(&key(code, modifiers));
+            let after_delete = editor.text();
 
-        // Down is now a plain no-op: the edit detached `browsing`
-        // above, so there is nothing left to navigate away from, and
-        // the edited text is left as it is rather than being replaced
-        // by the pre-Up draft or by a history entry.
-        editor.key(&key(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(editor.text(), "firs");
+            // Down is now a plain no-op: the deletion detached
+            // `browsing` above, so there is nothing left to navigate
+            // away from, and the text the deletion left is kept
+            // rather than being replaced by the pre-Up draft or by a
+            // history entry.
+            editor.key(&key(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(
+                editor.text(),
+                after_delete,
+                "{code:?}+{modifiers:?}: Down did not stay detached from history"
+            );
+        }
     }
 }

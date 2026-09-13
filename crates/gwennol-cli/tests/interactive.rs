@@ -192,9 +192,11 @@ async fn run_drive(
 /// Clear the editor and any notice between runs. Production never
 /// needs this — `/exit` ends the process, so a stale editor never
 /// meets a later turn — but this suite's runs share one `Ui` across
-/// several `drive` calls (D12), and a run that ends in a cancel
-/// leaves the uncommitted draft behind (D9): un-cleared, the next
-/// run's typed text lands after it and reads as one plain turn.
+/// several `drive` calls (D12), and defensively so: a cancelled turn
+/// leaves the draft in place rather than clearing it (D9), so an
+/// un-cleared editor could in principle carry text into the next run
+/// and have it read as one plain turn, even though every run in this
+/// suite today happens to end on a committed submission instead.
 fn reset_editor(shared: &std::sync::Arc<Shared>) {
     shared.update(|ui| {
         ui.editor = gwennol::tui::editor::Editor::default();
@@ -486,8 +488,8 @@ async fn scenario() {
     // uncommitted "draft" in the editor (D9: a cancel never touches
     // it), so the driver clears it with Backspace before typing
     // `/exit` — typed straight onto "draft" it would read as one
-    // unknown word, `draft/exit`, and land as a plain turn instead of
-    // the exit command, exactly as a real, un-cleared editor would.
+    // word, `draft/exit`, and land as a plain turn instead of the exit
+    // command, exactly as a real, un-cleared editor would.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let editor_had_draft = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -793,11 +795,11 @@ async fn scenario() {
     // treated as a running `/exit`: cancelled, then unwound. Nothing
     // exercised this before this round — run F closes the source
     // while idle, and the row's own name, "key source closes", had
-    // been credited to what is now run I below, whose channel in fact
-    // never closes (a clone is moved into the driver; the outer `tx`
-    // outlives the whole scenario). A fresh channel, moved (not
-    // cloned) into the driver, so it is this run's only sender and
-    // closes the moment the driver task ends.
+    // been credited to what is now run H below, which forces the
+    // session out through a second `/exit` before its channel closing
+    // would ever matter. A fresh channel, moved (not cloned) into the
+    // driver, so it is this run's only sender and closes the moment
+    // the driver task ends.
     let start = shared.lock().entries.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let driver = tokio::spawn(async move {
@@ -825,29 +827,30 @@ async fn scenario() {
     }
 
     reset_editor(&shared);
-    // A closed key source ends this test: later runs need a fresh
-    // channel.
+    // Runs F and G each closed their own key source; the last one
+    // stays closed, so run H needs a fresh channel.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
 
-    // ---- run I: a second /exit forces the session out at once.
-    let driver = {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            type_line(&tx, "sleep");
-            type_line(&tx, "/exit");
-            type_line(&tx, "/exit");
-        })
-    };
+    // ---- run H: a second /exit forces the session out at once. This
+    // also, intermittently, pins the running loop's `biased;`
+    // (`drive.rs:205`): removing it leaves the key and the cancelled
+    // turn's own completion racing, so the mutant still passes some
+    // runs (3/10 in a local run) rather than being reliably killed.
+    let driver = tokio::spawn(async move {
+        type_line(&tx, "sleep");
+        type_line(&tx, "/exit");
+        type_line(&tx, "/exit");
+    });
     let began = std::time::Instant::now();
     let code = run_drive(session, &shared, &mut rx, None).await;
     driver.await.unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(10),
-        "run I: forced exit took too long"
+        "run H: forced exit took too long"
     );
     assert_eq!(
         code,
         ExitCode::from(130),
-        "run I: a second /exit forces status 130"
+        "run H: a second /exit forces status 130"
     );
 }
