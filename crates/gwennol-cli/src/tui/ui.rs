@@ -29,7 +29,8 @@ pub enum Entry {
     /// to the most recent open one rather than opening a new entry.
     Assistant(String),
     /// A trace line: a decision, a call, its result, its failure, a
-    /// retry, or a startup warning. Always `gwennol: `-prefixed.
+    /// retry, or a startup warning, each `gwennol: `-prefixed;
+    /// `/help`'s lines ([`HELP`]) are pushed as written.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -43,8 +44,9 @@ pub enum TurnState {
     /// A turn is running; the model has not spoken yet, or is between
     /// tool rounds.
     Working {
-        /// When the turn (or the round since its last `ToolResult`)
-        /// started; carried across state changes within one turn.
+        /// When the turn started; carried unchanged across every
+        /// state change within one turn, so the status line's seconds
+        /// are the turn's, not the round's.
         since: Instant,
     },
     /// The model is producing text or asked for a tool.
@@ -66,15 +68,31 @@ pub struct Ui {
     pub turn: TurnState,
     /// The line editor.
     pub editor: Editor,
-    /// A message that replaces the status text until the next key
-    /// (a Ctrl-C hint, an unknown command).
+    /// A message that replaces the status text until the next key (a
+    /// Ctrl-C hint, an unknown command): `drive` clears it only on
+    /// `Input::Key`, not on a resize or a paste.
     pub notice: Option<String>,
-    /// `/exit` was pressed while a turn was unwinding: the loop
-    /// returns once it does.
+    /// The session ends once the running turn finishes: set by
+    /// a `/exit` submitted while a turn is running, or by the key
+    /// source closing then. `drive` takes it after the outcome.
     pub exiting: bool,
     /// Bumped on every redraw tick, for the spinner frame.
     pub tick: usize,
+    /// Bumped whenever `entries` or `open` changes in a way that could
+    /// change what `render_pane` draws (every [`Ui::push`] and every
+    /// call to [`Ui::apply`]). `render_pane` rewraps the whole
+    /// transcript only when this, or the pane's width, differs from
+    /// the cached frame: the 100ms tick and a redraw it triggers
+    /// otherwise rewrap on every frame for a spinner character alone.
+    revision: u64,
+    /// `render_pane`'s last computed rows, and the `(revision, width)`
+    /// they were computed at.
+    pane_cache: std::cell::RefCell<Option<PaneCache>>,
 }
+
+/// One wrapped, styled row of `render_pane`'s output, cached against
+/// the `(revision, width)` it was computed at.
+type PaneCache = (u64, u16, Vec<(String, Style)>);
 
 impl Default for Ui {
     fn default() -> Self {
@@ -86,6 +104,8 @@ impl Default for Ui {
             notice: None,
             exiting: false,
             tick: 0,
+            revision: 0,
+            pane_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -102,19 +122,28 @@ impl Ui {
         } else {
             None
         };
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Map one loop event onto the pane and the turn state (D6).
     pub fn apply(&mut self, event: Event, verbosity: u8) {
+        self.revision = self.revision.wrapping_add(1);
         match event {
             Event::Text(text) => {
                 match self.open {
-                    Some(idx) => {
+                    Some(idx) if matches!(self.entries[idx], Entry::Assistant(_)) => {
                         if let Entry::Assistant(existing) = &mut self.entries[idx] {
                             existing.push_str(&text);
                         }
                     }
-                    None => self.push(Entry::Assistant(text)),
+                    // `open` names a non-`Assistant` entry: every
+                    // event that sets it also closes it (`push`), so
+                    // this should not happen; a new entry keeps the
+                    // text rather than dropping it silently.
+                    _ => {
+                        debug_assert!(self.open.is_none(), "open pointed at a non-Assistant entry");
+                        self.push(Entry::Assistant(text));
+                    }
                 }
                 self.turn = TurnState::Streaming {
                     since: self.since(),
@@ -165,8 +194,12 @@ impl Ui {
             Event::TurnComplete => {
                 self.open = None;
             }
+            // Unbounded and unscrubbed like every other trace line
+            // would be without it: `show::preview` bounds and
+            // one-lines it, the same treatment a tool result gets.
             other => self.push(Entry::Trace(format!(
-                "gwennol: event this frontend cannot show: {other:?}"
+                "gwennol: event this frontend cannot show: {}",
+                show::preview(&format!("{other:?}"))
             ))),
         }
     }
@@ -196,7 +229,7 @@ impl Ui {
     }
 }
 
-/// A process-wide handle to the `Ui` a loop drives and other tasks
+/// A shared handle to the `Ui` a loop drives and other tasks
 /// (a running turn, a host step awaiting approval) update.
 pub struct Shared {
     ui: Mutex<Ui>,
@@ -296,17 +329,22 @@ fn text_of(entry: &Entry) -> &str {
     }
 }
 
-/// The window of `text` (as `char`s) that fits a `width`-column row
-/// ending at `cursor`, and the cursor's column offset within it: no
-/// scrolling while the cursor and the text before it fit, else a
-/// window that keeps the cursor in view at the row's last column.
+/// The tail of `text` (as `char`s) from the column a `width`-column
+/// row ending at `cursor` would start at, and the cursor's column
+/// offset within it: no scrolling while the cursor and the text
+/// before it fit, else a start that keeps the cursor in view at the
+/// row's last column. Not clipped on the right to `width`: the
+/// caller's `buf.set_stringn` truncates.
 fn editor_window(text: &[char], cursor: usize, width: usize) -> (String, usize) {
     let start = if cursor + 2 >= width {
         (cursor + 3).saturating_sub(width)
     } else {
         0
     };
-    let start = start.min(text.len());
+    // `width` under 3 can put `start` past `cursor` (`cursor + 3 -
+    // width` grows faster than `cursor` as `width` shrinks below 3);
+    // clamped so the offset below never underflows.
+    let start = start.min(cursor).min(text.len());
     let window: String = text[start..].iter().collect();
     (window, cursor - start)
 }
@@ -333,15 +371,35 @@ impl Widget for View<'_> {
 }
 
 fn render_pane(ui: &Ui, area: Rect, buf: &mut Buffer) {
-    let width = area.width as usize;
-    let mut rows: Vec<(String, Style)> = Vec::new();
-    for entry in &ui.entries {
-        let style = style_of(entry);
-        for row in wrap(text_of(entry), width) {
-            rows.push((row, style));
-        }
+    // `regions` can hand back a rect [`Layout`] could not actually fit
+    // inside `buf`'s area when the frame is shorter than the three
+    // fixed rows it asks for (`Length(1)` twice plus `Min(1)`); clipped
+    // to what the buffer really has before any `set_stringn` below
+    // indexes it, rather than trusting the sub-rect's own bounds.
+    let area = area.intersection(buf.area);
+    if area.width == 0 || area.height == 0 {
+        return;
     }
+    let width = area.width as usize;
     let height = area.height as usize;
+    // Rewrapping the whole, unbounded transcript is only worth
+    // redoing when `entries`/`open` (`revision`) or the pane's width
+    // changed since the last frame: the 100ms tick redraws for the
+    // spinner alone, and the `changed()` arm it also triggers would
+    // otherwise redo this same work a second time right after.
+    let mut cache = ui.pane_cache.borrow_mut();
+    let fresh = matches!(&*cache, Some((rev, w, _)) if *rev == ui.revision && *w == area.width);
+    if !fresh {
+        let mut rows: Vec<(String, Style)> = Vec::new();
+        for entry in &ui.entries {
+            let style = style_of(entry);
+            for row in wrap(text_of(entry), width) {
+                rows.push((row, style));
+            }
+        }
+        *cache = Some((ui.revision, area.width, rows));
+    }
+    let rows = &cache.as_ref().expect("just populated above").2;
     let start = rows.len().saturating_sub(height);
     for (i, (row, style)) in rows[start..].iter().enumerate() {
         buf.set_stringn(area.x, area.y + i as u16, row, width, *style);
@@ -365,6 +423,12 @@ fn status_text(ui: &Ui) -> String {
 }
 
 fn render_status(ui: &Ui, area: Rect, buf: &mut Buffer) {
+    // See `render_pane`: `area` can lie outside `buf` on a too-short
+    // frame.
+    let area = area.intersection(buf.area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let width = area.width as usize;
     buf.set_stringn(
         area.x,
@@ -376,6 +440,12 @@ fn render_status(ui: &Ui, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_editor(ui: &Ui, area: Rect, buf: &mut Buffer) {
+    // See `render_pane`: `area` can lie outside `buf` on a too-short
+    // frame.
+    let area = area.intersection(buf.area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let width = area.width as usize;
     let chars: Vec<char> = ui.editor.text().chars().collect();
     let (window, _) = editor_window(&chars, ui.editor.cursor(), width);
@@ -601,5 +671,193 @@ mod tests {
             scrolled.editor.text().chars().last(),
             "editor row does not end at the cursor: {editor_row:?}"
         );
+    }
+
+    /// Guards two panics on a terminal under three rows: `regions`
+    /// splits `Min(1)/Length(1)/Length(1)`, so below three rows the
+    /// status or editor area's `y` falls outside the buffer and
+    /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
+    /// `cursor - start` underflowed once `width < 3`. Mutation: drop
+    /// either guard — `TestBackend::new(80, 1)` or `(80, 2)` then
+    /// panics with "index outside of buffer"; a 5-char buffer at
+    /// width 1 or 2 panics with "attempt to subtract with overflow".
+    #[test]
+    fn a_too_small_terminal_neither_panics_nor_runs_the_cursor_past_the_window() {
+        let mut ui = Ui::default();
+        ui.push(Entry::Assistant("hi".to_string()));
+        for (w, h) in [(80u16, 1u16), (80, 2), (80, 3), (1, 6)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render(&ui, f))
+                .unwrap_or_else(|e| panic!("{w}x{h} failed to draw: {e}"));
+        }
+
+        let text: Vec<char> = "abcde".chars().collect();
+        for width in [1usize, 2, 3, 80] {
+            let (window, offset) = editor_window(&text, 4, width);
+            assert!(
+                offset <= window.chars().count(),
+                "width {width}: offset {offset} exceeds window {window:?}"
+            );
+        }
+    }
+
+    /// Guards D8's status line, previously pinned only by the idle
+    /// string: a notice overrides the state text; `Working` and
+    /// `Streaming` render distinct prefixes; two different `tick`
+    /// values give two different spinner frames. Mutation: replace
+    /// `"working {frame} …"`/`"streaming {frame} …"` with fixed
+    /// strings, or `SPINNER[ui.tick % SPINNER.len()]` with
+    /// `SPINNER[0]` — either leaves this red.
+    #[test]
+    fn the_status_line_shows_the_notice_the_state_and_the_spinner() {
+        let mut ui = Ui::default();
+        assert_eq!(status_text(&ui), "/help for commands");
+
+        ui.notice = Some("a notice".to_string());
+        assert_eq!(status_text(&ui), "a notice");
+        ui.notice = None;
+
+        ui.turn = TurnState::Working {
+            since: Instant::now(),
+        };
+        assert!(
+            status_text(&ui).starts_with("working "),
+            "{}",
+            status_text(&ui)
+        );
+        ui.turn = TurnState::Streaming {
+            since: Instant::now(),
+        };
+        assert!(
+            status_text(&ui).starts_with("streaming "),
+            "{}",
+            status_text(&ui)
+        );
+
+        ui.tick = 0;
+        let frame0 = status_text(&ui);
+        ui.tick = 1;
+        let frame1 = status_text(&ui);
+        assert_ne!(frame0, frame1, "the spinner did not change with tick");
+    }
+
+    /// Guards the cursor's screen column, previously unpinned: the
+    /// terminal's reported cursor position tracks the editor's own
+    /// cursor as it moves. Mutation: replace the computed `x` with
+    /// `editor_area.x` — both assertions below fail.
+    #[test]
+    fn the_terminal_cursor_tracks_the_editor_cursor() {
+        let mut ui = Ui::default();
+        for c in "hello".chars() {
+            ui.editor.key(&crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(2 + 5, 5)
+        );
+
+        ui.editor.key(&crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(2 + 4, 5)
+        );
+    }
+
+    /// Guards `style_of`, previously unpinned: each entry kind renders
+    /// with its own style. Mutation: collapse every arm to
+    /// `Style::new()` — every assertion below fails.
+    #[test]
+    fn entries_render_with_their_kind_style() {
+        let mut ui = Ui::default();
+        ui.push(Entry::User("u".to_string()));
+        ui.push(Entry::Assistant("a".to_string()));
+        ui.push(Entry::Trace("t".to_string()));
+        ui.push(Entry::Outcome("o".to_string()));
+        let backend = TestBackend::new(20, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::BOLD),
+            "User is not bold"
+        );
+        assert!(
+            !buf[(0, 1)].modifier.contains(Modifier::BOLD),
+            "Assistant is bold"
+        );
+        assert!(
+            !buf[(0, 1)].modifier.contains(Modifier::DIM),
+            "Assistant is dim"
+        );
+        assert!(
+            buf[(0, 2)].modifier.contains(Modifier::DIM),
+            "Trace is not dim"
+        );
+        assert!(
+            buf[(0, 3)].modifier.contains(Modifier::DIM),
+            "Outcome is not dim"
+        );
+    }
+
+    /// Guards the pane's render cache (an unbounded rewrap on every
+    /// frame before this round): a render after `entries` changed shows
+    /// the new content, not a stale cached frame; the cache is keyed
+    /// on width too, so a resize is not served the old width's rows.
+    /// Mutation: drop `revision` (or `width`) from the cache key
+    /// comparison in `render_pane` — the second draw below still
+    /// shows only "first" (or the 20-column wrapping).
+    #[test]
+    fn the_pane_cache_invalidates_on_new_entries_and_on_resize() {
+        let mut ui = Ui::default();
+        ui.push(Entry::Trace("gwennol: first".to_string()));
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert!(row(terminal.backend().buffer(), 0, 20).contains("first"));
+
+        ui.push(Entry::Trace("gwennol: second".to_string()));
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(row(buf, 0, 20).contains("first"));
+        assert!(row(buf, 1, 20).contains("second"));
+
+        // A resize (a fresh, wider backend) rewraps rather than
+        // reusing rows cached at the old width: this entry is long
+        // enough to wrap across two rows at 20 columns but fits one
+        // at 40, so a stale, narrower cache would visibly split it.
+        let mut wrapping = Ui::default();
+        wrapping.push(Entry::Trace("gwennol: twenty-six characters".to_string()));
+        let narrow_backend = TestBackend::new(20, 6);
+        let mut narrow_terminal = Terminal::new(narrow_backend).unwrap();
+        narrow_terminal.draw(|f| render(&wrapping, f)).unwrap();
+        let narrow_buf = narrow_terminal.backend().buffer();
+        assert!(
+            row(narrow_buf, 1, 20).trim_end() != "",
+            "fixture does not wrap at 20 columns: {:?}",
+            row(narrow_buf, 0, 20)
+        );
+
+        let wide_backend = TestBackend::new(40, 6);
+        let mut wide_terminal = Terminal::new(wide_backend).unwrap();
+        wide_terminal.draw(|f| render(&wrapping, f)).unwrap();
+        let wide_buf = wide_terminal.backend().buffer();
+        assert_eq!(
+            row(wide_buf, 0, 40).trim_end(),
+            "gwennol: twenty-six characters",
+            "a resize reused rows wrapped at the old, narrower width"
+        );
+        assert_eq!(row(wide_buf, 1, 40).trim_end(), "");
     }
 }

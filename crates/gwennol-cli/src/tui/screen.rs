@@ -50,6 +50,10 @@ impl<W: Write> Screen<W> {
         if raw {
             terminal::enable_raw_mode()?;
             bits |= RAW;
+            // Recorded as soon as it is true, not batched until the
+            // whole function returns: a panic between here and the end
+            // (D5's case) must still see raw mode as entered.
+            ENTERED.fetch_or(RAW, Ordering::SeqCst);
         }
         let want_kitty = match kitty {
             Kitty::Probe => terminal::supports_keyboard_enhancement().unwrap_or(false),
@@ -57,24 +61,32 @@ impl<W: Write> Screen<W> {
             Kitty::Off => false,
         };
         let outcome: io::Result<()> = (|| {
-            queue!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+            // Marked before the write it covers is attempted, not
+            // after: `queue!`'s two commands can fail between them, and
+            // recording optimistically means `undo` (idempotent) is
+            // asked to clean up a byte sequence that might have been
+            // partly written, rather than one the accounting says
+            // never was.
             bits |= SCREEN;
+            ENTERED.fetch_or(SCREEN, Ordering::SeqCst);
+            queue!(out, EnterAlternateScreen, EnableBracketedPaste)?;
             if want_kitty {
+                bits |= KITTY;
+                ENTERED.fetch_or(KITTY, Ordering::SeqCst);
                 queue!(
                     out,
                     PushKeyboardEnhancementFlags(
                         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     )
                 )?;
-                bits |= KITTY;
             }
             out.flush()
         })();
         if let Err(e) = outcome {
             undo(&mut out, bits);
+            ENTERED.fetch_and(!bits, Ordering::SeqCst);
             return Err(e);
         }
-        ENTERED.fetch_or(bits, Ordering::SeqCst);
         Ok(Self { out, bits })
     }
 }

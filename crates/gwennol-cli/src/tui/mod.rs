@@ -37,12 +37,19 @@ use ui::{Entry, Shared};
 
 /// Boot for a session: `frontend::start` with the interactive operator,
 /// the startup warnings as the pane's first entries. No terminal state
-/// is touched: a startup error prints to a normal terminal.
+/// is touched: a startup error prints to a normal terminal. `--transcript`
+/// is print mode only (`lib.rs`'s help says so): a session rejects it
+/// here rather than silently writing nothing.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
 ) -> Result<(Session, Arc<Shared>), Fatal> {
+    if cli.transcript.is_some() {
+        return Err(Fatal(
+            "--transcript is print-mode only (-p); a session does not write one".to_string(),
+        ));
+    }
     let shared = Shared::new();
     let mut warnings = Vec::new();
     let session = frontend::start(
@@ -76,8 +83,10 @@ pub async fn run(
 ) -> Result<ExitCode, Fatal> {
     let (mut session, shared) = start(&cli, workspace, flag_rules)?;
     screen::install_panic_hook();
-    let screen = Screen::enter(std::io::stdout(), true, Kitty::Probe)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let screen = Screen::enter(std::io::stdout(), true, Kitty::Probe)
+        .map_err(|e| Fatal(format!("terminal setup: {e}")))?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))
+        .map_err(|e| Fatal(format!("terminal: {e}")))?;
     let mut keys = TerminalKeys::new();
     let code = drive(
         &mut session,
@@ -98,15 +107,25 @@ mod tests {
 
     use super::*;
 
-    /// `tui::start` shows a startup warning it would otherwise only
-    /// log, as the pane's first entry. This is the only unit test in
-    /// this crate that boots the host (`gwennol_core::host`'s
-    /// `OnceLock` installs once per process; nothing else here reaches
-    /// `boot_with`). Assumes `GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY`
-    /// is unset in the test environment, as it is in CI: the convention
-    /// variable is the last of three sources this run supplies none of.
-    /// Guards D3. Mutation: remove `warnings.push` in `frontend.rs` —
-    /// no entry.
+    /// `tui::start` shows every startup warning it would otherwise
+    /// only log, as the pane's first entries, in the order `start`
+    /// produces them: the empty-policy warning (no `--allow`/`--deny`
+    /// given), then each declared-secret warning. This is the only
+    /// unit test in this crate that boots the host
+    /// (`gwennol_core::host`'s `OnceLock` installs once per process,
+    /// and `boot_with` fails every call after the first with
+    /// `BootError::AlreadyInstalled`; nothing else here reaches it),
+    /// so both warnings are guarded in this one test rather than a
+    /// second that would need its own boot. An explicit `--secret`
+    /// rule points the lookup at an environment variable this test
+    /// names and never sets, rather than the convention variable
+    /// `GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY`, which a
+    /// developer's own shell may have set for real use — a rule
+    /// always wins over the convention variable (`secrets.rs`'s
+    /// `source_for`), so this is isolated from the machine's
+    /// environment regardless. Guards D3. Mutations: remove either
+    /// `warnings.push` in `frontend.rs` — one entry instead of two,
+    /// or the wrong one missing.
     #[test]
     fn startup_warnings_are_the_first_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -131,21 +150,53 @@ mod tests {
             provider_anthropic::PLUGIN_NAME,
             "--config",
             config_path.to_str().unwrap(),
+            "--secret",
+            &format!(
+                "{}:api_key=env:GWENNOL_TEST_STARTUP_WARNING_38_UNSET",
+                provider_anthropic::PLUGIN_NAME
+            ),
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
-
+        // No --allow/--deny rule at all: the empty-policy warning
+        // fires too, and (per `start`'s own order) precedes the
+        // declared-secret one below.
         let (_session, shared) = start(&cli, workspace, Vec::new()).unwrap();
         let guard = shared.lock();
-        assert_eq!(guard.entries.len(), 1, "{:?}", guard.entries);
-        match &guard.entries[0] {
+        assert_eq!(guard.entries.len(), 2, "{:?}", guard.entries);
+        assert_eq!(
+            guard.entries[0],
+            Entry::Trace("gwennol: no approval rules: every request will be denied".to_string())
+        );
+        match &guard.entries[1] {
             Entry::Trace(text) => assert!(
                 text.starts_with(
                     "gwennol: plugin provider-anthropic declares secret \"api_key\" \
-                     but no source has it: set "
+                     but no source has it: set environment variable \
+                     GWENNOL_TEST_STARTUP_WARNING_38_UNSET"
                 ),
                 "{text}"
             ),
             other => panic!("expected a Trace entry, got {other:?}"),
+        }
+    }
+
+    /// `tui::start` rejects `--transcript` outright rather than
+    /// accepting it and silently writing nothing, as a session did
+    /// before this round (`lib.rs`'s help now says print-mode only).
+    /// The check runs before the plugin bundle would be needed, so
+    /// this needs none. Mutation: drop the `cli.transcript.is_some()`
+    /// check — `start` then fails on the missing bundle instead, with
+    /// no mention of `--transcript`.
+    #[test]
+    fn a_session_rejects_transcript() {
+        let matches = Cli::command().get_matches_from(["gwennol", "--transcript", "/tmp/x"]);
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        match start(&cli, PathBuf::from("."), Vec::new()) {
+            Err(Fatal(message)) => assert!(
+                message.contains("--transcript"),
+                "wrong rejection reason: {message}"
+            ),
+            Ok(_) => panic!("expected --transcript to be rejected"),
         }
     }
 }

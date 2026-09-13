@@ -73,3 +73,80 @@ impl Operator for Interactive {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gwennol_core::ToolCall;
+
+    use super::*;
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: Some("t1".to_string()),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    fn last_trace(shared: &Arc<Shared>) -> String {
+        match shared.lock().entries.last() {
+            Some(Entry::Trace(t)) => t.clone(),
+            other => panic!("expected a Trace entry, got {other:?}"),
+        }
+    }
+
+    /// Guards the session's `-v` (no test before this round;
+    /// `show::tool_result`'s verbosity branch was exercised only
+    /// through `headless.rs`): `emit` passes its own `verbosity`
+    /// to `Ui::apply`, not a hardcoded value, so a multi-line result
+    /// shows whole at `-v` and cut to one line without it. Mutation:
+    /// hardcode `ui.apply(event, 0)` in `emit` — the first assertion
+    /// below fails (the whole-content run instead shows a preview).
+    #[test]
+    fn emit_passes_its_own_verbosity_through() {
+        let policy = crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap();
+        let content = "line one\nline two\nline three".to_string();
+
+        let shared = Shared::new();
+        let verbose = Interactive::new(
+            policy.clone(),
+            Secrets::new(Vec::new()),
+            PathBuf::from("/ws"),
+            1,
+            shared.clone(),
+        );
+        verbose.emit(Event::ToolResult {
+            call: call(),
+            content: content.clone(),
+            is_error: false,
+        });
+        let whole = last_trace(&shared);
+        assert!(
+            whole.contains("\n    line one")
+                && whole.contains("\n    line two")
+                && whole.contains("\n    line three"),
+            "verbosity 1 did not show each line on its own indented line: {whole:?}"
+        );
+
+        let shared0 = Shared::new();
+        let quiet = Interactive::new(
+            policy,
+            Secrets::new(Vec::new()),
+            PathBuf::from("/ws"),
+            0,
+            shared0.clone(),
+        );
+        quiet.emit(Event::ToolResult {
+            call: call(),
+            content,
+            is_error: false,
+        });
+        let preview = last_trace(&shared0);
+        assert!(
+            !preview.contains("\n    line two"),
+            "verbosity 0 showed each line on its own indented line: {preview:?}"
+        );
+    }
+}

@@ -46,15 +46,24 @@ fn handle_key(
 ) -> Option<Action> {
     let mut action = None;
     shared.update(|ui| {
-        ui.notice = None;
         let key = match input {
             Input::Resize => return,
             Input::Paste(text) => {
                 ui.editor.paste(&text);
                 return;
             }
+            Input::Errored(message) => {
+                ui.push(Entry::Trace(format!(
+                    "gwennol: reading input failed: {message}"
+                )));
+                return;
+            }
             Input::Key(key) => key,
         };
+        // Only an actual key input retires a standing notice: a
+        // resize or a paste must not clear a Ctrl-C hint the user has
+        // not yet read.
+        ui.notice = None;
         if key.modifiers.is_empty() && key.code == KeyCode::Esc {
             if running {
                 cancel.cancel();
@@ -109,7 +118,9 @@ fn handle_key(
 }
 
 fn draw<B: Backend>(shared: &Shared, terminal: &mut Terminal<B>) -> Result<(), Fatal> {
-    terminal.draw(|f| render(&shared.lock(), f))?;
+    terminal
+        .draw(|f| render(&shared.lock(), f))
+        .map_err(|e| Fatal(format!("terminal: {e}")))?;
     Ok(())
 }
 
@@ -131,7 +142,10 @@ async fn idle_step<B: Backend, K: KeySource>(
             Some(input) => handle_key(shared, &scratch, false, input),
             None => Some(Action::ExitIdle),
         },
-        _ = changes.changed() => None,
+        // `Err` only once every sender has dropped, permanently; `Ok`
+        // here (rather than matching either) means that happening
+        // disables this arm instead of winning every later poll.
+        Ok(_) = changes.changed() => None,
     };
     draw(shared, terminal)?;
     Ok(action)
@@ -209,7 +223,10 @@ pub async fn drive<B: Backend, K: KeySource>(
                         }
                     }
                 }
-                _ = changes.changed() => { draw(shared, terminal)?; }
+                // See `idle_step`: `Ok` only, so a permanently
+                // dropped sender disables this arm instead of
+                // spinning it at 100% CPU.
+                Ok(_) = changes.changed() => { draw(shared, terminal)?; }
                 _ = tick.tick() => {
                     shared.update(|ui| ui.tick += 1);
                     draw(shared, terminal)?;
@@ -240,9 +257,10 @@ mod tests {
     use super::*;
 
     /// Guards D7: `Esc` fires the token only while a turn is running,
-    /// and leaves the editor and notice alone either way; `Alt+b`
-    /// reaches the editor; `Ctrl-C` sets the notice. Mutation: drop
-    /// the `Esc` arm.
+    /// and leaves the editor alone either way (every key input clears
+    /// the notice, Esc included, but a resize or a paste must not);
+    /// `Alt+b` reaches the editor; `Ctrl-C` sets the notice. Mutation:
+    /// drop the `Esc` arm.
     #[test]
     fn esc_cancels_a_running_turn_and_nothing_else() {
         let shared = Shared::new();
@@ -293,13 +311,140 @@ mod tests {
             shared.lock().notice.as_deref(),
             Some("Esc cancels the turn, /exit leaves")
         );
+
+        // A resize or a paste must not clear a standing notice; only
+        // a key input does. Mutation: clear `ui.notice` before
+        // discriminating `input` — both assertions below fail.
+        handle_key(&shared, &cancel, true, Input::Resize);
+        assert!(
+            shared.lock().notice.is_some(),
+            "a resize cleared the notice"
+        );
+        handle_key(&shared, &cancel, true, Input::Paste("x".to_string()));
+        assert!(shared.lock().notice.is_some(), "a paste cleared the notice");
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        );
+        assert!(
+            shared.lock().notice.is_none(),
+            "a key input did not clear the notice"
+        );
+    }
+
+    /// Guards the forced-exit path directly and deterministically: the
+    /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
+    /// only pins `biased` in the running loop's `select!` 5 times in
+    /// 20 (removing it there still leaves 15/20 runs green, since the
+    /// key and the cancelled turn's own completion race). With a
+    /// cancel already pending from a first `/exit`, a second one
+    /// returns `ForceExit` here regardless of any scheduling.
+    /// Mutation: swap the branches of the `ui.exiting` check
+    /// (`ForceExit` when *not* already exiting) — the second assertion
+    /// below fails immediately.
+    #[test]
+    fn a_second_exit_forces_the_session_out_while_the_first_is_pending() {
+        let shared = Shared::new();
+        let cancel = CancellationToken::new();
+        let submit_exit = |shared: &Shared, cancel: &CancellationToken| {
+            for c in "/exit".chars() {
+                handle_key(
+                    shared,
+                    cancel,
+                    true,
+                    Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                );
+            }
+            handle_key(
+                shared,
+                cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            )
+        };
+
+        let first = submit_exit(&shared, &cancel);
+        assert_eq!(
+            first, None,
+            "the first /exit while running returns no Action"
+        );
+        assert!(shared.lock().exiting, "the first /exit did not set exiting");
+        assert!(cancel.is_cancelled(), "the first /exit did not cancel");
+
+        let second = submit_exit(&shared, &cancel);
+        assert_eq!(second, Some(Action::ForceExit));
+    }
+
+    /// Guards `Input::Errored`: before this round a read error folded
+    /// into `None`, the same as the source closing, said nowhere; it
+    /// traces the message instead. Mutation: fold `Input::Errored`
+    /// into the `Input::Resize` arm (silently discarded) — the
+    /// assertion below fails.
+    #[test]
+    fn a_read_error_is_traced_not_silently_treated_as_closed() {
+        let shared = Shared::new();
+        let cancel = CancellationToken::new();
+        handle_key(
+            &shared,
+            &cancel,
+            false,
+            Input::Errored("the terminal went away".to_string()),
+        );
+        assert!(
+            shared
+                .lock()
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::Trace(t) if t.contains("the terminal went away"))),
+            "the read error was not traced: {:?}",
+            shared.lock().entries
+        );
+    }
+
+    /// Guards the "a turn is running; Esc cancels it" branch (no test
+    /// before this round): submitting a turn while one is already
+    /// running sets the notice, returns no
+    /// `Action`, and leaves the editor's text in place rather than
+    /// discarding it. Mutation: replace the whole `Submission::Turn`
+    /// arm with an unconditional commit-and-submit — both assertions
+    /// below fail.
+    #[test]
+    fn a_turn_typed_while_one_is_running_is_not_swallowed() {
+        let shared = Shared::new();
+        let cancel = CancellationToken::new();
+        for c in "another turn".chars() {
+            handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        let action = handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(action, None, "a turn was submitted while one was running");
+        assert_eq!(
+            shared.lock().notice.as_deref(),
+            Some("a turn is running; Esc cancels it")
+        );
+        assert_eq!(
+            shared.lock().editor.text(),
+            "another turn",
+            "the editor was cleared instead of keeping the swallowed text"
+        );
     }
 
     /// Guards D7's redraw arm: an update from another task, with no
     /// key ever arriving, still causes a redraw. Mutation: drop the
     /// `changed()` arm — the step waits on keys forever and the
-    /// timeout fails the test (named in the PR body as the one unit
-    /// pin bound by time).
+    /// 10s timeout below fails the test (the one unit pin bound by
+    /// time).
     #[tokio::test]
     async fn an_update_from_another_task_redraws() {
         let shared = Shared::new();

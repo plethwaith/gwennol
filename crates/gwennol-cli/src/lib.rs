@@ -129,9 +129,9 @@ pub struct Cli {
     #[arg(long)]
     pub no_stream: bool,
 
-    /// Write the conversation as the provider saw it — system prompt,
-    /// tools, messages and settings, the whole chat input — to FILE at
-    /// the end, after a failure too.
+    /// Print mode only: write the conversation as the provider saw
+    /// it — system prompt, tools, messages and settings, the whole
+    /// chat input — to FILE at the end, after a failure too.
     #[arg(long, value_name = "FILE")]
     pub transcript: Option<PathBuf>,
 
@@ -145,8 +145,9 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub log: Option<PathBuf>,
 
-    /// More detail on stderr: -v shows tool results whole and the
-    /// host's info log, -vv its debug log.
+    /// More detail: -v shows tool results whole and raises the host
+    /// log to info, -vv to debug. Print mode puts both on stderr; a
+    /// session puts results in the pane and the log only in --log.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 }

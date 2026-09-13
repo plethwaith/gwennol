@@ -116,8 +116,8 @@ impl Editor {
     }
 
     /// Push the current text to history (unless it equals the last
-    /// entry) and clear the buffer. Called when a turn is sent or
-    /// `/help` runs.
+    /// entry) and clear the buffer. Called for every recognized
+    /// submission: a turn, `/help`, and `/exit`.
     pub fn commit(&mut self) {
         let text: String = self.text.iter().collect();
         if self.history.last() != Some(&text) {
@@ -150,12 +150,14 @@ impl Editor {
             self.cursor -= 1;
             self.text.remove(self.cursor);
         }
+        self.browsing = None;
     }
 
     fn delete_right(&mut self) {
         if self.cursor < self.text.len() {
             self.text.remove(self.cursor);
         }
+        self.browsing = None;
     }
 
     /// The index a leftward word-skip lands on: past whitespace, then
@@ -198,11 +200,13 @@ impl Editor {
         let start = self.word_left_index();
         self.text.drain(start..self.cursor);
         self.cursor = start;
+        self.browsing = None;
     }
 
     fn delete_word_right(&mut self) {
         let end = self.word_right_index();
         self.text.drain(self.cursor..end);
+        self.browsing = None;
     }
 
     fn history_up(&mut self) {
@@ -359,5 +363,99 @@ mod tests {
             Submission::Command(Command::Unknown("/nope".to_string()))
         );
         assert_eq!(submission_of("hi"), Submission::Turn("hi".to_string()));
+    }
+
+    /// Guards bindings with no pin before this round: a `Char` key
+    /// with `SHIFT` still inserts (the char itself already carries the
+    /// case; `SHIFT` alone must not turn it into a different binding);
+    /// `Home`/`End` with no modifiers move to the line's start/end;
+    /// `commit` never pushes two identical entries back to back; Up
+    /// past the oldest entry stays there rather than wrapping.
+    /// Mutations (each named, each leaves the suite green before this
+    /// test): `plain_char` requires `key.modifiers == KeyModifiers::NONE`
+    /// exactly; `KeyCode::Home` becomes a no-op; history dedup becomes
+    /// unconditional; `Some(0) => 0` in `history_up` wraps to the
+    /// newest entry instead.
+    #[test]
+    fn shift_home_end_dedup_and_the_oldest_history_entry() {
+        // A shifted letter still inserts.
+        let mut editor = Editor::default();
+        editor.key(&key(KeyCode::Char('H'), KeyModifiers::SHIFT));
+        assert_eq!(editor.text(), "H");
+
+        // Home/End with no modifiers.
+        let mut editor = Editor::default();
+        type_text(&mut editor, "hello");
+        editor.key(&key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(editor.cursor(), 0);
+        editor.key(&key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(editor.cursor(), 5);
+
+        // `commit` does not push a duplicate of the last entry: two
+        // "dup" commits in a row must count as one history entry, not
+        // two. Adjacent duplicates share a value, so the count of Up
+        // presses to reach a *distinct* older entry is what a
+        // duplicate-value assertion cannot tell apart; three commits
+        // deduping to `["first", "dup", "last"]` (3 entries) put
+        // "first" three Up presses up, where four undeduped entries
+        // would still show "dup" at that point.
+        let mut editor = Editor::default();
+        for text in ["first", "dup", "dup", "last"] {
+            type_text(&mut editor, text);
+            editor.commit();
+        }
+        for _ in 0..3 {
+            editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            editor.text(),
+            "first",
+            "a duplicate entry was pushed onto history"
+        );
+
+        // Up past the oldest entry stays on it rather than wrapping to
+        // the newest.
+        let mut editor = Editor::default();
+        type_text(&mut editor, "first");
+        editor.commit();
+        type_text(&mut editor, "second");
+        editor.commit();
+        editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "second");
+        editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "first");
+        editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            editor.text(),
+            "first",
+            "Up past the oldest entry wrapped instead of staying"
+        );
+    }
+
+    /// Before this round, only `insert` reset `browsing`, so an edit
+    /// made to a history entry mid-browse (Backspace here) did not
+    /// detach from it, and a later Down (with nothing newer in
+    /// history) discarded the edit and restored the pre-Up draft
+    /// instead of leaving the edited text alone. Mutation: drop
+    /// `self.browsing = None;` from `delete_left` — the last assertion
+    /// below fails, `editor.text()` reading back "draft".
+    #[test]
+    fn deleting_while_browsing_history_detaches_from_it() {
+        let mut editor = Editor::default();
+        type_text(&mut editor, "first");
+        editor.commit();
+        type_text(&mut editor, "draft");
+        editor.key(&key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "first");
+
+        editor.key(&key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "firs");
+
+        // Down is now a plain no-op: the edit detached `browsing`
+        // above, so there is nothing left to navigate away from, and
+        // the edited text is left as it is rather than being replaced
+        // by the pre-Up draft or by a history entry.
+        editor.key(&key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "firs");
     }
 }

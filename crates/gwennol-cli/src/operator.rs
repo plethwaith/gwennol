@@ -68,9 +68,15 @@ impl Headless {
         }
         let mut out = std::io::stdout().lock();
         // A closed pipe is the reader's business, not a reason to fail
-        // the turn; the model's answer still lands in the transcript.
-        let _ = out.write_all(text.as_bytes());
-        let _ = out.flush();
+        // the turn (the model's answer still lands in the transcript);
+        // anything else — a full disk, say — is worth a line on
+        // stderr rather than a silently truncated answer.
+        if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                self.note(format!("stdout: {e}"));
+            }
+            return;
+        }
         *self.line_open.lock().unwrap() = !text.ends_with('\n');
     }
 
@@ -84,8 +90,11 @@ impl Headless {
         let mut open = self.line_open.lock().unwrap();
         if *open {
             let mut out = std::io::stdout().lock();
-            let _ = out.write_all(b"\n");
-            let _ = out.flush();
+            if let Err(e) = out.write_all(b"\n").and_then(|()| out.flush())
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                self.note(format!("stdout: {e}"));
+            }
             *open = false;
         }
     }

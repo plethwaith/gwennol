@@ -779,7 +779,9 @@ fn verbose_startup_log_carries_the_frontend_target_in_order() {
 /// never one — the binary runs in print mode even without `-p`, and
 /// says so once, first, before anything else on stderr. Guards D2.
 /// Mutation: `choose_mode` returns `Interactive` when `!cli.print` —
-/// the run tries raw mode on a pipe and exits 2.
+/// with no controlling terminal the raw-mode enter fails and the run
+/// exits 2; where `/dev/tty` opens it blocks on the key source
+/// instead.
 #[test]
 fn without_a_terminal_the_binary_runs_in_print_mode_and_says_so() {
     let f = fixture();

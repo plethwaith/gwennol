@@ -14,6 +14,10 @@ pub enum Input {
     Paste(String),
     /// The terminal was resized.
     Resize,
+    /// Reading the terminal's events failed. Not the source closing
+    /// (`next` returns `None` for that): the loop is told, rather than
+    /// treating a transient read error as a silent, unremarked exit.
+    Errored(String),
 }
 
 /// Where the loop gets its keys. `None` once the source is closed.
@@ -54,7 +58,8 @@ impl KeySource for TerminalKeys {
                 Some(Ok(Event::Paste(text))) => return Some(Input::Paste(text)),
                 Some(Ok(Event::Resize(_, _))) => return Some(Input::Resize),
                 Some(Ok(Event::FocusGained | Event::FocusLost | Event::Mouse(_))) => {}
-                Some(Err(_)) | None => return None,
+                Some(Err(e)) => return Some(Input::Errored(e.to_string())),
+                None => return None,
             }
         }
     }

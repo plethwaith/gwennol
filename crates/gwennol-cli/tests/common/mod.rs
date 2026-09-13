@@ -148,8 +148,9 @@ fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
     };
     let first = text.split_whitespace().next().unwrap_or("");
     match first {
-        // Never answers; the cancellation pin reads until the caller
-        // moves on and closes the connection.
+        // Never answers: the handler blocks on a read that ends
+        // when the cancelled caller closes the connection, or at the
+        // 10 s socket read timeout set above.
         "stall" => {
             let mut sink = [0u8; 1];
             let _ = socket.read(&mut sink);

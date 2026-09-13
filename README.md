@@ -38,8 +38,7 @@ the bundled plugins (the Anthropic provider and the `read`, `write`,
 `grep` and `bash` tools, [plugins/](plugins/)), the agent loop
 (`gwennol_core::agent::Session`) and the `gwennol` CLI (interactive by
 default, `-p` for a print run, every approval decided by a rule and
-traced,
-[crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
+traced, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
 exercised by integration tests against a real kernel and a stubbed
 Messages API. Nothing is packaged yet: the CLI runs from a checkout
 with `cargo xtask bundle` beside it. The 0.0.0 release on crates.io is
@@ -70,7 +69,7 @@ bundler fills the slot ([plugins/README.md](plugins/README.md)).
 cargo build -p gwennol-cli
 export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/a/repository
-/path/to/gwennol/target/debug/gwennol \
+/path/to/gwennol/target/debug/gwennol -p \
     --trust-runtime provider-anthropic \
     --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**' \
     'What is this repository for?'
@@ -78,7 +77,8 @@ cd /path/to/a/repository
 
 Nothing is approved by prompt: every reach outside the sandbox is
 judged by the `--allow`/`--deny` rules and a config file, and traced
-on stderr with the rule that decided it. The rule grammar, the config
+with the rule that decided it — on stderr in a print run, into the
+session's pane otherwise. The rule grammar, the config
 file, where secrets come from and the exit statuses are in
 [crates/gwennol-cli/README.md](crates/gwennol-cli/README.md).
 

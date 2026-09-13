@@ -192,9 +192,9 @@ async fn run_drive(
 /// Clear the editor and any notice between runs. Production never
 /// needs this — `/exit` ends the process, so a stale editor never
 /// meets a later turn — but this suite's runs share one `Ui` across
-/// several `drive` calls (D12), and `/exit` deliberately leaves the
-/// editor as it is (D9): un-cleared, the next run's typed text lands
-/// after it and reads as one unknown command instead of a turn.
+/// several `drive` calls (D12), and a run that ends in a cancel
+/// leaves the uncommitted draft behind (D9): un-cleared, the next
+/// run's typed text lands after it and reads as one plain turn.
 fn reset_editor(shared: &std::sync::Arc<Shared>) {
     shared.update(|ui| {
         ui.editor = gwennol::tui::editor::Editor::default();
@@ -204,9 +204,9 @@ fn reset_editor(shared: &std::sync::Arc<Shared>) {
 
 /// How many `Outcome` entries `ui.entries[start..]` holds: one per
 /// turn that has finished, the sync point a fast, all-local stub makes
-/// necessary (a turn can complete before the driver task is even
-/// scheduled, so waiting on `TurnState::Idle` alone can observe a
-/// *later* turn's idle instead of the one just submitted).
+/// necessary (`ui.turn` is still `Idle` between the submission and the
+/// loop picking it up, so waiting on `TurnState::Idle` alone can match
+/// the idle from before the turn).
 fn outcomes_since(ui: &Ui, start: usize) -> usize {
     ui.entries[start..]
         .iter()
@@ -216,7 +216,9 @@ fn outcomes_since(ui: &Ui, start: usize) -> usize {
 
 /// The `text` field of every `assistant`-role message from `from`
 /// onward, concatenated: what the transcript holds for the completed
-/// turns since a point, to compare against `Ui::assistant_text_since`.
+/// turns since a point, to compare against the pane's own `Assistant`
+/// entries over the same range (built inline here, since
+/// `Ui::assistant_text_since` has no upper bound).
 fn assistant_text_from_transcript(transcript: &[Value], from: usize) -> String {
     transcript[from..]
         .iter()
@@ -301,13 +303,20 @@ async fn scenario() {
     let mut locked = guard.lock().await;
     let (session, shared) = &mut *locked;
     let shared = shared.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
 
-    // ---- run A: two turns, then an idle /exit.
+    // ---- run A: two turns, then an idle /exit. Each run below gets
+    // its own fresh channel, moved whole (never cloned) into its
+    // driver: if a driver panics (an `await_ui` timeout, a failed
+    // assertion), dropping its one `tx` closes the channel, so
+    // `run_drive`'s `keys.next()` sees the source close and the run
+    // ends in seconds rather than at the outer 180s timeout. Before
+    // this round, every run but the last two shared one `tx`/`rx`
+    // pair that outlived every driver, so a panicked driver's clone
+    // dropping changed nothing.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
         let shared = shared.clone();
-        let tx = tx.clone();
         tokio::spawn(async move {
             await_ui(
                 &shared,
@@ -334,6 +343,10 @@ async fn scenario() {
     .await;
     driver.await.unwrap();
     assert_eq!(code, ExitCode::SUCCESS, "run A");
+    assert!(
+        matches!(shared.lock().turn, TurnState::Idle),
+        "run A: the status stayed on the second turn's state after drive returned"
+    );
     {
         let ui = shared.lock();
         let entries = &ui.entries[start..];
@@ -386,8 +399,8 @@ async fn scenario() {
         // holds the messages of the "again please" follow-up too):
         // the pane's `Assistant` entries since the turn's `User` entry
         // concatenate to the transcript's assistant `text` blocks
-        // since that turn's user message (`transcript()[1..4]`, as
-        // planned: index 0 is the user message itself).
+        // since that turn's user message (`transcript()[..4]`: the
+        // helper itself filters on `role == "assistant"`).
         let ui_text: String = entries[1..9]
             .iter()
             .filter_map(|e| match e {
@@ -417,10 +430,10 @@ async fn scenario() {
 
     reset_editor(&shared);
     // ---- run B: a retried round.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
         let shared = shared.clone();
-        let tx = tx.clone();
         tokio::spawn(async move {
             type_line(&tx, "flaky please");
             await_ui(
@@ -475,11 +488,11 @@ async fn scenario() {
     // `/exit` — typed straight onto "draft" it would read as one
     // unknown word, `draft/exit`, and land as a plain turn instead of
     // the exit command, exactly as a real, un-cleared editor would.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let editor_had_draft = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let driver = {
         let shared = shared.clone();
-        let tx = tx.clone();
         let editor_had_draft = editor_had_draft.clone();
         tokio::spawn(async move {
             type_line(&tx, "stall");
@@ -489,6 +502,10 @@ async fn scenario() {
                 "run C: stall working",
             )
             .await;
+            assert!(
+                frame(&shared).iter().any(|r| r.starts_with("working ")),
+                "run C: the status line does not show \"working\" while a turn is running"
+            );
             esc(&tx);
             await_ui(
                 &shared,
@@ -509,6 +526,17 @@ async fn scenario() {
                 "run C: stream-stall text shown",
             )
             .await;
+            {
+                let rows = frame(&shared);
+                assert!(
+                    rows.iter().any(|r| r.contains("so far")),
+                    "run C: the pane does not show the stream-stall's partial text: {rows:?}"
+                );
+                assert!(
+                    rows.iter().any(|r| r.starts_with("streaming ")),
+                    "run C: the status line does not show \"streaming\" once text has arrived: {rows:?}"
+                );
+            }
             for c in "draft".chars() {
                 key(&tx, KeyCode::Char(c), KeyModifiers::NONE);
             }
@@ -567,11 +595,11 @@ async fn scenario() {
             "run C: the stream-stall's partial text is missing from the pane"
         );
     }
-    // Neither cancelled round left a trace in the transcript: the last
-    // message is still the "stall" turn's own user text, unaccompanied
-    // by any assistant reply, and "stream-stall" never sent one either
-    // (both are one message, since a turn's own text is appended to an
-    // existing trailing user message rather than opening a new one).
+    // Neither cancelled round left an assistant reply in the
+    // transcript: the last message is still a user message, and it
+    // carries both turns' own text — "stall" and "stream-stall" are
+    // one message, since a turn's text is appended to an existing
+    // trailing user message rather than opening a new one.
     let last = session.transcript().last().cloned().unwrap();
     assert_eq!(last["role"], "user");
     let texts: Vec<&str> = last["content"]
@@ -588,10 +616,10 @@ async fn scenario() {
 
     reset_editor(&shared);
     // ---- run D: cancel during a tool call.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
         let shared = shared.clone();
-        let tx = tx.clone();
         tokio::spawn(async move {
             type_line(&tx, "sleep");
             await_ui(
@@ -644,10 +672,10 @@ async fn scenario() {
 
     reset_editor(&shared);
     // ---- run E: a failed turn.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
         let shared = shared.clone();
-        let tx = tx.clone();
         tokio::spawn(async move {
             type_line(&tx, "fail");
             await_ui(
@@ -666,6 +694,10 @@ async fn scenario() {
         ExitCode::from(1),
         "run E: /exit after a failed turn is status 1"
     );
+    assert!(
+        matches!(shared.lock().turn, TurnState::Idle),
+        "run E: the status stayed on the failed turn's state after drive returned"
+    );
     {
         let ui = shared.lock();
         let entries = &ui.entries[start..];
@@ -675,11 +707,12 @@ async fn scenario() {
         );
     }
 
-    // ---- run F: slash-command edge cases touch no turn. `tx` (not a
-    // clone) moves into the driver so dropping it there actually
-    // closes the channel: every other clone has already gone out of
-    // scope with the runs that made it.
+    // ---- run F: slash-command edge cases touch no turn, ending by
+    // dropping the sole `tx` (never cloned) to close the channel
+    // itself, on purpose this time, rather than only as a
+    // panic-recovery side effect.
     reset_editor(&shared);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let requests_before = stub().requests().len();
     let start = shared.lock().entries.len();
     let driver = {
@@ -720,6 +753,15 @@ async fn scenario() {
                 "run F: help printed",
             )
             .await;
+            // Guards the `/help` `commit`, pinned only by the 180s
+            // outer timeout before this round. Mutation:
+            // drop the `commit` in the `Command::Help` arm — the
+            // editor keeps "/help" and this fails fast instead of
+            // three runs downstream, at the 180s timeout.
+            assert!(
+                shared.lock().editor.text().is_empty(),
+                "run F: /help did not clear the editor"
+            );
             drop(tx);
         })
     };
@@ -747,11 +789,47 @@ async fn scenario() {
         assert_eq!(help, gwennol::tui::ui::HELP);
     }
 
+    // ---- run G: the key source closing while a turn is running is
+    // treated as a running `/exit`: cancelled, then unwound. Nothing
+    // exercised this before this round — run F closes the source
+    // while idle, and the row's own name, "key source closes", had
+    // been credited to what is now run I below, whose channel in fact
+    // never closes (a clone is moved into the driver; the outer `tx`
+    // outlives the whole scenario). A fresh channel, moved (not
+    // cloned) into the driver, so it is this run's only sender and
+    // closes the moment the driver task ends.
+    let start = shared.lock().entries.len();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let driver = tokio::spawn(async move {
+        type_line(&tx, "sleep");
+        // `tx` drops here, its only owner: the channel closes while
+        // the turn `drive` is about to run is still in flight.
+    });
+    let began = std::time::Instant::now();
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "run G: closing the key source mid-turn took too long to unwind"
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "run G");
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Entry::Outcome(t) if t == "gwennol: cancelled")),
+            "run G outcome: {entries:?}"
+        );
+    }
+
+    reset_editor(&shared);
     // A closed key source ends this test: later runs need a fresh
     // channel.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
 
-    // ---- run G: a second /exit forces the session out at once.
+    // ---- run I: a second /exit forces the session out at once.
     let driver = {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -765,13 +843,11 @@ async fn scenario() {
     driver.await.unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(10),
-        "run G: forced exit took too long"
+        "run I: forced exit took too long"
     );
     assert_eq!(
         code,
         ExitCode::from(130),
-        "run G: a second /exit forces status 130"
+        "run I: a second /exit forces status 130"
     );
-
-    let _ = frame(&shared); // exercised at least once, as tests/interactive.rs's rendering pin.
 }
