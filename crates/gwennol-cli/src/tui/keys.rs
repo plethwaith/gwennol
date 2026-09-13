@@ -60,9 +60,9 @@ const MAX_CONSECUTIVE_READ_ERRORS: u32 = 2;
 /// still returns exactly that.
 pub struct TerminalKeys<S = EventStream> {
     stream: S,
-    /// Consecutive read errors since the last event that reached
-    /// `next`'s caller; reset on `step`'s key-press, paste and resize
-    /// arms only. See `MAX_CONSECUTIVE_READ_ERRORS`.
+    /// Consecutive read errors since the last successfully read event
+    /// that reached `next`'s caller; reset on `step`'s key press-or-repeat,
+    /// paste and resize arms only. See `MAX_CONSECUTIVE_READ_ERRORS`.
     errors: u32,
 }
 
@@ -91,7 +91,7 @@ impl TerminalKeys {
 /// plain `Option<Result<..>>` standing in for the poll) so a test does
 /// not need a real, breakable `EventStream` to exercise it in
 /// isolation. `errors` is reset on three arms only — a key press or
-/// repeat, a paste, a resize — the reads that hand an `Input` back.
+/// repeat, a paste, a resize — the successful reads.
 /// The two arms that return `Step::Continue` (a key release; a focus
 /// or mouse event) leave it alone, so an `Err` run alternating with
 /// either still reaches `MAX_CONSECUTIVE_READ_ERRORS` instead of being
@@ -275,10 +275,11 @@ mod tests {
     /// tests above call `step` directly with a local counter, which
     /// cannot exercise this: it is the `errors` field on `TerminalKeys`,
     /// not `step`, that carries the count across `.await` points — each
-    /// `next()` call below returns on its first poll, so the loop
-    /// itself never iterates. Mutation: reset `self.errors`
-    /// to 0 at the top of `next`'s loop body — the second `next().await`
-    /// below then returns `Some(Errored(..))` again instead of `None`.
+    /// `next()` call below returns on its first poll, so the loop body
+    /// runs once per call and never comes round again. Mutation: reset
+    /// `self.errors` to 0 at the top of `next`'s loop body — the second
+    /// `next().await` below then returns `Some(Errored(..))` again
+    /// instead of `None`.
     #[tokio::test]
     async fn a_second_consecutive_read_error_closes_the_source_across_polls() {
         let mut keys = TerminalKeys {

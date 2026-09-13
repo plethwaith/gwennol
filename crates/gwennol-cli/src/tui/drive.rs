@@ -334,10 +334,10 @@ mod tests {
         );
     }
 
-    /// Guards the forced-exit path directly and deterministically: the
+    /// Guards the forced-exit path directly and deterministically. The
     /// end-to-end double-`/exit` scenario in `tests/interactive.rs`
     /// does not pin `biased` in the running loop's `select!`: with it
-    /// removed the key and the cancelled turn's own completion race, and
+    /// removed, the key and the cancelled turn's own completion race, and
     /// the mutant survives most runs (see run H's own comment). With a
     /// cancel already pending from a first `/exit`, a second one
     /// returns `ForceExit` here regardless of any scheduling.
@@ -492,8 +492,8 @@ mod tests {
     }
 
     /// Guards `idle_step`'s own `biased;` (distinct from the running
-    /// loop's, whose mutant no test kills — see run H's comment in
-    /// `tests/interactive.rs`): with a key and a pending redraw both
+    /// loop's, whose mutant no test kills reliably — see run H's comment
+    /// in `tests/interactive.rs`): with a key and a pending redraw both
     /// ready, the key arm runs first, reaching the editor. Racy on its
     /// own, as run H is: without `biased;`, `tokio::select!`'s own per-call
     /// rotation still sometimes starts at the key arm anyway (about
