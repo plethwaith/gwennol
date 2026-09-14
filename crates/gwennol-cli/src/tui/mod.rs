@@ -125,7 +125,8 @@ mod tests {
     /// developer's own shell may have set for real use — a rule
     /// always wins over the convention variable (`secrets.rs`'s
     /// `source_for`), so this is isolated from the machine's
-    /// environment regardless. Guards D3, D6. Mutation: restore the
+    /// environment regardless. Guards the no-rules warning going only
+    /// to the log in a session, not the pane. Mutation: restore the
     /// `warnings.push` in `frontend.rs` — two entries instead of one.
     #[test]
     fn startup_warnings_are_the_first_entries() {

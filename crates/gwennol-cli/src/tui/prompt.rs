@@ -3,9 +3,8 @@
 //! key answers it, how it comes down when the future behind it is
 //! dropped, and what the box shows. Cancel-safety in one sentence: a
 //! [`PromptGuard`] removes the prompt by id when dropped — which is what
-//! happens when the turn is cancelled while a prompt is open, since the
-//! guard is declared after the receiver it guards — and an answer whose
-//! receiver is already gone is simply ignored.
+//! happens when the turn is cancelled while a prompt is open — and an
+//! answer whose receiver is already gone is simply ignored.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -51,6 +50,13 @@ pub struct Prompt {
     /// `(rows, visible)` the last render measured, for the handler's
     /// clamp: set by [`render_prompt`], read by [`key`].
     pub view: Cell<(usize, usize)>,
+    /// [`lines`]'s content rows, computed once: `request`,
+    /// `unjudgeable` and `access_line` never change after
+    /// construction, so the rows never do either. Populated lazily by
+    /// [`lines`]'s first call rather than eagerly here, since a
+    /// prompt's rows are otherwise never needed before the first
+    /// render.
+    lines_cache: std::cell::OnceCell<Vec<String>>,
     answer: Option<oneshot::Sender<Decision>>,
 }
 
@@ -73,6 +79,7 @@ impl Prompt {
             subject,
             scroll: 0,
             view: Cell::new((0, 0)),
+            lines_cache: std::cell::OnceCell::new(),
             answer: Some(answer),
         }
     }
@@ -123,8 +130,10 @@ enum Answer {
 
 /// Route one key to the first open prompt. `true` when the key was
 /// the prompt's — every key is, while a prompt is open (D4): the
-/// answer keys act, the scroll keys move `scroll`, and anything else
-/// is swallowed rather than reaching the editor or the token.
+/// answer keys (unmodified only — `Ctrl-y` is swallowed, not
+/// answered) act, the scroll keys move `scroll` regardless of
+/// modifiers, and anything else is swallowed rather than reaching the
+/// editor or the token.
 pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path) -> bool {
     if ui.prompts.is_empty() {
         return false;
@@ -164,28 +173,26 @@ pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path) -> bool {
     true
 }
 
-/// Remove the first prompt, push a session rule when the answer asks
-/// for one and the subject allows it, send the decision, and — only
-/// when the send lands — trace it.
+/// Remove the first prompt and send the decision; only when the send
+/// lands do the rule the answer asked for (if the subject allows one)
+/// and the trace get recorded — so a failed send leaves neither behind.
 fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
     let mut prompt = ui.prompts.remove(0);
-    let (decision, suffix) = match answer {
-        Answer::Once(d) => (d, ""),
-        Answer::Session(d) => {
-            let mut suffix = "";
-            if let (Some(subject), Some(kind)) =
-                (prompt.subject.clone(), Kind::of(&prompt.request.access))
-            {
-                ui.session_rules.push(SessionRule {
+    let (decision, suffix, rule) = match answer {
+        Answer::Once(d) => (d, "", None),
+        Answer::Session(d) => match (prompt.subject.clone(), Kind::of(&prompt.request.access)) {
+            (Some(subject), Some(kind)) => (
+                d,
+                " for the rest of the session",
+                Some(SessionRule {
                     decision: d,
                     plugin: prompt.request.plugin.clone(),
                     kind,
                     subject,
-                });
-                suffix = " for the rest of the session";
-            }
-            (d, suffix)
-        }
+                }),
+            ),
+            _ => (d, "", None),
+        },
     };
     let verb = match decision {
         Decision::Allow => "allowed",
@@ -196,6 +203,9 @@ fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
         .take()
         .is_some_and(|tx| tx.send(decision).is_ok());
     if sent {
+        if let Some(rule) = rule {
+            ui.session_rules.push(rule);
+        }
         let line = format!(
             "gwennol: {}",
             show::decided(
@@ -209,8 +219,19 @@ fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
 }
 
 /// The box's content rows before wrapping (D5 order), the key line
-/// excluded.
+/// excluded. Computed once per prompt and cloned out of a cache on
+/// every later call — `render` and `View::render` each call
+/// `regions`, which calls [`height`], and then `render_prompt` calls
+/// it again, so this would otherwise re-parse and re-pretty-print the
+/// whole tool-call `arguments` three times a frame at the 100 ms tick.
 pub fn lines(prompt: &Prompt) -> Vec<String> {
+    prompt
+        .lines_cache
+        .get_or_init(|| compute_lines(prompt))
+        .clone()
+}
+
+fn compute_lines(prompt: &Prompt) -> Vec<String> {
     let mut out = vec![prompt.access_line.clone()];
     out.push(format!("asked by {}", prompt.request.plugin));
     match &prompt.request.cause {
@@ -252,24 +273,42 @@ pub fn lines(prompt: &Prompt) -> Vec<String> {
     out
 }
 
+/// The key legend for `prompt`: the full [`KEYS`] when a session rule
+/// can hold this request, else [`KEYS_ONCE`] (never a prefix of
+/// either — [`height`] and [`render_prompt`] wrap it in full).
+fn key_line(prompt: &Prompt) -> &'static str {
+    if prompt.subject.is_some() {
+        KEYS
+    } else {
+        KEYS_ONCE
+    }
+}
+
 /// The box height for `lines` at `width` inside `area_height` (D5):
-/// `min(rows + 3, max(4, area_height * 2 / 3))`, where `rows` is the
-/// wrapped content row count (the two borders and the key line
-/// account for the other three).
+/// `min(rows + 2 + legend_rows, max(4, area_height * 2 / 3))`, where
+/// `rows` is the wrapped content row count and `legend_rows` is
+/// `key_line` wrapped at the same width (the two borders account
+/// for the other two rows; the legend is wrapped, not truncated, so
+/// it is counted like any other content instead of assumed to fit in
+/// one row).
 pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
     let inner_width = width.saturating_sub(2).max(1) as usize;
     let rows: usize = lines(prompt)
         .iter()
         .map(|line| ui::wrap(line, inner_width).len())
         .sum();
+    let legend_rows = ui::wrap(key_line(prompt), inner_width).len();
     let max_box = ((area_height as usize) * 2 / 3).max(4);
-    (rows + 3).min(max_box) as u16
+    (rows + 2 + legend_rows).min(max_box) as u16
 }
 
 /// Draw the box: a bordered block titled [`TITLE`]; the content rows
 /// wrapped at the inner width, showing the `scroll`-clamped window;
-/// the key line ([`KEYS`] or [`KEYS_ONCE`]) as the last inner row,
-/// never scrolled.
+/// the key legend (`key_line`), wrapped at the same width, as the
+/// last inner rows, never scrolled. When the box is shorter than
+/// [`height`] asked for (D5's "terminal shorter than the box"), the
+/// legend is clipped to what remains rather than overrunning the
+/// content rows.
 pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -283,7 +322,8 @@ pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
         .iter()
         .flat_map(|line| ui::wrap(line, width))
         .collect();
-    let visible = (inner.height as usize).saturating_sub(1);
+    let legend = ui::wrap(key_line(prompt), width);
+    let visible = (inner.height as usize).saturating_sub(legend.len());
     prompt.view.set((rows.len(), visible));
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -292,18 +332,16 @@ pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     for (i, row) in rows[start..].iter().take(visible).enumerate() {
         buf.set_stringn(inner.x, inner.y + i as u16, row, width, Style::new());
     }
-    let key_line = if prompt.subject.is_some() {
-        KEYS
-    } else {
-        KEYS_ONCE
-    };
-    buf.set_stringn(
-        inner.x,
-        inner.y + inner.height - 1,
-        key_line,
-        width,
-        Style::new().add_modifier(Modifier::DIM),
-    );
+    let legend_budget = (inner.height as usize).saturating_sub(visible);
+    for (i, row) in legend.iter().take(legend_budget).enumerate() {
+        buf.set_stringn(
+            inner.x,
+            inner.y + visible as u16 + i as u16,
+            row,
+            width,
+            Style::new().add_modifier(Modifier::DIM),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -430,7 +468,7 @@ pub(crate) mod tests {
         let handled = shared.update(|ui| {
             key(
                 ui,
-                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
                 &workspace,
             )
         });
@@ -585,11 +623,14 @@ pub(crate) mod tests {
                 "missing {needle:?} in {frame:?}"
             );
         }
-        let keys_once_head: String = KEYS_ONCE.chars().take(30).collect();
-        assert!(
-            frame.iter().any(|r| r.contains(&keys_once_head)),
-            "{frame:?}"
-        );
+        // The full legend, not a prefix `KEYS` also shares: every
+        // wrapped row of `KEYS_ONCE` must reach the screen.
+        for row in ui::wrap(KEYS_ONCE, 78) {
+            assert!(
+                frame.iter().any(|r| r.contains(&row)),
+                "missing legend row {row:?} in {frame:?}"
+            );
+        }
 
         let cancel = CancellationToken::new();
         let _ = crate::tui::drive::handle_key(
@@ -645,8 +686,26 @@ pub(crate) mod tests {
         let frame = render_frame(&shared);
         assert!(frame.iter().any(|r| r.contains("\"k00\"")), "{frame:?}");
         assert!(!frame.iter().any(|r| r.contains("\"k39\"")), "{frame:?}");
-        let keys_head: String = KEYS.chars().take(20).collect();
-        assert!(frame.iter().any(|r| r.contains(&keys_head)), "{frame:?}");
+        // The full legend, not a prefix `KEYS_ONCE` also shares.
+        for row in ui::wrap(KEYS, 78) {
+            assert!(
+                frame.iter().any(|r| r.contains(&row)),
+                "missing legend row {row:?} in {frame:?}"
+            );
+        }
+
+        // D5's box-height rule: `min(rows + 2 + legend_rows, max(4,
+        // area_height * 2 / 3))`. This prompt's 45 content rows plus
+        // its 2-row legend (93 chars at inner width 78) hit the `* 2
+        // / 3` cap at a tall terminal and the `max(4)` floor at a
+        // short one; neither is reachable through the pane, whose
+        // `Min(1)` constraint hands it whatever `height` returns.
+        {
+            let ui = shared.lock();
+            let prompt = &ui.prompts[0];
+            assert_eq!(height(prompt, 80, 24), 16, "the `* 2 / 3` cap, not 49");
+            assert_eq!(height(prompt, 80, 3), 4, "the `max(4)` floor");
+        }
 
         let mut presses = 0;
         loop {
@@ -665,7 +724,12 @@ pub(crate) mod tests {
             assert!(presses <= 10, "k39 never scrolled into view");
         }
         let frame = render_frame(&shared);
-        assert!(frame.iter().any(|r| r.contains(&keys_head)), "{frame:?}");
+        for row in ui::wrap(KEYS, 78) {
+            assert!(
+                frame.iter().any(|r| r.contains(&row)),
+                "missing legend row {row:?} in {frame:?}"
+            );
+        }
 
         for _ in 0..100 {
             shared.update(|ui| {
@@ -706,6 +770,15 @@ pub(crate) mod tests {
             frame.iter().any(|r| r.contains("started by the frontend")),
             "{frame:?}"
         );
+        // This prompt's 3 content rows (access line, "asked by", the
+        // no-cause sentence) plus its 2-row legend sit under both
+        // caps: `rows + 2 + legend_rows`, not `max(4, area_height * 2
+        // / 3) = 16`.
+        {
+            let ui = shared2.lock();
+            let prompt = &ui.prompts[0];
+            assert_eq!(height(prompt, 80, 24), 7, "3 + 2 + 2, under the cap");
+        }
     }
 
     /// Guards D3: the first prompt is shown and answered first; the

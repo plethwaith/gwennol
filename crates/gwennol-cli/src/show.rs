@@ -47,7 +47,10 @@ impl fmt::Display for ShowAccess<'_> {
                 }
                 Ok(())
             }
-            Access::Http { method, url } => f.write_str(&http_subject(method, url)),
+            Access::Http { method, url } => match http_subject(method, url) {
+                Some(s) => f.write_str(&s),
+                None => write!(f, "{method} request (unparseable URL)"),
+            },
             _ => f.write_str("an access this frontend does not know"),
         }
     }
@@ -68,24 +71,24 @@ fn spawn_subject(argv: &[String], cwd: &Path, workspace: &Path) -> String {
 /// in the URL cut)` markers `ShowAccess` writes: userinfo, a query
 /// string and a fragment can all carry a credential, and the rule that
 /// judged the request judged the whole URL, not this shortened one.
-fn http_subject(method: &str, url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut u) => {
-            let had_userinfo = !u.username().is_empty() || u.password().is_some();
-            let had_query = u.query().is_some() || u.fragment().is_some();
-            gwennol_core::steps::http::scrub(&mut u);
-            let mut out = format!("{method} {u}");
-            // Say that something was cut, without saying what.
-            if had_query {
-                out.push_str("?…");
-            }
-            if had_userinfo {
-                out.push_str(" (credentials in the URL cut)");
-            }
-            out
-        }
-        Err(_) => format!("{method} request (unparseable URL)"),
+/// `None` for a URL that fails to parse: unlike every other subject,
+/// that text is the same placeholder for every such request regardless
+/// of what was actually asked, so it must never be remembered — the
+/// same reason a spawn carrying stdin has no subject either.
+fn http_subject(method: &str, url: &str) -> Option<String> {
+    let mut u = url::Url::parse(url).ok()?;
+    let had_userinfo = !u.username().is_empty() || u.password().is_some();
+    let had_query = u.query().is_some() || u.fragment().is_some();
+    gwennol_core::steps::http::scrub(&mut u);
+    let mut out = format!("{method} {u}");
+    // Say that something was cut, without saying what.
+    if had_query {
+        out.push_str("?…");
     }
+    if had_userinfo {
+        out.push_str(" (credentials in the URL cut)");
+    }
+    Some(out)
 }
 
 /// The exact text a [`crate::policy::SessionRule`] remembers for
@@ -93,10 +96,14 @@ fn http_subject(method: &str, url: &str) -> String {
 /// the three path kinds; for a spawn without stdin, the argv and cwd
 /// `spawn_subject` writes; for `http`, `http_subject`. `None` for
 /// a spawn carrying stdin — the stdin is the payload, and each one is
-/// a new request — and for a kind this frontend does not know. Built
+/// a new request — for a kind this frontend does not know, and for an
+/// `http` URL that fails to parse, whose placeholder text is the same
+/// for every such request. Built
 /// through the same helpers [`ShowAccess`] renders with, so the two
 /// cannot drift: a session rule matches exactly the text the prompt
-/// showed.
+/// showed — for `http` that text is already the *scrubbed* URL, so
+/// one answer admits every query string at the same path, not only
+/// the one shown.
 pub fn subject(access: &Access, workspace: &Path) -> Option<String> {
     match access {
         Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
@@ -108,7 +115,7 @@ pub fn subject(access: &Access, workspace: &Path) -> Option<String> {
             stdin: None,
         } => Some(spawn_subject(argv, cwd, workspace)),
         Access::Spawn { stdin: Some(_), .. } => None,
-        Access::Http { method, url } => Some(http_subject(method, url)),
+        Access::Http { method, url } => http_subject(method, url),
         _ => None,
     }
 }
@@ -138,9 +145,9 @@ pub fn preview(text: &str) -> String {
     out
 }
 
-/// An approval decision, in the words `Headless::approve` used to print
-/// itself: the access, who asked, the call it was made for (if any),
-/// and the judgement.
+/// [`decided`] with a [`Judgement`] as the verdict: the shape
+/// `Headless::approve` used to print itself, and what a rule (or
+/// session rule) decision traces as.
 pub fn decision(request: &ApprovalRequest, judgement: &Judgement<'_>, workspace: &Path) -> String {
     decided(request, judgement, workspace)
 }
@@ -238,8 +245,12 @@ mod tests {
 
     /// Guards D2: `subject` is the text after the kind word of
     /// `ShowAccess` (the whole line for `http`, which has no leading
-    /// kind word), `None` for a spawn carrying stdin, and `decided`
-    /// with the judgement itself is exactly what `decision` writes.
+    /// kind word), `None` for a spawn carrying stdin. `decided` and
+    /// `decision` agreeing is not tested here — `decision` is a
+    /// one-line delegation to `decided` (`decision`'s own doc), so
+    /// the two calls are the same call and no assertion on them can
+    /// fail; the trace's exact words for a prompted decision are
+    /// really pinned by `prompt::tests::each_key_answers_as_the_legend_says`.
     /// Mutation: omit the cwd in `spawn_subject` — the elsewhere-spawn
     /// assertions below fail.
     #[test]
@@ -315,17 +326,18 @@ mod tests {
         assert!(!shown.contains("user"));
         assert_eq!(subject(&secret_http, ws), Some(shown));
 
-        let request = ApprovalRequest {
-            plugin: "tool-write".to_string(),
-            cause: None,
-            access: read,
+        // A URL that fails to parse: `ShowAccess` still shows the
+        // same placeholder it always has, but that text is identical
+        // for every such request, so no session rule can be made from
+        // it — the same reason a spawn carrying stdin has none.
+        // Mutation: `Some(format!(...))` in `http_subject`'s `Err`
+        // arm — this assertion fails.
+        let unparseable_http = Access::Http {
+            method: "GET".into(),
+            url: "not a url".into(),
         };
-        let policy = crate::policy::Policy::compile(Vec::new(), ws).unwrap();
-        let judgement = policy.judge(&request);
-        assert_eq!(
-            decided(&request, &judgement, ws),
-            decision(&request, &judgement, ws)
-        );
+        assert_eq!(show(&unparseable_http), "GET request (unparseable URL)");
+        assert_eq!(subject(&unparseable_http, ws), None);
     }
 
     #[test]

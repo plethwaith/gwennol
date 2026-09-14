@@ -131,7 +131,8 @@ fn unauthorized(socket: &mut TcpStream) {
 /// scenario `tests/interactive.rs` needs by typing a different first
 /// word each turn; `write`, `read`, `grep` and `sh` ask for those
 /// tools by name, with the rest of the text as the tool's own
-/// argument, so the approval suite can raise a request of each kind.
+/// argument, and `elsewhere` takes no argument, so the approval suite
+/// can raise a request of each kind.
 fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
     let Some(text) = last_user_text(body) else {
         // A follow-up turn: the last message is a tool result.
@@ -205,6 +206,7 @@ fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
             socket,
             &calling_sse("sh", &json!({"script": rest}).to_string()),
         ),
+        "elsewhere" => stream(socket, &calling_sse("elsewhere", "{}")),
         _ => stream(socket, OPENING_SSE),
     }
 }

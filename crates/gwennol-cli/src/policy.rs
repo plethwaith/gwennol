@@ -70,8 +70,10 @@
 //! applying that default, and an answer given for the session becomes
 //! a [`SessionRule`], tried after every compiled rule
 //! ([`Policy::judge_with`]); print mode has no such rules. An access of
-//! a kind this frontend does not know matches no rule, `any` included,
-//! and so is denied too.
+//! a kind this frontend does not know matches no rule, `any` included:
+//! a print run denies it, the same as any other unmatched request, and
+//! a session asks at a prompt instead, the same as it does for one no
+//! rule can judge.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -343,8 +345,11 @@ impl Rule {
 }
 
 /// A rule the user made at a prompt for the rest of the session:
-/// exact text, never a glob, never written to disk. Tried after every
-/// compiled rule, so it can never pre-empt a file's `deny`.
+/// exact text, never a glob, never written to disk — except for
+/// `http`, whose subject is the *scrubbed* URL ([`crate::show::subject`]):
+/// one answer admits any query string at the same path, not only the
+/// one that was asked about. Tried after every compiled rule, so it
+/// can never pre-empt a file's `deny`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRule {
     /// Allow or deny.
@@ -553,9 +558,10 @@ impl Policy {
         self.judge_with(request, &[])
     }
 
-    /// Judge a request: the first matching compiled rule, then the
-    /// first matching session rule — tried in the order they were
-    /// made, so a session rule can never pre-empt a compiled `deny` —
+    /// Judge a request: the first matching compiled rule, then —
+    /// compiled rules being tried first, not session rules being
+    /// tried in the order they were made — the first matching session
+    /// rule, so a session rule can never pre-empt a compiled `deny`;
     /// else the default denial.
     pub fn judge_with<'a>(
         &'a self,

@@ -4,7 +4,10 @@
 //! is never left behind. `Session::run` is never called: it stops at
 //! the first turn that does not complete, and a session must carry on
 //! past a failed or cancelled one. Keys go to an open approval prompt
-//! before anything else, so `Esc` there denies rather than cancels.
+//! before anything else typed reaches it (a Ctrl-C notice is still
+//! retired first; a resize or a read error never reaches the prompt
+//! at all, and a paste is dropped rather than routed to it), so `Esc`
+//! there denies rather than cancels.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -56,7 +59,12 @@ pub(crate) fn handle_key(
         let key = match input {
             Input::Resize => return,
             Input::Paste(text) => {
-                ui.editor.paste(&text);
+                // A prompt swallows a paste too, the same as a key:
+                // pasted text must not accumulate behind an open
+                // prompt, silently, for the editor to submit later.
+                if ui.prompts.is_empty() {
+                    ui.editor.paste(&text);
+                }
                 return;
             }
             Input::Errored(message) => {
@@ -384,10 +392,17 @@ mod tests {
         ));
 
         // A second prompt: typing past it reaches neither the editor
-        // nor `exiting`, and it is still open afterward.
+        // nor `exiting`, and it is still open afterward. "/exi", not
+        // "/exit": a whole recognized command still commits (clears)
+        // the editor even with the prompt-routing arm dropped, since
+        // `Command::Exit`'s own handling always calls `commit()`, so
+        // that mutant would leave `editor.text()` empty either way;
+        // "/exi" is `Command::Unknown`, whose arm never commits, so
+        // only the real fix — the prompt swallowing every key before
+        // `ui.editor.key` is ever called — leaves the editor empty.
         let mut fut2 = interactive.approve(write_req());
         assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
-        for c in "/exit".chars() {
+        for c in "/exi".chars() {
             handle_key(
                 &shared,
                 &cancel,

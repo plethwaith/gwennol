@@ -4,8 +4,10 @@
 //! session, by default, and `-p`/`--print`, one task with the model's
 //! text on stdout and the trace on stderr, no input. A session decides
 //! by a rule when one matches and asks at a prompt otherwise,
-//! remembering an `a`/`d` answer for the rest of the session; a print
-//! run decides by rules alone and denies what none matches. Both trace
+//! remembering an `a`/`d` answer for the rest of the session when the
+//! request can hold one (not a spawn carrying stdin, nor a kind this
+//! frontend does not know); a print run decides by rules alone and
+//! denies what none matches. Both trace
 //! every decision — a session into its transcript pane, a print run to
 //! stderr — and both go through [`frontend::start`] and share
 //! [`show`]'s words, so a session reads like a print run's stderr.

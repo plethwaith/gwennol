@@ -8,8 +8,8 @@
 //! `drive` — `y`/`n` decide once, `a`/`d` for the rest of the session
 //! as a `SessionRule` tried after every compiled rule — and the
 //! prompt comes down by construction when the turn is cancelled under
-//! it, since [`crate::tui::prompt::PromptGuard`]'s drop runs before
-//! the awaited receiver's does. The frontend drives `Session::turn`
+//! it, because [`crate::tui::prompt::PromptGuard`]'s drop removes it
+//! by id whenever this future is dropped. The frontend drives `Session::turn`
 //! itself (D7), so `input` never runs.
 
 use std::path::PathBuf;
@@ -93,8 +93,11 @@ impl Operator for Interactive {
             &self.shared,
             Prompt::new(request, unjudgeable, access_line, subject, tx),
         );
-        // Dropped here when the turn is cancelled under the prompt:
-        // the guard runs before `rx` is dropped (declared after it).
+        // Dropped here when the turn is cancelled under the prompt: the guard's
+        // drop removes the prompt by id unconditionally. Order is the reverse of
+        // what the declarations suggest — `rx` is moved into the awaited temporary,
+        // created after `_guard`, and a suspended future drops in reverse creation
+        // order, so the receiver goes first and the guard's retain runs after it.
         rx.await.unwrap_or(Decision::Deny)
     }
 

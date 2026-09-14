@@ -85,10 +85,59 @@ const TOOL_SH_MANIFEST: &str = r#"{
 }
 "#;
 
+/// The test-only `tool-elsewhere` manifest: spawns outside the
+/// workspace root with no stdin, so the approval suite can raise
+/// `Unjudgeable::SpawnElsewhere` through a real prompt — the one
+/// combination where `unjudgeable` is `Some` (the box shows the `any`
+/// note) *and* `subject` is `Some` (the full `KEYS` legend applies and
+/// `a`/`d` must record a rule), otherwise covered only by
+/// `policy.rs`'s unit test. `__CWD__` is replaced with the fixture's
+/// own root (the workspace's parent) at fixture-build time.
+const TOOL_ELSEWHERE_MANIFEST: &str = r#"{
+  "formatVersion": 1,
+  "name": "tool-elsewhere",
+  "version": "0.1.0",
+  "description": "Test-only: spawns outside the workspace root with no stdin, so the approval suite can raise Unjudgeable::SpawnElsewhere through a real prompt.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_process.run"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "elsewhere",
+        "description": "Run a no-op command outside the workspace root.",
+        "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+      },
+      "steps": [
+        {
+          "id": "run",
+          "type": "host_process.run",
+          "params": {
+            "argv": ["true"],
+            "cwd": "__CWD__",
+            "timeout_ms": 5000,
+            "max_output_bytes": 1024
+          }
+        },
+        {
+          "id": "answer",
+          "type": "return",
+          "params": { "value": {
+            "content": "ok",
+            "is_error": "{{$steps.run.result.status != 0}}"
+          } }
+        }
+      ]
+    }
+  }
+}
+"#;
+
 struct Fixture {
     /// The fixture's own root: the workspace's parent, and where
-    /// `outside.txt` sits — a path outside the workspace an
-    /// interactive spawn can be judged at (D2).
+    /// `outside.txt` sits — a path outside the workspace, so run K's
+    /// `read` of it matches no rule and must be asked at a prompt. No
+    /// spawn in this suite runs outside the workspace; that case is
+    /// unit-tested in `policy.rs`.
     root: PathBuf,
     workspace: PathBuf,
     key_file: PathBuf,
@@ -118,6 +167,11 @@ fn fixture() -> &'static Fixture {
         xtask::write_bundle(&bundled, &bundle_root).unwrap();
         let plugins = bundle_root.join(xtask::PLUGINS_DIR);
         std::fs::write(plugins.join("tools").join("sh.json"), TOOL_SH_MANIFEST).unwrap();
+        std::fs::write(
+            plugins.join("tools").join("elsewhere.json"),
+            TOOL_ELSEWHERE_MANIFEST.replace("__CWD__", &root.display().to_string()),
+        )
+        .unwrap();
 
         let stub = stub();
         let key_file = root.join("anthropic.key");
@@ -204,18 +258,28 @@ fn esc(tx: &UnboundedSender<Input>) {
 }
 
 /// Wait until `check` holds, polling on `shared.changed`; bounded at
-/// 10 s per wait and 2_000 changes total, so a stuck loop fails fast
-/// rather than hanging the suite.
+/// 10 s wall-clock for the whole wait (not per notification: the
+/// running loop's own tick bumps `changed` every 100 ms regardless of
+/// whether `check` has become true, so a per-notification timeout
+/// never trips while a turn is in flight) and 2_000 changes total, so
+/// a stuck loop fails fast, naming itself, rather than hanging the
+/// suite until the scenario's own outer timeout fires with no `what`.
 async fn await_ui(shared: &std::sync::Arc<Shared>, mut check: impl FnMut(&Ui) -> bool, what: &str) {
     let mut changes = shared.changed.subscribe();
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
     for _ in 0..2000 {
         if check(&shared.lock()) {
             return;
         }
-        tokio::time::timeout(Duration::from_secs(10), changes.changed())
-            .await
-            .unwrap_or_else(|_| panic!("timed out after 10s waiting for: {what}"))
-            .expect("the Shared sender outlives every waiter in this test");
+        tokio::select! {
+            r = changes.changed() => {
+                r.expect("the Shared sender outlives every waiter in this test");
+            }
+            () = &mut deadline => {
+                panic!("timed out after 10s waiting for: {what}");
+            }
+        }
     }
     panic!("gave up after 2000 changes waiting for: {what}");
 }
@@ -234,6 +298,51 @@ fn frame(shared: &std::sync::Arc<Shared>) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+/// The rows strictly inside the open approval box's borders — content
+/// and the key legend, never the transcript pane above it. A needle
+/// like the typed request's own text can appear twice: once as the
+/// box's own content, and once as the `Entry::User` row the pane
+/// still shows above it (the pane shrinks but does not disappear with
+/// a prompt open) — checking `frame` alone for such a needle would
+/// pass even with the box's content wrong, so a box-content assertion
+/// checks this instead. Panics if no box is open.
+fn box_rows(shared: &std::sync::Arc<Shared>) -> Vec<String> {
+    let f = frame(shared);
+    let top = f
+        .iter()
+        .position(|r| r.starts_with('┌'))
+        .expect("box_rows: no open box (no row starts with the top border)");
+    let bottom = f[top + 1..]
+        .iter()
+        .position(|r| r.starts_with('└'))
+        .map(|i| top + 1 + i)
+        .expect("box_rows: box never closes (no row starts with the bottom border)");
+    f[top + 1..bottom].to_vec()
+}
+
+/// Whether `needle` appears in the open box's content, `box_rows`
+/// with borders and trailing padding stripped. `ui::wrap` breaks a
+/// line two ways — at a space, which it drops, or (a word longer than
+/// the width, a long path with no spaces) mid-word, which it does
+/// not — so a needle spanning two wrapped rows is checked against the
+/// rows joined both ways, no separator and a single space, rather
+/// than guessing which kind of break split it. Not suitable for a
+/// check that cares about row shape (a pretty-printed JSON line): use
+/// `box_rows` for that instead.
+fn box_contains(shared: &std::sync::Arc<Shared>, needle: &str) -> bool {
+    let owned = box_rows(shared);
+    let rows: Vec<&str> = owned
+        .iter()
+        .map(|r| {
+            r.strip_prefix('│')
+                .and_then(|s| s.strip_suffix('│'))
+                .unwrap_or(r)
+                .trim_end()
+        })
+        .collect();
+    rows.join("").contains(needle) || rows.join(" ").contains(needle)
 }
 
 async fn run_drive(
@@ -295,7 +404,8 @@ fn assistant_text_from_transcript(transcript: &[Value], from: usize) -> String {
         .collect()
 }
 
-/// Whether an approval prompt is open.
+/// The `check` most `await_ui` calls in this file wait for: a request
+/// no rule decided has reached a prompt.
 fn prompt_open(ui: &Ui) -> bool {
     !ui.prompts.is_empty()
 }
@@ -953,24 +1063,29 @@ async fn scenario() {
         tokio::spawn(async move {
             type_line(&tx, "write out.txt");
             await_ui(&shared, prompt_open, "run I: prompt open").await;
-            let rows = frame(&shared);
-            // The access line's own path is a temp workspace, long
-            // enough to wrap (even hard-break) across rows, so the
-            // needles below look for "write" and the path's own tail
-            // separately rather than one continuous "write {path}"
-            // string.
+            assert!(
+                frame(&shared).iter().any(|r| r.contains(TITLE)),
+                "run I: {:?}",
+                frame(&shared)
+            );
+            // Box-only content: `box_contains`, not `frame` — the pane
+            // above the box still shows the typed "write out.txt" as
+            // an `Entry::User` row, which would satisfy "write" and
+            // "out.txt" needles against `frame` even if the box's own
+            // content were wrong.
             for needle in [
-                TITLE,
                 "write",
                 "out.txt",
                 "asked by tool-write",
                 "the model asked write (toolu_s1)",
             ] {
                 assert!(
-                    rows.iter().any(|r| r.contains(needle)),
-                    "run I: missing {needle:?} in {rows:?}"
+                    box_contains(&shared, needle),
+                    "run I: missing {needle:?} in {:?}",
+                    box_rows(&shared)
                 );
             }
+            let rows = box_rows(&shared);
             for line in pretty_lines(&json!({"path": "out.txt", "content": "hello"})) {
                 assert!(
                     rows.iter().any(|r| r.contains(&line)),
@@ -1102,17 +1217,24 @@ async fn scenario() {
             let before_rules = shared.lock().session_rules.len();
             type_line(&tx, &format!("read {}", outside.display()));
             await_ui(&shared, prompt_open, "run K: first prompt open").await;
-            let rows = frame(&shared);
-            // As in run I: the path is a temp directory, long enough
-            // to wrap across rows, so only the file's own name is
-            // checked rather than the whole "read {path}" line.
+            // Box-only content: `box_contains`, not `frame` — the pane
+            // above the box still shows the typed "read {outside}" as
+            // an `Entry::User` row, which would satisfy the
+            // "outside.txt" needle even if the box's own content were
+            // wrong. The temp directory's path is long enough that the
+            // box's own render can hard-wrap it mid-word (observed:
+            // "...outside.tx" / "t..." on consecutive rows), which
+            // `box_rows`, checked row by row, would miss even though
+            // the box shows it in full.
             assert!(
-                rows.iter().any(|r| r.contains("outside.txt")),
-                "run K: {rows:?}"
+                box_contains(&shared, "outside.txt"),
+                "run K: {:?}",
+                box_rows(&shared)
             );
             assert!(
-                rows.iter().any(|r| r.contains("asked by tool-read")),
-                "run K: {rows:?}"
+                box_contains(&shared, "asked by tool-read"),
+                "run K: {:?}",
+                box_rows(&shared)
             );
             key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
             await_ui(
@@ -1377,6 +1499,92 @@ async fn scenario() {
         !f.workspace.join("forbidden.txt").exists(),
         "run N: forbidden.txt was written"
     );
+
+    reset_editor(&shared);
+    // ---- run P: a spawn outside the workspace root, carrying no
+    // stdin — `Unjudgeable::SpawnElsewhere` through a real prompt, the
+    // one combination where `unjudgeable` is `Some` (the box shows the
+    // `any` note) *and* `subject` is `Some` (the full `KEYS` legend
+    // applies and `a` records a rule); otherwise this case is exercised
+    // only by `policy.rs`'s unit test.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let before_rules = shared.lock().session_rules.len();
+            type_line(&tx, "elsewhere");
+            await_ui(&shared, prompt_open, "run P: first prompt open").await;
+            assert!(
+                box_contains(&shared, "asked by tool-elsewhere"),
+                "run P: {:?}",
+                box_rows(&shared)
+            );
+            assert!(
+                box_contains(
+                    &shared,
+                    "only a rule of kind any could have matched this: a spawn outside \
+                     the workspace root, which no spawn rule can judge"
+                ),
+                "run P: missing the any-only note in {:?}",
+                box_rows(&shared)
+            );
+            // The full legend, not `KEYS_ONCE`: `subject` is `Some`
+            // for this request, so `a`/`d` must be able to record a
+            // rule.
+            assert!(
+                box_contains(&shared, "a allow for the session"),
+                "run P: KEYS_ONCE shown instead of the full legend in {:?}",
+                box_rows(&shared)
+            );
+            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run P: first outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                assert_eq!(
+                    ui.session_rules.len(),
+                    before_rules + 1,
+                    "run P: no session rule was recorded"
+                );
+                let entries = &ui.entries[start..];
+                assert!(
+                    entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                        if t.ends_with("allowed at the prompt for the rest of the session"))),
+                    "run P: {entries:?}"
+                );
+            }
+
+            // The same request again: the session rule decides it,
+            // with no second prompt.
+            let mid = shared.lock().entries.len();
+            type_line(&tx, "elsewhere");
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, mid) >= 1,
+                "run P: second outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                assert!(ui.prompts.is_empty(), "run P: a second prompt opened");
+                let entries = &ui.entries[mid..];
+                assert!(
+                    entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                        if t.contains("allowed by session rule spawn:") && t.contains("tool-elsewhere"))),
+                    "run P: {entries:?}"
+                );
+            }
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run P");
 
     reset_editor(&shared);
     // ---- run O: cancel with a prompt open.

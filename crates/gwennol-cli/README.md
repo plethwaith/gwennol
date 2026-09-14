@@ -3,8 +3,10 @@
 `gwennol [options] [prompt]` opens an interactive session by default:
 the model's text streams into a transcript pane, a line editor takes
 the next turn, and an approval no rule decides is asked at a prompt,
-`y`/`n` once, `a`/`d` for the rest of the session; a rule always
-decides first, and every decision traces into the pane, in the same
+`y`/`n` once, `a`/`d` for the rest of the session when the request can
+be remembered (not a spawn carrying stdin, nor an access of a kind
+this frontend does not know); a rule always decides first, and every
+decision traces into the pane, in the same
 words this file's examples show on stderr. `-p`/`--print` — what the
 rest of this file walks through — is one task run headlessly instead,
 with every approval decided by a rule and traced to it, and a request
@@ -105,7 +107,10 @@ nothing; a real restriction names a program that is not a shell
 workspace root matches no `spawn` rule at all, since the grammar cannot
 judge those; only `any` reaches them, in either direction — a
 `deny spawn:*` does not stop such a spawn that a later `allow any`
-admits; `deny any` does — and the trace says so. An `http`
+admits; `deny any` does — and the trace says so, and a session asks
+at a prompt for them instead of denying — a spawn outside the
+workspace root can then be remembered for the session, one carrying
+stdin cannot. An `http`
 pattern names the method first — `http:POST …`, upper-case, one space,
 or `http:* …` for any method — because a URL that may be fetched is
 not one that may be posted to; a method that could never match is
@@ -113,8 +118,9 @@ refused rather than admitting nothing.
 
 Rules are tried in order — `--allow`/`--deny` flags in command-line
 order, then the `--policy` file's `[[rules]]`, then the config file's —
-and the first match decides. A request no rule matches is **denied**,
-and the trace says `denied: no rule matched`. So a narrow deny goes
+and the first match decides. A request no rule matches is **denied**
+in a print run, and the trace says `denied: no rule matched`; a
+session asks at a prompt instead. So a narrow deny goes
 before the broad allow it carves out of:
 
 ```sh

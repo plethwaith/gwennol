@@ -109,9 +109,13 @@ pub struct Ui {
     /// Rules made at prompts, in the order made: tried after every
     /// compiled rule by `Interactive::approve` under this same lock.
     pub session_rules: Vec<SessionRule>,
-    /// The canonical workspace, set once by `tui::start` before the
-    /// frontend runs a turn: what a prompt's key handler roots a
-    /// spawn's session rule at.
+    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs:56`)
+    /// before the frontend runs a turn: what a prompt's key handler
+    /// renders the answered request's trace line against
+    /// (`show::decided`, `prompt.rs:201`). A session rule's own subject
+    /// is not taken from here — `Interactive::approve` computes it
+    /// from its own workspace (`operator.rs:91`) and the prompt
+    /// carries it.
     pub workspace: PathBuf,
 }
 
@@ -300,7 +304,7 @@ impl Shared {
 pub const HELP: &[&str] = &[
     "/exit ends the session (twice while a turn is unwinding: exit at once, status 130)",
     "/help lists the commands",
-    "Esc cancels the running turn",
+    "Esc cancels the running turn (denies once instead, at an open approval prompt)",
     "y n a d answer an open approval prompt: once, or for the rest of the session; Esc denies once",
 ];
 
@@ -418,10 +422,11 @@ impl Widget for View<'_> {
 
 fn render_pane(ui: &Ui, area: Rect, buf: &mut Buffer) {
     // `regions` can hand back a rect [`Layout`] could not actually fit
-    // inside `buf`'s area when the frame is shorter than the three
-    // fixed rows it asks for (`Length(1)` twice plus `Min(1)`); clipped
-    // to what the buffer really has before any `set_stringn` below
-    // indexes it, rather than trusting the sub-rect's own bounds.
+    // inside `buf`'s area when the frame is shorter than the fixed
+    // rows it asks for (`Length(1)` twice, `Length(h)` for an open
+    // prompt, plus `Min(1)`); clipped to what the buffer really has
+    // before any `set_stringn` below indexes it, rather than trusting
+    // the sub-rect's own bounds.
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
         return;
@@ -739,7 +744,8 @@ mod tests {
     }
 
     /// Guards two panics on a terminal under three rows: `regions`
-    /// splits `Min(1)/Length(1)/Length(1)`, so below three rows the
+    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:392-401;
+    /// `h` is zero with no prompt open), so below three rows the
     /// status or editor area's `y` falls outside the buffer and
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
     /// `cursor - start` underflowed once `width < 3`; and, with a
