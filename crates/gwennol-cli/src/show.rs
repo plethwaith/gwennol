@@ -3,9 +3,10 @@
 //! the same words: an access in the words a prompt would use,
 //! with the URL's userinfo, query and fragment scrubbed because
 //! the screen or the trace is a record and a rule judged the full
-//! URL; a tool call as name and id; a bounded one-line preview;
-//! the outcome line and the exit status it decides; and the trace's
-//! lines: a decision, a call, its result, its failure, a retry.
+//! URL, and the exact subject a session rule is made of; a tool
+//! call as name and id; a bounded one-line preview; the outcome
+//! line and the exit status it decides; and the trace's lines: a
+//! decision, a call, its result, its failure, a retry.
 
 use std::fmt;
 use std::path::Path;
@@ -40,36 +41,75 @@ impl fmt::Display for ShowAccess<'_> {
             Access::WriteFile(p) => write!(f, "write {}", p.display()),
             Access::ListDir(p) => write!(f, "list {}", p.display()),
             Access::Spawn { argv, cwd, stdin } => {
-                // argv as a JSON array: unambiguous about where each
-                // argument ends, which a space-joined line is not.
-                write!(f, "spawn {}", serde_json::Value::from(argv.clone()))?;
-                if cwd != self.workspace {
-                    write!(f, " in {}", cwd.display())?;
-                }
+                write!(f, "spawn {}", spawn_subject(argv, cwd, self.workspace))?;
                 if let Some(stdin) = stdin {
                     write!(f, " with {} bytes on stdin", stdin.len())?;
                 }
                 Ok(())
             }
-            Access::Http { method, url } => match url::Url::parse(url) {
-                Ok(mut u) => {
-                    let had_userinfo = !u.username().is_empty() || u.password().is_some();
-                    let had_query = u.query().is_some() || u.fragment().is_some();
-                    gwennol_core::steps::http::scrub(&mut u);
-                    write!(f, "{method} {u}")?;
-                    // Say that something was cut, without saying what.
-                    if had_query {
-                        f.write_str("?…")?;
-                    }
-                    if had_userinfo {
-                        f.write_str(" (credentials in the URL cut)")?;
-                    }
-                    Ok(())
-                }
-                Err(_) => write!(f, "{method} request (unparseable URL)"),
-            },
+            Access::Http { method, url } => f.write_str(&http_subject(method, url)),
             _ => f.write_str("an access this frontend does not know"),
         }
+    }
+}
+
+/// The argv as a JSON array — unambiguous about where each argument
+/// ends, which a space-joined line is not — plus ` in {cwd}` when the
+/// spawn's cwd is not `workspace`.
+fn spawn_subject(argv: &[String], cwd: &Path, workspace: &Path) -> String {
+    let mut out = serde_json::Value::from(argv.to_vec()).to_string();
+    if cwd != workspace {
+        out.push_str(&format!(" in {}", cwd.display()));
+    }
+    out
+}
+
+/// The scrubbed `{method} {url}`, with the same `?…` and `(credentials
+/// in the URL cut)` markers `ShowAccess` writes: userinfo, a query
+/// string and a fragment can all carry a credential, and the rule that
+/// judged the request judged the whole URL, not this shortened one.
+fn http_subject(method: &str, url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let had_userinfo = !u.username().is_empty() || u.password().is_some();
+            let had_query = u.query().is_some() || u.fragment().is_some();
+            gwennol_core::steps::http::scrub(&mut u);
+            let mut out = format!("{method} {u}");
+            // Say that something was cut, without saying what.
+            if had_query {
+                out.push_str("?…");
+            }
+            if had_userinfo {
+                out.push_str(" (credentials in the URL cut)");
+            }
+            out
+        }
+        Err(_) => format!("{method} request (unparseable URL)"),
+    }
+}
+
+/// The exact text a [`crate::policy::SessionRule`] remembers for
+/// `access`, made at a workspace rooted at `workspace`: the path for
+/// the three path kinds; for a spawn without stdin, the argv and cwd
+/// `spawn_subject` writes; for `http`, `http_subject`. `None` for
+/// a spawn carrying stdin — the stdin is the payload, and each one is
+/// a new request — and for a kind this frontend does not know. Built
+/// through the same helpers [`ShowAccess`] renders with, so the two
+/// cannot drift: a session rule matches exactly the text the prompt
+/// showed.
+pub fn subject(access: &Access, workspace: &Path) -> Option<String> {
+    match access {
+        Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
+            Some(p.display().to_string())
+        }
+        Access::Spawn {
+            argv,
+            cwd,
+            stdin: None,
+        } => Some(spawn_subject(argv, cwd, workspace)),
+        Access::Spawn { stdin: Some(_), .. } => None,
+        Access::Http { method, url } => Some(http_subject(method, url)),
+        _ => None,
     }
 }
 
@@ -102,12 +142,18 @@ pub fn preview(text: &str) -> String {
 /// itself: the access, who asked, the call it was made for (if any),
 /// and the judgement.
 pub fn decision(request: &ApprovalRequest, judgement: &Judgement<'_>, workspace: &Path) -> String {
+    decided(request, judgement, workspace)
+}
+
+/// A decision line whose verdict is not a `Judgement`: what a prompt's
+/// own answer writes.
+pub fn decided(request: &ApprovalRequest, verdict: impl fmt::Display, workspace: &Path) -> String {
     let cause = match &request.cause {
         Some(call) => format!(" (call {})", ShowCall(call)),
         None => String::new(),
     };
     format!(
-        "{} from {}{cause}: {judgement}",
+        "{} from {}{cause}: {verdict}",
         ShowAccess {
             access: &request.access,
             workspace,
@@ -190,6 +236,12 @@ mod tests {
         assert_eq!(preview(&exact), exact);
     }
 
+    /// Guards D2: `subject` is the text after the kind word of
+    /// `ShowAccess` (the whole line for `http`, which has no leading
+    /// kind word), `None` for a spawn carrying stdin, and `decided`
+    /// with the judgement itself is exactly what `decision` writes.
+    /// Mutation: omit the cwd in `spawn_subject` — the elsewhere-spawn
+    /// assertions below fail.
     #[test]
     fn the_trace_shows_what_a_prompt_would_have() {
         let ws = Path::new("/ws");
@@ -200,45 +252,80 @@ mod tests {
             }
             .to_string()
         };
+
+        let read = Access::ReadFile(PathBuf::from("/ws/a.txt"));
+        assert_eq!(show(&read), "read /ws/a.txt");
+        assert_eq!(subject(&read, ws), Some("/ws/a.txt".to_string()));
+
+        let spawn_local = Access::Spawn {
+            argv: vec!["bash".into(), "-c".into(), "echo a b".into()],
+            cwd: PathBuf::from("/ws"),
+            stdin: None,
+        };
+        assert_eq!(show(&spawn_local), r#"spawn ["bash","-c","echo a b"]"#);
         assert_eq!(
-            show(&Access::ReadFile(PathBuf::from("/ws/a.txt"))),
-            "read /ws/a.txt"
+            subject(&spawn_local, ws),
+            Some(r#"["bash","-c","echo a b"]"#.to_string())
         );
+
+        let spawn_elsewhere_with_stdin = Access::Spawn {
+            argv: vec!["sh".into()],
+            cwd: PathBuf::from("/elsewhere"),
+            stdin: Some("exit 1\n".into()),
+        };
         assert_eq!(
-            show(&Access::Spawn {
-                argv: vec!["bash".into(), "-c".into(), "echo a b".into()],
-                cwd: PathBuf::from("/ws"),
-                stdin: None,
-            }),
-            r#"spawn ["bash","-c","echo a b"]"#
-        );
-        assert_eq!(
-            show(&Access::Spawn {
-                argv: vec!["sh".into()],
-                cwd: PathBuf::from("/elsewhere"),
-                stdin: Some("exit 1\n".into()),
-            }),
+            show(&spawn_elsewhere_with_stdin),
             r#"spawn ["sh"] in /elsewhere with 7 bytes on stdin"#
         );
+        // The stdin is the real payload; no session rule can remember
+        // a request like this one.
+        assert_eq!(subject(&spawn_elsewhere_with_stdin, ws), None);
+        let spawn_elsewhere = Access::Spawn {
+            argv: vec!["sh".into()],
+            cwd: PathBuf::from("/elsewhere"),
+            stdin: None,
+        };
         assert_eq!(
-            show(&Access::Http {
-                method: "POST".into(),
-                url: "https://api.anthropic.com/v1/messages".into(),
-            }),
-            "POST https://api.anthropic.com/v1/messages"
+            subject(&spawn_elsewhere, ws),
+            Some(r#"["sh"] in /elsewhere"#.to_string())
         );
+
+        let http = Access::Http {
+            method: "POST".into(),
+            url: "https://api.anthropic.com/v1/messages".into(),
+        };
+        assert_eq!(show(&http), "POST https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            subject(&http, ws),
+            Some("POST https://api.anthropic.com/v1/messages".to_string())
+        );
+
         // Userinfo and the query string can carry a credential: the
         // rule judged them, the trace does not repeat them.
-        let shown = show(&Access::Http {
+        let secret_http = Access::Http {
             method: "GET".into(),
             url: "https://user:hunter2@x.example/p?key=sk-secret#frag".into(),
-        });
+        };
+        let shown = show(&secret_http);
         assert_eq!(
             shown,
             "GET https://x.example/p?… (credentials in the URL cut)"
         );
         assert!(!shown.contains("hunter2") && !shown.contains("sk-secret"));
         assert!(!shown.contains("user"));
+        assert_eq!(subject(&secret_http, ws), Some(shown));
+
+        let request = ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: read,
+        };
+        let policy = crate::policy::Policy::compile(Vec::new(), ws).unwrap();
+        let judgement = policy.judge(&request);
+        assert_eq!(
+            decided(&request, &judgement, ws),
+            decision(&request, &judgement, ws)
+        );
     }
 
     #[test]

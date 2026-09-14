@@ -37,8 +37,8 @@ guests compiled to wasm32, [docs/SUBSTRATE.md](docs/SUBSTRATE.md)),
 the bundled plugins (the Anthropic provider and the `read`, `write`,
 `grep` and `bash` tools, [plugins/](plugins/)), the agent loop
 (`gwennol_core::agent::Session`) and the `gwennol` CLI (interactive by
-default, `-p` for a print run, every approval decided by a rule and
-traced, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
+default, `-p` for a print run, rules first, then a prompt in a
+session, every decision traced, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
 exercised by integration tests against a real kernel and a stubbed
 Messages API. Nothing is packaged yet: the CLI runs from a checkout
 with `cargo xtask bundle` beside it. The 0.0.0 release on crates.io is
@@ -75,9 +75,10 @@ cd /path/to/a/repository
     'What is this repository for?'
 ```
 
-Nothing is approved by prompt: every reach outside the sandbox is
-judged by the `--allow`/`--deny` rules and a config file, and traced
-with the rule that decided it — on stderr in a print run, into the
+Every reach outside the sandbox is judged by the `--allow`/`--deny`
+rules and a config file first; a session asks at a prompt for what no
+rule decides, and a print run denies it. Every decision is traced
+with the rule or answer behind it — on stderr in a print run, into the
 session's pane otherwise. The rule grammar, the config
 file, where secrets come from and the exit statuses are in
 [crates/gwennol-cli/README.md](crates/gwennol-cli/README.md).
@@ -86,7 +87,7 @@ file, where secrets come from and the exit statuses are in
 
 ```
 crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
-crates/gwennol-cli/    the `gwennol` binary: interactive session or print run, rules instead of prompts
+crates/gwennol-cli/    the `gwennol` binary: interactive session or print run; rules, then a prompt
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
 crates/provider-anthropic/  the bundled model provider's guest code

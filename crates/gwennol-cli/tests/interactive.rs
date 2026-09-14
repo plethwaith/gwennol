@@ -21,6 +21,7 @@ use clap::{CommandFactory, FromArgMatches};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gwennol::tui::drive::drive;
 use gwennol::tui::keys::Input;
+use gwennol::tui::prompt::TITLE;
 use gwennol::tui::screen::{Kitty, Screen};
 use gwennol::tui::ui::{Entry, Shared, TurnState, Ui, render};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
@@ -28,12 +29,67 @@ use gwennol_core::Session;
 use provider_anthropic::PLUGIN_NAME as PROVIDER;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 // ------------------------------------------------------------- fixture
 
+/// The test-only `tool-sh` manifest: pipes its `script` argument to
+/// `sh` on stdin, shaped like `plugins/tools/bash.json`. It exists so
+/// the suite can raise a spawn that carries stdin, which no bundled
+/// tool does: every real tool runs its command as argv, never through
+/// an interpreter fed on stdin.
+const TOOL_SH_MANIFEST: &str = r#"{
+  "formatVersion": 1,
+  "name": "tool-sh",
+  "version": "0.1.0",
+  "description": "Test-only: pipes its script to sh on stdin, so the approval suite can raise a spawn that carries stdin.",
+  "roles": ["TOOL"],
+  "permissions": ["step_type:host_process.run"],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "sh",
+        "description": "Run a script by piping it to sh on stdin.",
+        "parameters": {
+          "type": "object",
+          "required": ["script"],
+          "additionalProperties": false,
+          "properties": {
+            "script": { "type": "string", "description": "Fed to sh on stdin." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "run",
+          "type": "host_process.run",
+          "params": {
+            "argv": ["sh"],
+            "stdin": "{{$input.script}}",
+            "timeout_ms": 60000,
+            "max_output_bytes": 262144
+          }
+        },
+        {
+          "id": "answer",
+          "type": "return",
+          "params": { "value": {
+            "content": "{{$steps.run.result.stdout}}",
+            "is_error": "{{$steps.run.result.status != 0}}"
+          } }
+        }
+      ]
+    }
+  }
+}
+"#;
+
 struct Fixture {
+    /// The fixture's own root: the workspace's parent, and where
+    /// `outside.txt` sits — a path outside the workspace an
+    /// interactive spawn can be judged at (D2).
+    root: PathBuf,
     workspace: PathBuf,
     key_file: PathBuf,
     config: PathBuf,
@@ -46,6 +102,7 @@ fn fixture() -> &'static Fixture {
         let workspace = root.join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("hello.txt"), "hello from the workspace\n").unwrap();
+        std::fs::write(root.join("outside.txt"), "outside\n").unwrap();
 
         let mut bundled = xtask::bundle(&xtask::workspace_root())
             .unwrap_or_else(|e| panic!("bundling plugins/ failed: {e}"));
@@ -60,6 +117,7 @@ fn fixture() -> &'static Fixture {
         let bundle_root = root.join("bundle");
         xtask::write_bundle(&bundled, &bundle_root).unwrap();
         let plugins = bundle_root.join(xtask::PLUGINS_DIR);
+        std::fs::write(plugins.join("tools").join("sh.json"), TOOL_SH_MANIFEST).unwrap();
 
         let stub = stub();
         let key_file = root.join("anthropic.key");
@@ -70,7 +128,8 @@ fn fixture() -> &'static Fixture {
             &config,
             format!(
                 "[plugins]\ndir = {plugins:?}\ntrust_runtimes = [{provider:?}]\n\n\
-                 [plugin_config.{provider}]\nmodel = \"claude-fixture\"\nbase_url = \"http://{addr}/scripted\"\n",
+                 [plugin_config.{provider}]\nmodel = \"claude-fixture\"\nbase_url = \"http://{addr}/scripted\"\n\n\
+                 [[rules]]\ndeny = \"write:forbidden.txt\"\n",
                 plugins = plugins.display().to_string(),
                 provider = PROVIDER,
                 addr = stub.addr,
@@ -79,6 +138,7 @@ fn fixture() -> &'static Fixture {
         .unwrap();
 
         Fixture {
+            root,
             workspace,
             key_file,
             config,
@@ -232,6 +292,23 @@ fn assistant_text_from_transcript(transcript: &[Value], from: usize) -> String {
                 .flatten()
         })
         .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// Whether an approval prompt is open.
+fn prompt_open(ui: &Ui) -> bool {
+    !ui.prompts.is_empty()
+}
+
+/// `v` pretty-printed, as separate lines with no leading/trailing
+/// whitespace: what a prompt box's arguments block wraps, one JSON
+/// line at a time, so a frame assertion can look for one key's own
+/// row rather than the whole block.
+fn pretty_lines(v: &Value) -> Vec<String> {
+    serde_json::to_string_pretty(v)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_string())
         .collect()
 }
 
@@ -862,5 +939,501 @@ async fn scenario() {
         code,
         ExitCode::from(130),
         "run H: a second /exit forces status 130"
+    );
+
+    let f = fixture();
+
+    reset_editor(&shared);
+    // ---- run I: a write no rule matches opens a prompt; `y` allows
+    // it once.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "write out.txt");
+            await_ui(&shared, prompt_open, "run I: prompt open").await;
+            let rows = frame(&shared);
+            // The access line's own path is a temp workspace, long
+            // enough to wrap (even hard-break) across rows, so the
+            // needles below look for "write" and the path's own tail
+            // separately rather than one continuous "write {path}"
+            // string.
+            for needle in [
+                TITLE,
+                "write",
+                "out.txt",
+                "asked by tool-write",
+                "the model asked write (toolu_s1)",
+            ] {
+                assert!(
+                    rows.iter().any(|r| r.contains(needle)),
+                    "run I: missing {needle:?} in {rows:?}"
+                );
+            }
+            for line in pretty_lines(&json!({"path": "out.txt", "content": "hello"})) {
+                assert!(
+                    rows.iter().any(|r| r.contains(&line)),
+                    "run I: missing argument row {line:?} in {rows:?}"
+                );
+            }
+            key(&tx, KeyCode::Char('y'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run I: outcome",
+            )
+            .await;
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run I");
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Entry::Trace(t) if t.ends_with("allowed at the prompt"))),
+            "run I: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Trace(t) if t.starts_with("gwennol: <- write toolu_s1: ok, "))),
+            "run I: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(
+                |e| matches!(e, Entry::Assistant(t) if t.starts_with("It says: wrote 5 bytes"))
+            ),
+            "run I: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Outcome(t) if t.starts_with("gwennol: done (EndTurn): 2 rounds"))),
+            "run I: {entries:?}"
+        );
+        assert!(ui.prompts.is_empty(), "run I: a prompt is still open");
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("out.txt")).unwrap(),
+        "hello",
+        "run I: out.txt"
+    );
+
+    reset_editor(&shared);
+    // ---- run J: a write no rule matches, denied once.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "write denied.txt");
+            await_ui(&shared, prompt_open, "run J: prompt open").await;
+            key(&tx, KeyCode::Char('n'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run J: outcome",
+            )
+            .await;
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run J");
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Entry::Trace(t) if t.ends_with("denied at the prompt"))),
+            "run J: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                if t.starts_with("gwennol: !! write toolu_s1: ") && t.contains("operator denied write to"))),
+            "run J: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Entry::Assistant(t) if t.starts_with("The read failed: "))),
+            "run J: {entries:?}"
+        );
+    }
+    {
+        let last_req = stub().requests().last().cloned().unwrap();
+        let last_msg = last_req.2["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let first_block = last_msg["content"][0].clone();
+        assert_eq!(first_block["type"], "tool_result", "run J: {first_block:?}");
+        assert_eq!(first_block["is_error"], true, "run J: {first_block:?}");
+        assert!(
+            first_block["content"]
+                .as_str()
+                .unwrap()
+                .contains("operator denied write to"),
+            "run J: {first_block:?}"
+        );
+    }
+    assert!(
+        !f.workspace.join("denied.txt").exists(),
+        "run J: denied.txt was written"
+    );
+
+    reset_editor(&shared);
+    // ---- run K: a session rule for a spawnless request (read), made
+    // with `a`; the same request afterward decides by that rule, with
+    // no prompt.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let outside = f.root.join("outside.txt");
+    let driver = {
+        let shared = shared.clone();
+        let outside = outside.clone();
+        tokio::spawn(async move {
+            let before_rules = shared.lock().session_rules.len();
+            type_line(&tx, &format!("read {}", outside.display()));
+            await_ui(&shared, prompt_open, "run K: first prompt open").await;
+            let rows = frame(&shared);
+            // As in run I: the path is a temp directory, long enough
+            // to wrap across rows, so only the file's own name is
+            // checked rather than the whole "read {path}" line.
+            assert!(
+                rows.iter().any(|r| r.contains("outside.txt")),
+                "run K: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("asked by tool-read")),
+                "run K: {rows:?}"
+            );
+            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run K: first outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                assert_eq!(
+                    ui.session_rules.len(),
+                    before_rules + 1,
+                    "run K: no session rule was recorded"
+                );
+                let entries = &ui.entries[start..];
+                assert!(
+                    entries.iter().any(|e| matches!(e, Entry::Trace(t) if t == &format!(
+                        "gwennol: read {} from tool-read (call read toolu_s1): allowed at the prompt for the rest of the session",
+                        outside.display()
+                    ))),
+                    "run K: {entries:?}"
+                );
+                assert!(
+                    entries.iter().any(
+                        |e| matches!(e, Entry::Assistant(t) if t.starts_with("It says: outside"))
+                    ),
+                    "run K: {entries:?}"
+                );
+            }
+            let mid = shared.lock().entries.len();
+            type_line(&tx, &format!("read {}", outside.display()));
+            // A prompt would hang here for 10s: the mutation this run
+            // guards (passing `&[]` for the session slice) makes the
+            // request prompt again instead of deciding at once.
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, mid) >= 1,
+                "run K: second outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                let entries = &ui.entries[mid..];
+                assert!(
+                    entries
+                        .iter()
+                        .any(|e| matches!(e, Entry::Trace(t) if t.ends_with(&format!(
+                            "allowed by session rule read:{} for plugin tool-read",
+                            outside.display()
+                        )))),
+                    "run K: {entries:?}"
+                );
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|e| matches!(e, Entry::Trace(t) if t.contains("at the prompt"))),
+                    "run K: a prompt trace appeared for the remembered rule: {entries:?}"
+                );
+                assert!(ui.prompts.is_empty(), "run K: a prompt is open");
+            }
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run K");
+
+    reset_editor(&shared);
+    // ---- run L: a session rule for a spawn (grep), made with `d`.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let grep_argv = r#"["grep","-rnI","--exclude-dir=.git","-E","-e","needle","--","."]"#;
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "grep needle");
+            await_ui(&shared, prompt_open, "run L: first prompt open").await;
+            let rows = frame(&shared);
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(&format!("spawn {grep_argv}"))),
+                "run L: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("asked by tool-grep")),
+                "run L: {rows:?}"
+            );
+            key(&tx, KeyCode::Char('d'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run L: first outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                let entries = &ui.entries[start..];
+                assert!(
+                    entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                        if t.ends_with("denied at the prompt for the rest of the session"))),
+                    "run L: {entries:?}"
+                );
+                assert!(
+                    entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                        if t.starts_with("gwennol: !! grep toolu_s1: ") && t.contains("operator denied spawn of \"grep\""))),
+                    "run L: {entries:?}"
+                );
+            }
+            let mid = shared.lock().entries.len();
+            type_line(&tx, "grep needle");
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, mid) >= 1,
+                "run L: second outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                let entries = &ui.entries[mid..];
+                assert!(
+                    entries
+                        .iter()
+                        .any(|e| matches!(e, Entry::Trace(t) if t.ends_with(&format!(
+                            "denied by session rule spawn:{grep_argv} for plugin tool-grep"
+                        )))),
+                    "run L: {entries:?}"
+                );
+                assert!(ui.prompts.is_empty(), "run L: a prompt is open");
+            }
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run L");
+
+    reset_editor(&shared);
+    // ---- run M: a spawn no session rule can hold (it carries
+    // stdin): decided once, remembering nothing, each time.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let before_rules = shared.lock().session_rules.len();
+            type_line(&tx, "sh echo from stdin");
+            await_ui(&shared, prompt_open, "run M: first prompt open").await;
+            let rows = frame(&shared);
+            for needle in [
+                "spawn [\"sh\"] with 15 bytes on stdin",
+                "asked by tool-sh",
+                "the child will read this on stdin (15 bytes):",
+                "echo from stdin",
+            ] {
+                assert!(
+                    rows.iter().any(|r| r.contains(needle)),
+                    "run M: missing {needle:?} in {rows:?}"
+                );
+            }
+            let keys_once_head: String = gwennol::tui::prompt::KEYS_ONCE.chars().take(30).collect();
+            assert!(
+                rows.iter().any(|r| r.contains(&keys_once_head)),
+                "run M: {rows:?}"
+            );
+            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run M: first outcome",
+            )
+            .await;
+            {
+                let ui = shared.lock();
+                let entries = &ui.entries[start..];
+                assert!(
+                    entries.iter().any(
+                        |e| matches!(e, Entry::Trace(t) if t.ends_with("allowed at the prompt"))
+                    ),
+                    "run M: {entries:?}"
+                );
+                assert_eq!(
+                    ui.session_rules.len(),
+                    before_rules,
+                    "run M: a rule was remembered for a stdin spawn"
+                );
+                assert!(
+                    entries
+                        .iter()
+                        .any(|e| matches!(e, Entry::Assistant(t) if t.contains("from stdin"))),
+                    "run M: {entries:?}"
+                );
+            }
+            let mid = shared.lock().entries.len();
+            type_line(&tx, "sh echo from stdin");
+            await_ui(&shared, prompt_open, "run M: second prompt open").await;
+            key(&tx, KeyCode::Char('y'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, mid) >= 1,
+                "run M: second outcome",
+            )
+            .await;
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run M");
+
+    reset_editor(&shared);
+    // ---- run N: a compiled `deny` from the config file decides
+    // outright — no prompt at all.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "write forbidden.txt");
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run N: outcome",
+            )
+            .await;
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run N");
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                if t.contains("denied by deny \"write:forbidden.txt\" (") && t.contains(" rule 1)"))),
+            "run N: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(
+                |e| matches!(e, Entry::Trace(t) if t.starts_with("gwennol: !! write toolu_s1: "))
+            ),
+            "run N: {entries:?}"
+        );
+        assert!(
+            ui.prompts.is_empty(),
+            "run N: a prompt opened for a compiled deny"
+        );
+        let user_at = entries
+            .iter()
+            .position(|e| matches!(e, Entry::User(_)))
+            .expect("run N: this run's User entry");
+        assert!(
+            !entries[user_at + 1..]
+                .iter()
+                .any(|e| matches!(e, Entry::Trace(t) if t.contains("at the prompt"))),
+            "run N: a prompt trace appeared for a compiled deny: {entries:?}"
+        );
+    }
+    assert!(
+        !f.workspace.join("forbidden.txt").exists(),
+        "run N: forbidden.txt was written"
+    );
+
+    reset_editor(&shared);
+    // ---- run O: cancel with a prompt open.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "write cancel.txt");
+            await_ui(&shared, prompt_open, "run O: prompt open").await;
+            assert!(
+                frame(&shared).iter().any(|r| r.contains(TITLE)),
+                "run O: the box is not shown"
+            );
+            // `tx` drops here, its only owner: the channel closes
+            // while the prompt is still open.
+        })
+    };
+    let began = std::time::Instant::now();
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "run O: cancel took too long to unwind"
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "run O");
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, Entry::Outcome(t) if t == "gwennol: cancelled")),
+            "run O: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, Entry::Trace(t)
+                if t.starts_with("gwennol: !! write toolu_s1: interrupted: the turn was cancelled"))),
+            "run O: {entries:?}"
+        );
+        assert!(ui.prompts.is_empty(), "run O: the prompt is still open");
+    }
+    assert!(
+        !frame(&shared).iter().any(|r| r.contains(TITLE)),
+        "run O: the box is still shown after drive returned"
+    );
+    let last = session.transcript().last().cloned().unwrap();
+    let content = last["content"].as_array().cloned().unwrap_or_default();
+    assert!(
+        content.iter().any(|b| b
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.starts_with("interrupted: the turn was cancelled"))),
+        "run O: the transcript's tool_result does not carry the interruption: {last:?}"
+    );
+    assert!(
+        !f.workspace.join("cancel.txt").exists(),
+        "run O: cancel.txt was written"
     );
 }

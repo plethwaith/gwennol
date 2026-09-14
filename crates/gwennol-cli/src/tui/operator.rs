@@ -1,8 +1,16 @@
-//! The interactive [`Operator`]: policy still answers approvals and
-//! sources still answer secrets, exactly as the print-mode frontend
-//! does; every event and decision becomes a pane update instead of a
-//! line on stderr. The frontend drives `Session::turn` itself (D7), so
-//! `input` never runs.
+//! The interactive [`Operator`]: a rule, compiled or made at a
+//! session's own prompt, still answers what it can, and sources still
+//! answer secrets, exactly as the print-mode frontend does; every
+//! event and decision becomes a pane update instead of a line on
+//! stderr. A request no rule matches becomes a prompt in the pane
+//! instead of a denial: the one thing a
+//! session can do that a print run cannot is ask. A key answers it in
+//! `drive` — `y`/`n` decide once, `a`/`d` for the rest of the session
+//! as a `SessionRule` tried after every compiled rule — and the
+//! prompt comes down by construction when the turn is cancelled under
+//! it, since [`crate::tui::prompt::PromptGuard`]'s drop runs before
+//! the awaited receiver's does. The frontend drives `Session::turn`
+//! itself (D7), so `input` never runs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +20,7 @@ use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn};
 use crate::policy::Policy;
 use crate::secrets::Secrets;
 use crate::show;
+use crate::tui::prompt::{Prompt, PromptGuard};
 use crate::tui::ui::{Entry, Shared};
 
 /// The interactive frontend: judges by `policy`, answers secrets from
@@ -47,14 +56,46 @@ impl Interactive {
 
 #[async_trait::async_trait]
 impl Operator for Interactive {
+    /// Judge under one `update`: a rule or a session rule decides and
+    /// traces with no `await`. Otherwise open a prompt carrying the
+    /// request, the reason no rule could judge it, the rendered
+    /// access line, and the subject a session rule would be made
+    /// from, and await the person's answer; a guard removes the
+    /// prompt when this future is dropped, and a receiver error (the
+    /// guard's sender gone without an answer) denies.
     async fn approve(&self, request: ApprovalRequest) -> Decision {
-        let judgement = self.policy.judge(&request);
-        let line = format!(
-            "gwennol: {}",
-            show::decision(&request, &judgement, &self.workspace)
+        let judged = self.shared.update(|ui| {
+            let judgement = self.policy.judge_with(&request, &ui.session_rules);
+            if judgement.rule.is_some() || judgement.session.is_some() {
+                let line = format!(
+                    "gwennol: {}",
+                    show::decision(&request, &judgement, &self.workspace)
+                );
+                let decision = judgement.decision;
+                ui.push(Entry::Trace(line));
+                Ok(decision)
+            } else {
+                Err(judgement.unjudgeable)
+            }
+        });
+        let unjudgeable = match judged {
+            Ok(decision) => return decision,
+            Err(u) => u,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let access_line = show::ShowAccess {
+            access: &request.access,
+            workspace: &self.workspace,
+        }
+        .to_string();
+        let subject = show::subject(&request.access, &self.workspace);
+        let _guard = PromptGuard::open(
+            &self.shared,
+            Prompt::new(request, unjudgeable, access_line, subject, tx),
         );
-        self.shared.update(|ui| ui.push(Entry::Trace(line)));
-        judgement.decision
+        // Dropped here when the turn is cancelled under the prompt:
+        // the guard runs before `rx` is dropped (declared after it).
+        rx.await.unwrap_or(Decision::Deny)
     }
 
     async fn secret(&self, plugin: &str, name: &str) -> Option<String> {
@@ -77,6 +118,7 @@ impl Operator for Interactive {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::task::Poll;
 
     use gwennol_core::ToolCall;
 
@@ -147,6 +189,66 @@ mod tests {
         assert!(
             !preview.contains("\n    line two"),
             "verbosity 0 showed each line on its own indented line: {preview:?}"
+        );
+    }
+
+    /// Guards D1, D3: a compiled rule and a session rule both decide
+    /// at once, tracing the same shape a rule decision always has,
+    /// with no prompt ever opened. Mutation: pass `&[]` for the
+    /// session slice in `approve` — the session-rule case below
+    /// regresses to a prompt (`Poll::Pending`).
+    #[test]
+    fn a_rule_or_a_session_rule_decides_without_a_prompt() {
+        use crate::policy::{Kind, RuleSpec, Source};
+        use crate::tui::prompt::tests::{op, write_req};
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        let deny_policy = crate::policy::Policy::compile(
+            vec![RuleSpec {
+                decision: Decision::Deny,
+                text: "write:**".to_string(),
+                plugin: None,
+                source: Source::Flag,
+            }],
+            Path::new("/ws"),
+        )
+        .unwrap();
+        let (interactive, shared) = op(deny_policy);
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+        assert!(shared.lock().prompts.is_empty());
+        assert!(
+            last_trace(&shared).ends_with(r#"denied by --deny "write:**""#),
+            "{}",
+            last_trace(&shared)
+        );
+
+        let empty_policy = crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap();
+        let (interactive, shared) = op(empty_policy);
+        shared.update(|ui| {
+            ui.session_rules.push(crate::policy::SessionRule {
+                decision: Decision::Allow,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/out.txt".to_string(),
+            });
+        });
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert!(shared.lock().prompts.is_empty());
+        assert!(
+            last_trace(&shared)
+                .ends_with("allowed by session rule write:/ws/out.txt for plugin tool-write"),
+            "{}",
+            last_trace(&shared)
         );
     }
 }

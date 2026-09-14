@@ -2,12 +2,15 @@
 //!
 //! Two `Operator` implementations share one binary: an interactive
 //! session, by default, and `-p`/`--print`, one task with the model's
-//! text on stdout and the trace on stderr, no input. Both decide every
-//! approval by a rule and trace it — a session into its transcript
-//! pane, a print run to stderr — and both go through [`frontend::start`]
-//! and share [`show`]'s words, so a session reads like a print run's
-//! stderr. `-p`, or a run with no terminal on stdin or stdout, is print
-//! mode; otherwise a session opens.
+//! text on stdout and the trace on stderr, no input. A session decides
+//! by a rule when one matches and asks at a prompt otherwise,
+//! remembering an `a`/`d` answer for the rest of the session; a print
+//! run decides by rules alone and denies what none matches. Both trace
+//! every decision — a session into its transcript pane, a print run to
+//! stderr — and both go through [`frontend::start`] and share
+//! [`show`]'s words, so a session reads like a print run's stderr.
+//! `-p`, or a run with no terminal on stdin or stdout, is print mode;
+//! otherwise a session opens.
 //!
 //! Exit status: 0 when the turn completed or the user ended the
 //! session; 1 when the turn failed, or the session ended right after a
@@ -33,8 +36,8 @@ use gwennol_core::Decision;
 
 use policy::{RuleSpec, Source};
 
-/// An interactive session, or one task with -p; every approval decided
-/// by a rule.
+/// An interactive session (rules, then a prompt for what no rule
+/// decides), or one task with -p (rules alone).
 #[derive(Debug, Parser)]
 #[command(name = "gwennol", version, about, long_about = None)]
 pub struct Cli {

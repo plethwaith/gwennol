@@ -129,7 +129,9 @@ fn unauthorized(socket: &mut TcpStream) {
 /// block is a tool result rather than text, answers exactly as the
 /// default route's follow-up does), so one session can drive every
 /// scenario `tests/interactive.rs` needs by typing a different first
-/// word each turn.
+/// word each turn; `write`, `read`, `grep` and `sh` ask for those
+/// tools by name, with the rest of the text as the tool's own
+/// argument, so the approval suite can raise a request of each kind.
 fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
     let Some(text) = last_user_text(body) else {
         // A follow-up turn: the last message is a tool result.
@@ -147,6 +149,9 @@ fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
         return;
     };
     let first = text.split_whitespace().next().unwrap_or("");
+    let rest = text
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, r)| r.trim());
     match first {
         // Never answers: the handler blocks on a read that ends
         // when the cancelled caller closes the connection, or at the
@@ -181,6 +186,25 @@ fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
         "refuse" => stream(socket, REFUSAL_SSE),
         "fail" => unauthorized(socket),
         "sleep" => stream(socket, &calling_sse("bash", r#"{"command": "sleep 30"}"#)),
+        "write" => stream(
+            socket,
+            &calling_sse(
+                "write",
+                &json!({"path": rest, "content": "hello"}).to_string(),
+            ),
+        ),
+        "read" => stream(
+            socket,
+            &calling_sse("read", &json!({"path": rest}).to_string()),
+        ),
+        "grep" => stream(
+            socket,
+            &calling_sse("grep", &json!({"pattern": rest}).to_string()),
+        ),
+        "sh" => stream(
+            socket,
+            &calling_sse("sh", &json!({"script": rest}).to_string()),
+        ),
         _ => stream(socket, OPENING_SSE),
     }
 }

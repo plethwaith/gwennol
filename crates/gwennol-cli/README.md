@@ -2,12 +2,14 @@
 
 `gwennol [options] [prompt]` opens an interactive session by default:
 the model's text streams into a transcript pane, a line editor takes
-the next turn, and every approval is still decided by a rule and
-traced into the pane, in the same words this file's examples show on
-stderr. `-p`/`--print` — what the rest of this file walks through — is
-one task run headlessly instead, with every approval decided by a rule
-and traced to it, and there is no prompt; a run with no terminal on
-stdin or stdout is print mode too, with one stderr line saying so.
+the next turn, and an approval no rule decides is asked at a prompt,
+`y`/`n` once, `a`/`d` for the rest of the session; a rule always
+decides first, and every decision traces into the pane, in the same
+words this file's examples show on stderr. `-p`/`--print` — what the
+rest of this file walks through — is one task run headlessly instead,
+with every approval decided by a rule and traced to it, and a request
+no rule matches is denied; a run with no terminal on stdin or stdout
+is print mode too, with one stderr line saying so.
 
 ## Quick start
 
@@ -229,6 +231,6 @@ exit 2, while a failed or cancelled turn keeps its own status.
 
 Persist or resume a conversation, manage the context window, or
 install plugins from outside the bundle: the roadmap's "Beyond the
-MVP". Prompt: every approval is still decided by a rule alone, in a
-session as in a print run; a request no rule matches is denied and
-traced, and the model routes around it or says what it could not do.
+MVP". Author a rule at the prompt or keep a session's answers past it:
+`a`/`d` are exact and in memory; a pattern is written in the config
+file between sessions.

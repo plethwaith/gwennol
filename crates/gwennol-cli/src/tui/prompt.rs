@@ -1,0 +1,767 @@
+//! The approval prompt: what `Interactive::approve`
+//! installs when no rule (compiled or session) decides a request, how a
+//! key answers it, how it comes down when the future behind it is
+//! dropped, and what the box shows. Cancel-safety in one sentence: a
+//! [`PromptGuard`] removes the prompt by id when dropped — which is what
+//! happens when the turn is cancelled while a prompt is open, since the
+//! guard is declared after the receiver it guards — and an answer whose
+//! receiver is already gone is simply ignored.
+
+use std::cell::Cell;
+use std::path::Path;
+use std::sync::Arc;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use gwennol_core::{Access, ApprovalRequest, Decision};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Widget};
+use tokio::sync::oneshot;
+
+use crate::policy::{Kind, SessionRule, Unjudgeable};
+use crate::show;
+use crate::tui::ui::{self, Entry, Shared, Ui};
+
+/// The key legend when the request can be remembered for the session.
+pub const KEYS: &str =
+    "y allow once · n deny once · a allow for the session · d deny for the session · Esc deny once";
+/// The key legend when it cannot: `a`/`d` would have nothing to hold.
+pub const KEYS_ONCE: &str = "y allow once · n deny once · Esc deny once · a and d act once here: this request cannot be remembered";
+/// The box's title.
+pub const TITLE: &str = "approval";
+
+/// One open approval, shown until answered or withdrawn.
+#[derive(Debug)]
+pub struct Prompt {
+    /// Assigned by [`PromptGuard::open`]; `0` until then.
+    pub id: u64,
+    /// What is being asked.
+    pub request: ApprovalRequest,
+    /// Why no rule short of `any` could judge this — the reason the
+    /// prompt exists at all.
+    pub unjudgeable: Option<Unjudgeable>,
+    /// `ShowAccess` of the request, as `approve` rendered it.
+    pub access_line: String,
+    /// [`show::subject`] of the request: `None` when no session rule
+    /// can hold it.
+    pub subject: Option<String>,
+    /// Rows scrolled off the top of the box; clamped at render.
+    pub scroll: usize,
+    /// `(rows, visible)` the last render measured, for the handler's
+    /// clamp: set by [`render_prompt`], read by [`key`].
+    pub view: Cell<(usize, usize)>,
+    answer: Option<oneshot::Sender<Decision>>,
+}
+
+impl Prompt {
+    /// A prompt for `request`, carrying `answer` to send the decision
+    /// back through. `id` is `0` until [`PromptGuard::open`] assigns
+    /// one.
+    pub fn new(
+        request: ApprovalRequest,
+        unjudgeable: Option<Unjudgeable>,
+        access_line: String,
+        subject: Option<String>,
+        answer: oneshot::Sender<Decision>,
+    ) -> Self {
+        Self {
+            id: 0,
+            request,
+            unjudgeable,
+            access_line,
+            subject,
+            scroll: 0,
+            view: Cell::new((0, 0)),
+            answer: Some(answer),
+        }
+    }
+}
+
+/// Removes prompt `id` when dropped: the shape
+/// [`gwennol_core::Operator::approve`]'s drop obligation asks for. Holds
+/// no lock across an `await`, so it cannot deadlock the state it
+/// updates.
+pub struct PromptGuard {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl PromptGuard {
+    /// Installs `prompt` in `shared`'s `Ui`, assigning it the next
+    /// id, and returns a guard that removes it again when dropped.
+    pub fn open(shared: &Arc<Shared>, mut prompt: Prompt) -> Self {
+        let id = shared.update(|ui| {
+            ui.prompt_seq += 1;
+            let id = ui.prompt_seq;
+            prompt.id = id;
+            ui.prompts.push(prompt);
+            id
+        });
+        Self {
+            shared: shared.clone(),
+            id,
+        }
+    }
+}
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        self.shared
+            .update(|ui| ui.prompts.retain(|p| p.id != self.id));
+    }
+}
+
+/// What a key means to an open prompt.
+enum Answer {
+    /// `y`/`n`/`Esc`: decides this request alone.
+    Once(Decision),
+    /// `a`/`d`: decides this request and, when it can be remembered,
+    /// every identical one for the rest of the session.
+    Session(Decision),
+}
+
+/// Route one key to the first open prompt. `true` when the key was
+/// the prompt's — every key is, while a prompt is open (D4): the
+/// answer keys act, the scroll keys move `scroll`, and anything else
+/// is swallowed rather than reaching the editor or the token.
+pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path) -> bool {
+    if ui.prompts.is_empty() {
+        return false;
+    }
+    if event.modifiers == KeyModifiers::NONE {
+        let answer = match event.code {
+            KeyCode::Char('y') => Some(Answer::Once(Decision::Allow)),
+            KeyCode::Char('n') => Some(Answer::Once(Decision::Deny)),
+            KeyCode::Char('a') => Some(Answer::Session(Decision::Allow)),
+            KeyCode::Char('d') => Some(Answer::Session(Decision::Deny)),
+            KeyCode::Esc => Some(Answer::Once(Decision::Deny)),
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            answer_prompt(ui, answer, workspace);
+            return true;
+        }
+    }
+    let (rows, visible) = ui.prompts[0].view.get();
+    let max_scroll = rows.saturating_sub(visible);
+    let page = visible.max(1);
+    match event.code {
+        KeyCode::Up => {
+            ui.prompts[0].scroll = ui.prompts[0].scroll.saturating_sub(1).min(max_scroll);
+        }
+        KeyCode::Down => {
+            ui.prompts[0].scroll = (ui.prompts[0].scroll + 1).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            ui.prompts[0].scroll = ui.prompts[0].scroll.saturating_sub(page).min(max_scroll);
+        }
+        KeyCode::PageDown => {
+            ui.prompts[0].scroll = (ui.prompts[0].scroll + page).min(max_scroll);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Remove the first prompt, push a session rule when the answer asks
+/// for one and the subject allows it, send the decision, and — only
+/// when the send lands — trace it.
+fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
+    let mut prompt = ui.prompts.remove(0);
+    let (decision, suffix) = match answer {
+        Answer::Once(d) => (d, ""),
+        Answer::Session(d) => {
+            let mut suffix = "";
+            if let (Some(subject), Some(kind)) =
+                (prompt.subject.clone(), Kind::of(&prompt.request.access))
+            {
+                ui.session_rules.push(SessionRule {
+                    decision: d,
+                    plugin: prompt.request.plugin.clone(),
+                    kind,
+                    subject,
+                });
+                suffix = " for the rest of the session";
+            }
+            (d, suffix)
+        }
+    };
+    let verb = match decision {
+        Decision::Allow => "allowed",
+        Decision::Deny => "denied",
+    };
+    let sent = prompt
+        .answer
+        .take()
+        .is_some_and(|tx| tx.send(decision).is_ok());
+    if sent {
+        let line = format!(
+            "gwennol: {}",
+            show::decided(
+                &prompt.request,
+                format!("{verb} at the prompt{suffix}"),
+                workspace
+            )
+        );
+        ui.push(Entry::Trace(line));
+    }
+}
+
+/// The box's content rows before wrapping (D5 order), the key line
+/// excluded.
+pub fn lines(prompt: &Prompt) -> Vec<String> {
+    let mut out = vec![prompt.access_line.clone()];
+    out.push(format!("asked by {}", prompt.request.plugin));
+    match &prompt.request.cause {
+        Some(call) => {
+            out.push(format!(
+                "the model asked {} ({}) with these arguments:",
+                call.name,
+                call.id.as_deref().unwrap_or("")
+            ));
+            match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                Ok(value) => {
+                    let pretty = serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|_| call.arguments.clone());
+                    out.extend(pretty.lines().map(str::to_string));
+                }
+                Err(_) => out.push(call.arguments.clone()),
+            }
+        }
+        None => out.push("started by the frontend, not by a tool call".to_string()),
+    }
+    if let Access::Spawn {
+        stdin: Some(stdin), ..
+    } = &prompt.request.access
+    {
+        out.push(format!(
+            "the child will read this on stdin ({} bytes):",
+            stdin.len()
+        ));
+        out.extend(stdin.lines().map(str::to_string));
+    }
+    if let Some(u) = &prompt.unjudgeable {
+        out.push(format!(
+            "only a rule of kind any could have matched this: {u}"
+        ));
+        if matches!(u, Unjudgeable::UnknownKind) {
+            out.push(format!("the request: {:?}", prompt.request.access));
+        }
+    }
+    out
+}
+
+/// The box height for `lines` at `width` inside `area_height` (D5):
+/// `min(rows + 3, max(4, area_height * 2 / 3))`, where `rows` is the
+/// wrapped content row count (the two borders and the key line
+/// account for the other three).
+pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let rows: usize = lines(prompt)
+        .iter()
+        .map(|line| ui::wrap(line, inner_width).len())
+        .sum();
+    let max_box = ((area_height as usize) * 2 / 3).max(4);
+    (rows + 3).min(max_box) as u16
+}
+
+/// Draw the box: a bordered block titled [`TITLE`]; the content rows
+/// wrapped at the inner width, showing the `scroll`-clamped window;
+/// the key line ([`KEYS`] or [`KEYS_ONCE`]) as the last inner row,
+/// never scrolled.
+pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
+    let area = area.intersection(buf.area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::bordered().title(TITLE);
+    let inner = block.inner(area);
+    (&block).render(area, buf);
+    let width = inner.width as usize;
+    let rows: Vec<String> = lines(prompt)
+        .iter()
+        .flat_map(|line| ui::wrap(line, width))
+        .collect();
+    let visible = (inner.height as usize).saturating_sub(1);
+    prompt.view.set((rows.len(), visible));
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let start = prompt.scroll.min(rows.len().saturating_sub(visible));
+    for (i, row) in rows[start..].iter().take(visible).enumerate() {
+        buf.set_stringn(inner.x, inner.y + i as u16, row, width, Style::new());
+    }
+    let key_line = if prompt.subject.is_some() {
+        KEYS
+    } else {
+        KEYS_ONCE
+    };
+    buf.set_stringn(
+        inner.x,
+        inner.y + inner.height - 1,
+        key_line,
+        width,
+        Style::new().add_modifier(Modifier::DIM),
+    );
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::task::{Context, Poll, Waker};
+
+    use gwennol_core::gwead::tokio_util::sync::CancellationToken;
+    use gwennol_core::{Operator, ToolCall};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::policy::Policy;
+    use crate::secrets::Secrets;
+    use crate::tui::keys::Input;
+    use crate::tui::operator::Interactive;
+
+    /// An `Interactive` judging by `policy` for workspace `/ws`, and
+    /// the `Shared` it renders through (with `workspace` already set,
+    /// as `tui::start` sets it before any turn runs).
+    pub(crate) fn op(policy: Policy) -> (Arc<Interactive>, Arc<Shared>) {
+        let shared = Shared::new();
+        let workspace = std::path::PathBuf::from("/ws");
+        shared.update(|ui| ui.workspace = workspace.clone());
+        let interactive = Arc::new(Interactive::new(
+            policy,
+            Secrets::new(Vec::new()),
+            workspace,
+            0,
+            shared.clone(),
+        ));
+        (interactive, shared)
+    }
+
+    /// A `write` request from `tool-write`, call `write t1`, arguments
+    /// `{"content":"hello","path":"out.txt"}`, access
+    /// `WriteFile("/ws/out.txt")`.
+    pub(crate) fn write_req() -> ApprovalRequest {
+        ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: Some(ToolCall {
+                id: Some("t1".to_string()),
+                name: "write".to_string(),
+                arguments: r#"{"content":"hello","path":"out.txt"}"#.to_string(),
+            }),
+            access: Access::WriteFile(std::path::PathBuf::from("/ws/out.txt")),
+        }
+    }
+
+    fn empty_policy() -> Policy {
+        Policy::compile(Vec::new(), Path::new("/ws")).unwrap()
+    }
+
+    /// `Context::from_waker(Waker::noop())`, one line at every call
+    /// site below instead of three.
+    fn noop_context() -> Context<'static> {
+        Context::from_waker(Waker::noop())
+    }
+
+    fn render_frame(shared: &Arc<Shared>) -> Vec<String> {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| crate::tui::ui::render(&shared.lock(), f))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Guards D3: the first poll installs the prompt (id 1) and it
+    /// shows in the frame; dropping the future — what happens when
+    /// the turn is cancelled under an open prompt — removes it and
+    /// the box comes down, with no trace line written (no answer
+    /// ever came). Mutation: empty `PromptGuard::drop`.
+    #[test]
+    fn a_prompt_opens_on_the_first_poll_and_comes_down_when_the_future_is_dropped() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        {
+            let ui = shared.lock();
+            assert_eq!(ui.prompts.len(), 1);
+            assert_eq!(ui.prompts[0].id, 1);
+        }
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains(TITLE)), "{frame:?}");
+        assert!(
+            frame.iter().any(|r| r.contains("write /ws/out.txt")),
+            "{frame:?}"
+        );
+        drop(fut);
+        assert!(shared.lock().prompts.is_empty());
+        let frame = render_frame(&shared);
+        assert!(!frame.iter().any(|r| r.contains(TITLE)), "{frame:?}");
+        assert!(shared.lock().entries.is_empty(), "no answer ever came");
+    }
+
+    /// Guards D4: a prompt whose receiver is already gone (the guard
+    /// stays alive; only the receiver is dropped) is answered without
+    /// panicking, and the answer is simply discarded: no rule, no
+    /// trace. Mutation: `expect` the send in `answer_prompt`.
+    #[test]
+    fn an_answer_after_the_future_was_dropped_is_ignored() {
+        let shared = Shared::new();
+        let workspace = std::path::PathBuf::from("/ws");
+        shared.update(|ui| ui.workspace = workspace.clone());
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        let prompt = Prompt::new(
+            write_req(),
+            None,
+            "write /ws/out.txt".to_string(),
+            Some("/ws/out.txt".to_string()),
+            tx,
+        );
+        let _guard = PromptGuard::open(&shared, prompt);
+        let handled = shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &workspace,
+            )
+        });
+        assert!(handled);
+        let ui = shared.lock();
+        assert!(ui.prompts.is_empty());
+        assert!(ui.entries.is_empty());
+        assert!(ui.session_rules.is_empty());
+    }
+
+    /// Guards D3, D4: each key answers exactly as the legend says,
+    /// driven through `drive::handle_key` (so `Esc` there must deny
+    /// rather than reach the token); an `a`/`d` answer both records a
+    /// session rule and survives the future being dropped unpolled
+    /// afterward; a prompt removed from under the future by something
+    /// other than an answer resolves it to `Deny` with no new trace.
+    /// Mutations: swap the `y`/`n` arms; `unwrap` the receive.
+    #[test]
+    fn each_key_answers_as_the_legend_says() {
+        for (code, decision, is_session) in [
+            (KeyCode::Char('y'), Decision::Allow, false),
+            (KeyCode::Char('n'), Decision::Deny, false),
+            (KeyCode::Char('a'), Decision::Allow, true),
+            (KeyCode::Char('d'), Decision::Deny, true),
+            (KeyCode::Esc, Decision::Deny, false),
+        ] {
+            let (interactive, shared) = op(empty_policy());
+            let mut cx = noop_context();
+            let mut fut = interactive.approve(write_req());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+            let cancel = CancellationToken::new();
+            let _ = crate::tui::drive::handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            );
+            assert!(!cancel.is_cancelled(), "{code:?} reached the token");
+
+            let polled = fut.as_mut().poll(&mut cx);
+            assert!(
+                matches!(polled, Poll::Ready(d) if d == decision),
+                "{code:?}: {polled:?}"
+            );
+
+            let suffix = if is_session {
+                " for the rest of the session"
+            } else {
+                ""
+            };
+            let verb = if decision == Decision::Allow {
+                "allowed"
+            } else {
+                "denied"
+            };
+            let expected = format!(
+                "gwennol: write /ws/out.txt from tool-write (call write t1): {verb} at the prompt{suffix}"
+            );
+            {
+                let ui = shared.lock();
+                match ui.entries.last() {
+                    Some(Entry::Trace(t)) => assert_eq!(t, &expected),
+                    other => panic!("expected a Trace entry, got {other:?}"),
+                }
+                if is_session {
+                    assert_eq!(
+                        ui.session_rules,
+                        vec![SessionRule {
+                            decision,
+                            plugin: "tool-write".to_string(),
+                            kind: Kind::Write,
+                            subject: "/ws/out.txt".to_string(),
+                        }]
+                    );
+                } else {
+                    assert!(ui.session_rules.is_empty());
+                }
+            }
+        }
+
+        // The state case: `a`, then drop the future without polling
+        // again — the rule and the trace remain regardless.
+        {
+            let (interactive, shared) = op(empty_policy());
+            let mut cx = noop_context();
+            let mut fut = interactive.approve(write_req());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+            let cancel = CancellationToken::new();
+            let _ = crate::tui::drive::handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            );
+            drop(fut);
+            let ui = shared.lock();
+            assert_eq!(ui.session_rules.len(), 1);
+            assert!(matches!(ui.entries.last(), Some(Entry::Trace(_))));
+        }
+
+        // Last: poll → Pending, remove the prompt from `prompts` by
+        // hand (something other than an answer), poll → Ready(Deny),
+        // no new entry.
+        {
+            let (interactive, shared) = op(empty_policy());
+            let mut cx = noop_context();
+            let mut fut = interactive.approve(write_req());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+            let before = shared.lock().entries.len();
+            shared.update(|ui| ui.prompts.clear());
+            let polled = fut.as_mut().poll(&mut cx);
+            assert!(matches!(polled, Poll::Ready(Decision::Deny)), "{polled:?}");
+            assert_eq!(shared.lock().entries.len(), before);
+        }
+    }
+
+    /// Guards D2: a request no session rule can hold (a spawn with
+    /// stdin) is decided once and remembers nothing, its key line is
+    /// [`KEYS_ONCE`], and the same request prompts again next time.
+    /// Mutation: push the rule anyway.
+    #[test]
+    fn a_request_no_session_rule_can_hold_is_decided_once() {
+        let (interactive, shared) = op(empty_policy());
+        let request = || ApprovalRequest {
+            plugin: "tool-sh".to_string(),
+            cause: Some(ToolCall {
+                id: Some("t2".to_string()),
+                name: "sh".to_string(),
+                arguments: r#"{"script":"echo hi\n"}"#.to_string(),
+            }),
+            access: Access::Spawn {
+                argv: vec!["sh".to_string()],
+                cwd: std::path::PathBuf::from("/ws"),
+                stdin: Some("echo hi\n".to_string()),
+            },
+        };
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(request());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let frame = render_frame(&shared);
+        for needle in [
+            "spawn [\"sh\"] with 8 bytes on stdin",
+            "asked by tool-sh",
+            "the child will read this on stdin (8 bytes):",
+            "echo hi",
+            "only a rule of kind any could have matched this: a spawn with stdin",
+        ] {
+            assert!(
+                frame.iter().any(|r| r.contains(needle)),
+                "missing {needle:?} in {frame:?}"
+            );
+        }
+        let keys_once_head: String = KEYS_ONCE.chars().take(30).collect();
+        assert!(
+            frame.iter().any(|r| r.contains(&keys_once_head)),
+            "{frame:?}"
+        );
+
+        let cancel = CancellationToken::new();
+        let _ = crate::tui::drive::handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        );
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert!(shared.lock().session_rules.is_empty());
+        match shared.lock().entries.last() {
+            Some(Entry::Trace(t)) => assert!(
+                t.ends_with("allowed at the prompt"),
+                "session suffix leaked for an unremembered request: {t}"
+            ),
+            other => panic!("expected a Trace entry, got {other:?}"),
+        }
+
+        // The same request again: it prompts once more.
+        let mut fut2 = interactive.approve(request());
+        assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
+    }
+
+    /// Guards D5: the box shows the whole arguments (not a preview)
+    /// and scrolls to reach a row past the visible window; the key
+    /// line stays put; a request with no cause shows the frontend
+    /// sentence instead of a call. Mutation: ignore `scroll` in
+    /// `render_prompt`.
+    #[test]
+    fn the_box_shows_the_whole_arguments_and_scrolls() {
+        let mut fields = serde_json::Map::new();
+        for i in 0..40 {
+            fields.insert(format!("k{i:02}"), serde_json::json!(i));
+        }
+        let request = ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: Some(ToolCall {
+                id: Some("t1".to_string()),
+                name: "write".to_string(),
+                arguments: serde_json::Value::Object(fields).to_string(),
+            }),
+            access: Access::WriteFile(std::path::PathBuf::from("/ws/out.txt")),
+        };
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(request);
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains("\"k00\"")), "{frame:?}");
+        assert!(!frame.iter().any(|r| r.contains("\"k39\"")), "{frame:?}");
+        let keys_head: String = KEYS.chars().take(20).collect();
+        assert!(frame.iter().any(|r| r.contains(&keys_head)), "{frame:?}");
+
+        let mut presses = 0;
+        loop {
+            shared.update(|ui| {
+                key(
+                    ui,
+                    &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &workspace,
+                )
+            });
+            presses += 1;
+            let frame = render_frame(&shared);
+            if frame.iter().any(|r| r.contains("\"k39\"")) {
+                break;
+            }
+            assert!(presses <= 10, "k39 never scrolled into view");
+        }
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains(&keys_head)), "{frame:?}");
+
+        for _ in 0..100 {
+            shared.update(|ui| {
+                key(
+                    ui,
+                    &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    &workspace,
+                )
+            });
+        }
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains("\"k39\"")), "{frame:?}");
+
+        for _ in 0..100 {
+            shared.update(|ui| {
+                key(
+                    ui,
+                    &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                    &workspace,
+                )
+            });
+        }
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains("\"k00\"")), "{frame:?}");
+
+        // A request with no cause: the frontend-started sentence,
+        // not a call.
+        let no_cause = ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: Access::WriteFile(std::path::PathBuf::from("/ws/other.txt")),
+        };
+        let (interactive2, shared2) = op(empty_policy());
+        let mut fut3 = interactive2.approve(no_cause);
+        assert!(matches!(fut3.as_mut().poll(&mut cx), Poll::Pending));
+        let frame = render_frame(&shared2);
+        assert!(
+            frame.iter().any(|r| r.contains("started by the frontend")),
+            "{frame:?}"
+        );
+    }
+
+    /// Guards D3: the first prompt is shown and answered first; the
+    /// second waits behind it, unaffected, until the first is
+    /// answered. Mutation: `PromptGuard::open` replaces the vec's
+    /// contents instead of pushing.
+    #[test]
+    fn a_second_prompt_waits_behind_the_first() {
+        let (interactive, shared) = op(empty_policy());
+        let req = |name: &str| ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: Access::WriteFile(std::path::PathBuf::from(format!("/ws/{name}"))),
+        };
+        let mut cx = noop_context();
+        let mut first = interactive.approve(req("out.txt"));
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+        let mut second = interactive.approve(req("two.txt"));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+
+        {
+            let ui = shared.lock();
+            assert_eq!(ui.prompts.len(), 2);
+            assert_eq!(ui.prompts[0].id, 1);
+            assert_eq!(ui.prompts[1].id, 2);
+        }
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains("out.txt")), "{frame:?}");
+        assert!(!frame.iter().any(|r| r.contains("two.txt")), "{frame:?}");
+
+        let workspace = std::path::PathBuf::from("/ws");
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &workspace,
+            )
+        });
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+        let frame = render_frame(&shared);
+        assert!(frame.iter().any(|r| r.contains("two.txt")), "{frame:?}");
+
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &workspace,
+            )
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+    }
+}

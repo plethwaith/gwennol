@@ -3,7 +3,8 @@
 //! polled before the turn future or a redraw so a queued `/exit`
 //! is never left behind. `Session::run` is never called: it stops at
 //! the first turn that does not complete, and a session must carry on
-//! past a failed or cancelled one.
+//! past a failed or cancelled one. Keys go to an open approval prompt
+//! before anything else, so `Esc` there denies rather than cancels.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -19,12 +20,13 @@ use tokio::sync::watch;
 use crate::show::outcome_line;
 use crate::tui::editor::{Command, Submission};
 use crate::tui::keys::{Input, KeySource};
+use crate::tui::prompt;
 use crate::tui::ui::{Entry, Shared, TurnState, render};
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED, Fatal};
 
 /// What handling one key means for the loop driving it.
 #[derive(Debug, PartialEq, Eq)]
-enum Action {
+pub(crate) enum Action {
     /// Idle only: `Enter` on a turn's text.
     Submit(String),
     /// Idle `/exit`, or the key source closing while idle: `drive`
@@ -37,8 +39,13 @@ enum Action {
 
 /// Apply one key (or paste, or resize) to the editor and the pane,
 /// `running` saying whether a turn is in flight. The only place `Esc`
-/// or a `/exit` reaches [`CancellationToken::cancel`].
-fn handle_key(
+/// or a `/exit` reaches [`CancellationToken::cancel`] — and it does
+/// not while a prompt is open: keys go to the prompt first, so `Esc`
+/// there denies rather than cancels, and nothing typed during a
+/// prompt reaches the editor. `pub(crate)` so `tui::prompt`'s own
+/// tests can drive a key through the same entry point `drive` uses,
+/// rather than a copy of its prompt-routing branch.
+pub(crate) fn handle_key(
     shared: &Shared,
     cancel: &CancellationToken,
     running: bool,
@@ -64,6 +71,11 @@ fn handle_key(
         // resize or a paste must not clear a Ctrl-C hint the user has
         // not yet read.
         ui.notice = None;
+        if !ui.prompts.is_empty() {
+            let workspace = ui.workspace.clone();
+            prompt::key(ui, &key, &workspace);
+            return;
+        }
         if key.modifiers.is_empty() && key.code == KeyCode::Esc {
             if running {
                 cancel.cancel();
@@ -332,6 +344,100 @@ mod tests {
             shared.lock().notice.is_none(),
             "a key input did not clear the notice"
         );
+    }
+
+    /// Guards D4: while a prompt is open, every key is the prompt's —
+    /// `Esc` denies rather than reaching the token, typing `/exit`
+    /// never reaches the editor or `exiting`, and Ctrl-C sets no
+    /// notice — until the prompt itself is answered. Mutation: drop
+    /// the prompt-routing arm in `handle_key`.
+    #[test]
+    fn keys_go_to_an_open_prompt_never_to_the_editor_or_the_token() {
+        use std::path::Path;
+        use std::task::{Context, Poll, Waker};
+
+        use gwennol_core::{Decision, Operator};
+
+        use crate::tui::prompt::tests::{op, write_req};
+
+        let (interactive, shared) =
+            op(crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        let cancel = CancellationToken::new();
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "Esc reached the token while a prompt was open"
+        );
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+
+        // A second prompt: typing past it reaches neither the editor
+        // nor `exiting`, and it is still open afterward.
+        let mut fut2 = interactive.approve(write_req());
+        assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
+        for c in "/exit".chars() {
+            handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        let action = handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(
+            action, None,
+            "typed text reached the editor's own submission while a prompt was open"
+        );
+        assert_eq!(
+            shared.lock().editor.text(),
+            "",
+            "typed text reached the editor while a prompt was open"
+        );
+        assert!(!shared.lock().exiting);
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "the prompt closed on its own"
+        );
+
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert!(
+            shared.lock().notice.is_none(),
+            "Ctrl-C set a notice while a prompt was open"
+        );
+
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        );
+        assert!(matches!(
+            fut2.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
     }
 
     /// Guards the forced-exit path directly and deterministically. The
