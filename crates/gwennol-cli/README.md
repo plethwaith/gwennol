@@ -238,5 +238,7 @@ exit 2, while a failed or cancelled turn keeps its own status.
 Persist or resume a conversation, manage the context window, or
 install plugins from outside the bundle: the roadmap's "Beyond the
 MVP". Author a rule at the prompt or keep a session's answers past it:
-`a`/`d` are exact and in memory; a pattern is written in the config
-file between sessions.
+`a`/`d` are in memory and match the request's text as the prompt
+showed it — for an `http` URL that text is scrubbed, so one answer
+covers any query string, and any credentials, at that path; a pattern
+is written in the config file between sessions.

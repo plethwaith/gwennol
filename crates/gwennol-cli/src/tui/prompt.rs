@@ -309,10 +309,11 @@ pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
 /// wrapped at the inner width, showing the `scroll`-clamped window;
 /// the key legend (`key_line`), wrapped at the same width, as the
 /// last inner rows, never scrolled. When the box is shorter than
-/// [`height`] asked for (D5's "terminal shorter than the box"), the
-/// legend keeps its rows and the content window shrinks to what is
-/// left — to nothing when the box is shorter than the legend itself,
-/// which is then clipped to the box.
+/// [`height`] asked for (D5's "terminal shorter than the box"), at
+/// least one content row is reserved before the legend — the legend
+/// is what gets clipped when the box cannot hold both, down to
+/// nothing when the box is one row of content or shorter, which is
+/// then clipped to the box.
 pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -327,7 +328,10 @@ pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
         .flat_map(|line| ui::wrap(line, width))
         .collect();
     let legend = ui::wrap(key_line(prompt), width);
-    let visible = (inner.height as usize).saturating_sub(legend.len());
+    let visible = (inner.height as usize)
+        .saturating_sub(legend.len())
+        .max(1)
+        .min(inner.height as usize);
     prompt.view.set((rows.len(), visible));
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -415,7 +419,14 @@ pub(crate) mod tests {
     }
 
     fn render_frame(shared: &Arc<Shared>) -> Vec<String> {
-        let backend = TestBackend::new(FRAME_W, 24);
+        render_frame_sized(shared, FRAME_W, 24)
+    }
+
+    /// Like [`render_frame`], at a caller-chosen size — for the cases
+    /// where the fixed 80x24 frame never exercises a short terminal's
+    /// box height.
+    fn render_frame_sized(shared: &Arc<Shared>, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::tui::ui::render(&shared.lock(), f))
@@ -724,6 +735,25 @@ pub(crate) mod tests {
                 "missing legend row {row:?} in {frame:?}"
             );
         }
+        // D5: "the key line is the block's last inner row, never
+        // scrolled" — position, not just membership. The row directly
+        // above the box's bottom border is the legend's last wrapped
+        // row.
+        {
+            let border = frame
+                .iter()
+                .position(|r| r.trim_end().ends_with('┘'))
+                .expect("no bottom border in the frame");
+            let last_legend_row = ui::wrap(KEYS, INNER_W)
+                .last()
+                .expect("KEYS wraps to at least one row")
+                .clone();
+            assert!(
+                frame[border - 1].contains(&last_legend_row),
+                "last inner row is not the legend's last row: {:?} in {frame:?}",
+                frame[border - 1]
+            );
+        }
 
         // D5's box-height rule: `min(rows + 2 + legend_rows, max(4,
         // area_height * 2 / 3))`. This prompt's 45 content rows plus
@@ -810,6 +840,25 @@ pub(crate) mod tests {
             let prompt = &ui.prompts[0];
             assert_eq!(height(prompt, FRAME_W, 24), 7, "3 + 2 + 2, under the cap");
         }
+    }
+
+    /// Guards D5: the box reserves at least one content row before
+    /// the legend, so a short terminal never shows the key legend
+    /// alone with nothing to approve. Mutation: drop the `.max(1)` in
+    /// `render_prompt`'s `visible` — the access line disappears at
+    /// 80x7 (`inner.height == 2`, `legend.len() == 2`, `visible == 0`).
+    #[test]
+    fn a_short_terminal_still_shows_the_access_line_behind_the_legend() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let frame = render_frame_sized(&shared, FRAME_W, 7);
+        assert!(
+            frame.iter().any(|r| r.contains("write /ws/out.txt")),
+            "no access line on screen at 80x7: {frame:?}"
+        );
     }
 
     /// Guards D3: the first prompt is shown and answered first; the

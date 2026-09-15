@@ -1266,17 +1266,21 @@ async fn scenario() {
             }
             let mid = shared.lock().entries.len();
             type_line(&tx, &format!("read {}", outside.display()));
-            // A prompt would hang here for 10s: the mutation this run
-            // guards (passing `&[]` for the session slice) makes the
-            // request prompt again instead of deciding at once.
+            // Waits for either outcome, so a second prompt opening
+            // (the mutation this run guards: passing `&[]` for the
+            // session slice) fails this wait itself, sub-second and by
+            // name, instead of leaving the `prompts.is_empty()`
+            // assertion below unreachable behind this call's 10 s
+            // timeout.
             await_ui(
                 &shared,
-                |ui| outcomes_since(ui, mid) >= 1,
-                "run K: second outcome",
+                |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
+                "run K: second outcome or a second prompt",
             )
             .await;
             {
                 let ui = shared.lock();
+                assert!(ui.prompts.is_empty(), "run K: a prompt is open");
                 let entries = &ui.entries[mid..];
                 assert!(
                     entries
@@ -1293,7 +1297,6 @@ async fn scenario() {
                         .any(|e| matches!(e, Entry::Trace(t) if t.contains("at the prompt"))),
                     "run K: a prompt trace appeared for the remembered rule: {entries:?}"
                 );
-                assert!(ui.prompts.is_empty(), "run K: a prompt is open");
             }
             type_line(&tx, "/exit");
         })
@@ -1345,14 +1348,20 @@ async fn scenario() {
             }
             let mid = shared.lock().entries.len();
             type_line(&tx, "grep needle");
+            // Waits for either outcome, so a second prompt opening
+            // (the mutation this run guards) fails this wait itself,
+            // sub-second and by name, instead of leaving the
+            // `prompts.is_empty()` assertion below unreachable behind
+            // this call's 10 s timeout.
             await_ui(
                 &shared,
-                |ui| outcomes_since(ui, mid) >= 1,
-                "run L: second outcome",
+                |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
+                "run L: second outcome or a second prompt",
             )
             .await;
             {
                 let ui = shared.lock();
+                assert!(ui.prompts.is_empty(), "run L: a prompt is open");
                 let entries = &ui.entries[mid..];
                 assert!(
                     entries
@@ -1362,7 +1371,6 @@ async fn scenario() {
                         )))),
                     "run L: {entries:?}"
                 );
-                assert!(ui.prompts.is_empty(), "run L: a prompt is open");
             }
             type_line(&tx, "/exit");
         })

@@ -360,7 +360,7 @@ mod tests {
     /// `Esc` denies rather than reaching the token, typing `/exi`
     /// never reaches the editor — `/exit` would not catch the
     /// mutation, since `Command::Exit`'s own arm commits the editor
-    /// either way (`drive.rs:116`) — a recognized `/exit` + Enter
+    /// either way — a recognized `/exit` + Enter
     /// still never sets `exiting`, a bracketed paste never reaches
     /// the editor either, and Ctrl-C sets no notice — until the
     /// prompt itself is answered. Mutations: drop the prompt-routing
@@ -462,7 +462,12 @@ mod tests {
         // "/exi" above cannot check this — it parses to
         // `Command::Unknown`, which has no path to `exiting` at all —
         // so this is the only assertion that a *recognized* command
-        // cannot take effect behind a prompt.
+        // cannot take effect behind a prompt. The buffer is cleared
+        // first: "/exi" left uncommitted (`Command::Unknown` never
+        // commits) would otherwise glue onto "/exit" as "/exi/exit",
+        // which also parses to `Unknown` and never reaches `exiting`
+        // regardless of whether the fix below is reverted.
+        shared.update(|ui| ui.editor.commit());
         for c in "/exit".chars() {
             handle_key(
                 &shared,

@@ -70,10 +70,10 @@
 //! applying that default, and an answer given for the session becomes
 //! a [`SessionRule`], tried after every compiled rule
 //! ([`Policy::judge_with`]); print mode has no such rules. An access of
-//! a kind this frontend does not know matches no rule, `any` included:
-//! a print run denies it, the same as any other unmatched request, and
-//! a session asks at a prompt instead, the same as it does for one no
-//! rule can judge.
+//! a kind this frontend does not know matches no rule short of `any`,
+//! exactly as a spawn carrying stdin or running outside the workspace
+//! does: with no `any` rule a print run denies it and a session asks
+//! at a prompt instead.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -349,8 +349,8 @@ impl Rule {
 /// `http`, whose subject is the *scrubbed* URL ([`crate::show::subject`]),
 /// so the exact text is the scrubbed one: when the URL carried a
 /// query or fragment (scrubbed to `?…`), one answer admits any query
-/// string at the same path; a URL with no query or fragment matches
-/// only itself. Tried after every compiled rule, so it can never
+/// string at the same path; and a URL matches every other that scrubs
+/// to the same text. Tried after every compiled rule, so it can never
 /// pre-empt a file's `deny`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRule {
