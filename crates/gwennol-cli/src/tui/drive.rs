@@ -357,16 +357,16 @@ mod tests {
     }
 
     /// Guards D4: while a prompt is open, every key is the prompt's —
-    /// `Esc` denies rather than reaching the token, typing `/exi`
-    /// never reaches the editor — `/exit` would not catch the
-    /// mutation, since `Command::Exit`'s own arm commits the editor
-    /// either way — a recognized `/exit` + Enter
-    /// still never sets `exiting`, a bracketed paste never reaches
-    /// the editor either, and Ctrl-C sets no notice — until the
-    /// prompt itself is answered. Mutations: drop the prompt-routing
-    /// arm in `handle_key` (the key case); drop the
-    /// `ui.prompts.is_empty()` guard around `ui.editor.paste` (the
-    /// paste case).
+    /// `Esc` denies rather than reaching the token, typing `/exi` never
+    /// reaches the editor, a recognized `/exit` + Enter still never sets
+    /// `exiting`, a bracketed paste never reaches the editor either, and
+    /// Ctrl-C sets no notice — until the prompt itself is answered.
+    /// Neither the `/exi` block nor the `/exit` block discriminates the
+    /// prompt-routing-arm mutation on its own; the `Esc` assertion above
+    /// them does, and each block's own comment says what it is for.
+    /// Mutations: drop the prompt-routing arm in `handle_key` (the key
+    /// case); drop the `ui.prompts.is_empty()` guard around
+    /// `ui.editor.paste` (the paste case).
     #[test]
     fn keys_go_to_an_open_prompt_never_to_the_editor_or_the_token() {
         use std::path::Path;
