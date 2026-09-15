@@ -65,9 +65,15 @@
 //! Rules are tried in the order they were given — flags in command-line
 //! order, then the policy file's rules, then the config file's — and
 //! the first that matches decides. A request no rule matches is denied,
-//! and the trace says so: there is no default that quietly allows. An
-//! access of a kind this frontend does not know matches no rule, `any`
-//! included, and so is denied too.
+//! and the trace says so: there is no default that quietly allows. The
+//! interactive frontend asks the person at the keyboard instead of
+//! applying that default, and an answer given for the session becomes
+//! a [`SessionRule`], tried after every compiled rule
+//! ([`Policy::judge_with`]); print mode has no such rules. An access of
+//! a kind this frontend does not know matches no rule short of `any`,
+//! exactly as a spawn carrying stdin or running anywhere but the
+//! workspace root does: with no `any` rule a print run denies it and a session asks
+//! at a prompt instead.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -120,7 +126,7 @@ impl Kind {
     /// The kind an access is judged under, or `None` for a kind this
     /// frontend does not know: `Access` is non-exhaustive, and a
     /// request no rule can describe is one no rule may admit.
-    fn of(access: &Access) -> Option<Self> {
+    pub fn of(access: &Access) -> Option<Self> {
         Some(match access {
             Access::ReadFile(_) => Self::Read,
             Access::WriteFile(_) => Self::Write,
@@ -338,6 +344,39 @@ impl Rule {
     }
 }
 
+/// A rule the user made at a prompt for the rest of the session:
+/// never a glob, never written to disk, and exact text — except for
+/// `http`, whose subject is the *scrubbed* URL ([`crate::show::subject`])
+/// plus a marker for what was cut: when the URL carried a query or
+/// fragment (scrubbed to `?…`), one answer admits any query string at
+/// the same path, and when it carried userinfo (`(credentials in the
+/// URL cut)`), any credentials at it. The markers are part of the
+/// subject, so a URL shown with neither matches only itself, never one
+/// that carried a query or credentials. Tried after every compiled
+/// rule, so it can never pre-empt a file's `deny`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRule {
+    /// Allow or deny.
+    pub decision: Decision,
+    /// Only requests from this plugin: the prompt named who asked.
+    pub plugin: String,
+    /// The kind of access; never `Any`.
+    pub kind: Kind,
+    /// [`crate::show::subject`] of the request answered, verbatim.
+    pub subject: String,
+}
+
+impl SessionRule {
+    /// Whether this rule decides `request` for a workspace at `root`:
+    /// the same plugin and kind, a subject equal to the request's, and
+    /// never a spawn carrying stdin (its subject is `None`).
+    pub fn matches(&self, request: &ApprovalRequest, root: &Path) -> bool {
+        self.plugin == request.plugin
+            && Kind::of(&request.access) == Some(self.kind)
+            && crate::show::subject(&request.access, root).as_deref() == Some(self.subject.as_str())
+    }
+}
+
 /// Whether an `http` pattern starts with a method token that can match
 /// a subject: `*`, or upper-case ASCII letters, then exactly one space
 /// and something after it. A lower-case or oddly spaced method would
@@ -491,6 +530,8 @@ pub struct Judgement<'a> {
     pub decision: Decision,
     /// The rule that decided, or `None` for the default denial.
     pub rule: Option<&'a Rule>,
+    /// With `rule` `None`: the session rule that decided, if one did.
+    pub session: Option<&'a SessionRule>,
     /// With `rule` `None`: why no rule short of `any` could have
     /// matched, when that is the case.
     pub unjudgeable: Option<Unjudgeable>,
@@ -516,25 +557,49 @@ impl Policy {
     }
 
     /// Judge a request: the first matching rule, or the default denial.
+    /// `judge_with(request, &[])`: print mode has no session rules.
     pub fn judge(&self, request: &ApprovalRequest) -> Judgement<'_> {
+        self.judge_with(request, &[])
+    }
+
+    /// Judge a request: the first matching compiled rule, else the
+    /// first matching session rule, in the order they were made;
+    /// else the default denial. Compiled rules being tried first —
+    /// not the order the session rules are in — is what keeps a
+    /// session rule from pre-empting a compiled `deny`.
+    pub fn judge_with<'a>(
+        &'a self,
+        request: &ApprovalRequest,
+        session: &'a [SessionRule],
+    ) -> Judgement<'a> {
         // Decided once: it costs a walk for a spawn, and every rule
         // consults it.
         let unjudgeable = self.unjudgeable(&request.access);
-        match self
+        if let Some(rule) = self
             .rules
             .iter()
             .find(|rule| rule.matches(request, unjudgeable))
         {
-            Some(rule) => Judgement {
+            return Judgement {
                 decision: rule.spec.decision,
                 rule: Some(rule),
+                session: None,
                 unjudgeable: None,
-            },
-            None => Judgement {
-                decision: Decision::Deny,
+            };
+        }
+        if let Some(s) = session.iter().find(|s| s.matches(request, &self.root)) {
+            return Judgement {
+                decision: s.decision,
                 rule: None,
-                unjudgeable,
-            },
+                session: Some(s),
+                unjudgeable: None,
+            };
+        }
+        Judgement {
+            decision: Decision::Deny,
+            rule: None,
+            session: None,
+            unjudgeable,
         }
     }
 
@@ -598,6 +663,19 @@ impl fmt::Display for RuleSpec {
 
 impl fmt::Display for Judgement<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(s) = self.session {
+            let verb = match self.decision {
+                Decision::Allow => "allowed",
+                Decision::Deny => "denied",
+            };
+            return write!(
+                f,
+                "{verb} by session rule {}:{} for plugin {}",
+                s.kind.name(),
+                s.subject,
+                s.plugin
+            );
+        }
         match (self.decision, self.rule) {
             (Decision::Allow, Some(rule)) => write!(f, "allowed by {}", rule.spec),
             (Decision::Deny, Some(rule)) => write!(f, "denied by {}", rule.spec),
@@ -1060,6 +1138,143 @@ mod tests {
                 .to_string();
             assert!(err.contains("http needs a method first"), "{bad}: {err}");
         }
+    }
+
+    /// Guards D1, D2: `judge_with` tries the compiled rules, then the
+    /// session rules — in that order, so a session rule can never
+    /// pre-empt a compiled `deny` — and a `SessionRule` matches
+    /// exactly the plugin, kind, and subject it was made from.
+    /// Mutations, each named in the PR body: consult session rules
+    /// before `self.rules` (the deny case); drop the plugin check;
+    /// drop the stdin check; build the http subject from the raw URL.
+    #[test]
+    fn a_session_rule_is_exact_plugin_bound_and_after_the_rules() {
+        let p = policy(vec![]);
+
+        let read_session = vec![SessionRule {
+            decision: Decision::Allow,
+            plugin: "tool-read".to_string(),
+            kind: Kind::Read,
+            subject: "/ws/a.txt".to_string(),
+        }];
+        assert_eq!(
+            p.judge_with(&read("/ws/a.txt"), &read_session).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            p.judge_with(&read("/ws/a.txt2"), &read_session).decision,
+            Decision::Deny
+        );
+        assert_eq!(
+            p.judge_with(
+                &request("tool-grep", Access::ReadFile(PathBuf::from("/ws/a.txt"))),
+                &read_session
+            )
+            .decision,
+            Decision::Deny,
+            "a session rule bound to another plugin must not match"
+        );
+        assert_eq!(
+            p.judge_with(
+                &request("tool-read", Access::WriteFile(PathBuf::from("/ws/a.txt"))),
+                &read_session
+            )
+            .decision,
+            Decision::Deny,
+            "a session rule bound to another kind must not match"
+        );
+
+        let spawn_session = vec![SessionRule {
+            decision: Decision::Allow,
+            plugin: "tool-bash".to_string(),
+            kind: Kind::Spawn,
+            subject: r#"["sh"] in /elsewhere"#.to_string(),
+        }];
+        let elsewhere = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: PathBuf::from("/elsewhere"),
+                stdin: None,
+            },
+        );
+        let j = p.judge_with(&elsewhere, &spawn_session);
+        assert_eq!(j.decision, Decision::Allow);
+        assert!(j.unjudgeable.is_none());
+        assert_eq!(
+            j.to_string(),
+            r#"allowed by session rule spawn:["sh"] in /elsewhere for plugin tool-bash"#
+        );
+        assert_eq!(
+            p.judge_with(&spawn(&["sh"]), &spawn_session).decision,
+            Decision::Deny,
+            "the same argv in a different cwd must not match"
+        );
+        let with_stdin = request(
+            "tool-bash",
+            Access::Spawn {
+                argv: vec!["sh".into()],
+                cwd: PathBuf::from("/elsewhere"),
+                stdin: Some("x".into()),
+            },
+        );
+        assert_eq!(
+            p.judge_with(&with_stdin, &spawn_session).decision,
+            Decision::Deny,
+            "a spawn rule never matches a spawn carrying stdin"
+        );
+
+        let http_session = vec![SessionRule {
+            decision: Decision::Allow,
+            plugin: "provider-anthropic".to_string(),
+            kind: Kind::Http,
+            subject: "GET https://x.example/p?…".to_string(),
+        }];
+        assert_eq!(
+            p.judge_with(&http("GET", "https://x.example/p?a=1"), &http_session)
+                .decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            p.judge_with(&http("GET", "https://x.example/p?a=2"), &http_session)
+                .decision,
+            Decision::Allow,
+            "a session rule made from one query must admit another"
+        );
+        assert_eq!(
+            p.judge_with(&http("GET", "https://x.example/p"), &http_session)
+                .decision,
+            Decision::Deny,
+            "a session rule made from a query must not admit the query-less URL"
+        );
+
+        // The escalation direction: a rule made from a clean URL must
+        // not admit one that carries a query (its subject gets the
+        // `?…` marker `http_subject` never adds to the clean one).
+        let clean_http_session = vec![SessionRule {
+            decision: Decision::Allow,
+            plugin: "provider-anthropic".to_string(),
+            kind: Kind::Http,
+            subject: "GET https://x.example/p".to_string(),
+        }];
+        assert_eq!(
+            p.judge_with(&http("GET", "https://x.example/p?a=1"), &clean_http_session)
+                .decision,
+            Decision::Deny,
+            "a session rule made from a query-less URL must not admit one that carries a query"
+        );
+
+        // A session rule never pre-empts a compiled rule.
+        let deny_first = policy(vec![flag(Decision::Deny, "read:**")]);
+        let j = deny_first.judge_with(&read("/ws/a.txt"), &read_session);
+        assert_eq!(j.decision, Decision::Deny);
+        assert_eq!(j.to_string(), r#"denied by --deny "read:**""#);
+
+        // `judge` passes no session rules at all.
+        assert_eq!(
+            p.judge(&read("/ws/a.txt")).to_string(),
+            "denied: no rule matched"
+        );
     }
 
     #[test]

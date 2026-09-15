@@ -10,12 +10,14 @@
 //! approvals and events into pane updates; `drive` is the loop itself,
 //! driving [`gwennol_core::agent::Session::turn`] one turn at a time so
 //! a failed or cancelled turn leaves the session running rather than
-//! ending it, as [`gwennol_core::agent::Session::run`] would.
+//! ending it, as [`gwennol_core::agent::Session::run`] would; `prompt`
+//! is the approval prompt a request no rule decides opens in the pane.
 
 pub mod drive;
 pub mod editor;
 pub mod keys;
 pub mod operator;
+pub mod prompt;
 pub mod screen;
 pub mod ui;
 
@@ -51,6 +53,7 @@ pub fn start(
         ));
     }
     let shared = Shared::new();
+    shared.update(|ui| ui.workspace = workspace.clone());
     let mut warnings = Vec::new();
     let session = frontend::start(
         cli,
@@ -108,24 +111,23 @@ mod tests {
     use super::*;
 
     /// `tui::start` shows every startup warning it would otherwise
-    /// only log, as the pane's first entries, in the order `start`
-    /// produces them: the empty-policy warning (no `--allow`/`--deny`
-    /// given), then each declared-secret warning. This is the only
-    /// unit test in this crate that boots the host
-    /// (`gwennol_core::host`'s `OnceLock` installs once per process,
-    /// and `boot_with` fails every call after the first with
-    /// `BootError::AlreadyInstalled`; nothing else here reaches it),
-    /// so both warnings are guarded in this one test rather than a
-    /// second that would need its own boot. An explicit `--secret`
-    /// rule points the lookup at an environment variable this test
-    /// names and never sets, rather than the convention variable
+    /// only log, as the pane's first entries — except the no-rules
+    /// one (D6): a session asks at a prompt for what no rule
+    /// decides, so "every request will be denied" is false there,
+    /// and it goes only to the log. This is the only unit test in
+    /// this crate that boots the host (`gwennol_core::host`'s
+    /// `OnceLock` installs once per process, and `boot_with` fails
+    /// every call after the first with `BootError::AlreadyInstalled`;
+    /// nothing else here reaches it). An explicit `--secret` rule
+    /// points the lookup at an environment variable this test names
+    /// and never sets, rather than the convention variable
     /// `GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY`, which a
     /// developer's own shell may have set for real use — a rule
     /// always wins over the convention variable (`secrets.rs`'s
     /// `source_for`), so this is isolated from the machine's
-    /// environment regardless. Guards D3. Mutations: remove either
-    /// `warnings.push` in `frontend.rs` — one entry instead of two,
-    /// or the wrong one missing.
+    /// environment regardless. Guards the no-rules warning going only
+    /// to the log in a session, not the pane. Mutation: restore the
+    /// `warnings.push` in `frontend.rs` — two entries instead of one.
     #[test]
     fn startup_warnings_are_the_first_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -158,16 +160,11 @@ mod tests {
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
         // No --allow/--deny rule at all: the empty-policy warning
-        // fires too, and (per `start`'s own order) precedes the
-        // declared-secret one below.
+        // fires to the log alone, per D6, and not into the pane.
         let (_session, shared) = start(&cli, workspace, Vec::new()).unwrap();
         let guard = shared.lock();
-        assert_eq!(guard.entries.len(), 2, "{:?}", guard.entries);
-        assert_eq!(
-            guard.entries[0],
-            Entry::Trace("gwennol: no approval rules: every request will be denied".to_string())
-        );
-        match &guard.entries[1] {
+        assert_eq!(guard.entries.len(), 1, "{:?}", guard.entries);
+        match &guard.entries[0] {
             Entry::Trace(text) => assert!(
                 text.starts_with(
                     "gwennol: plugin provider-anthropic declares secret \"api_key\" \
