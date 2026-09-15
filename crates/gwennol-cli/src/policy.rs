@@ -1248,6 +1248,22 @@ mod tests {
             "a session rule made from a query must not admit the query-less URL"
         );
 
+        // The escalation direction: a rule made from a clean URL must
+        // not admit one that carries a query (its subject gets the
+        // `?…` marker `http_subject` never adds to the clean one).
+        let clean_http_session = vec![SessionRule {
+            decision: Decision::Allow,
+            plugin: "provider-anthropic".to_string(),
+            kind: Kind::Http,
+            subject: "GET https://x.example/p".to_string(),
+        }];
+        assert_eq!(
+            p.judge_with(&http("GET", "https://x.example/p?a=1"), &clean_http_session)
+                .decision,
+            Decision::Deny,
+            "a session rule made from a query-less URL must not admit one that carries a query"
+        );
+
         // A session rule never pre-empts a compiled rule.
         let deny_first = policy(vec![flag(Decision::Deny, "read:**")]);
         let j = deny_first.judge_with(&read("/ws/a.txt"), &read_session);

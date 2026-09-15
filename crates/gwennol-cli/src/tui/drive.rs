@@ -401,13 +401,16 @@ mod tests {
 
         // A second prompt: typing past it reaches neither the editor
         // nor `exiting`, and it is still open afterward. "/exi", not
-        // "/exit": a whole recognized command still commits (clears)
-        // the editor even with the prompt-routing arm dropped, since
-        // `Command::Exit`'s own handling always calls `commit()`, so
-        // that mutant would leave `editor.text()` empty either way;
-        // "/exi" is `Command::Unknown`, whose arm never commits, so
-        // only the real fix — the prompt swallowing every key before
-        // `ui.editor.key` is ever called — leaves the editor empty.
+        // "/exit": a fix that intercepted only recognized commands
+        // would still leave `editor.text()` empty for "/exit", since
+        // `Command::Exit`'s own handling always calls `commit()`; "/exi"
+        // is `Command::Unknown`, whose arm never commits, so it is the
+        // one that would catch a fix narrowed to recognized commands
+        // instead of every key. It is not independently
+        // mutation-sensitive to the prompt-routing arm itself, though:
+        // dropping that arm fails earlier, at this test's `Esc`
+        // assertion above, before this block or the "/exit" block below
+        // ever runs.
         let mut fut2 = interactive.approve(write_req());
         assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
 

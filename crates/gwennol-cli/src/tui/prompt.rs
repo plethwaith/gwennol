@@ -278,9 +278,11 @@ fn compute_lines(prompt: &Prompt) -> Vec<String> {
 }
 
 /// The key legend for `prompt`: the full [`KEYS`] when a session rule
-/// can hold this request, else [`KEYS_ONCE`] (never a prefix of
-/// either — [`height`] and [`render_prompt`] wrap it in full, though a
-/// box too short for it shows only its first rows).
+/// can hold this request, else [`KEYS_ONCE`]. Neither constant is a
+/// prefix of the other, so a check over every wrapped row of one
+/// cannot pass on the other. [`height`] and [`render_prompt`] wrap the
+/// legend in full, but a box too short for it draws only the first of
+/// its wrapped rows.
 fn key_line(prompt: &Prompt) -> &'static str {
     if prompt.subject.is_some() {
         KEYS
@@ -311,10 +313,13 @@ pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
 /// wrapped at the inner width, showing the `scroll`-clamped window;
 /// the key legend (`key_line`), wrapped at the same width, as the
 /// last inner rows, never scrolled. When the box is shorter than
-/// [`height`] asked for (D5's "terminal shorter than the box"), at
-/// least one content row is reserved before the legend — the legend
-/// is what gets clipped, losing its last wrapped rows first, down to
-/// none at all when the box has room for only the one content row.
+/// [`height`] asked for (D5's "terminal shorter than the box"), one
+/// content row is reserved before the legend — the legend is what gets
+/// clipped, losing its last wrapped rows first, down to none at all
+/// when the box has room for only that one row. A box with no inner
+/// rows at all (`inner.height == 0`, which the layout produces at
+/// terminal heights 3-5) shows neither: the borders are drawn and
+/// nothing inside them.
 pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -845,9 +850,12 @@ pub(crate) mod tests {
 
     /// Guards D5: the box reserves at least one content row before
     /// the legend, so a short terminal never shows the key legend
-    /// alone with nothing to approve. Mutation: drop the `.max(1)` in
-    /// `render_prompt`'s `visible` — the access line disappears at
-    /// 80x7 (`inner.height == 2`, `legend.len() == 2`, `visible == 0`).
+    /// alone with nothing to approve, and it never drops the legend
+    /// entirely once there's room for it. Two mutations, one per
+    /// assertion: drop the `.max(1)` in `render_prompt`'s `visible` —
+    /// the access line disappears at 80x7 (`inner.height == 2`,
+    /// `legend.len() == 2`, `visible == 0`); or force `legend_budget`
+    /// to 0 once the legend cannot fit — the legend disappears instead.
     #[test]
     fn a_short_terminal_still_shows_the_access_line_behind_the_legend() {
         let (interactive, shared) = op(empty_policy());

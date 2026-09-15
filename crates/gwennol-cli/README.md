@@ -241,7 +241,7 @@ MVP". Author a rule at the prompt or keep a session's answers past it:
 `a`/`d` are in memory and match the request's text as the prompt
 showed it — for an `http` URL that text is the scrubbed one with a
 marker for what was cut, so an answer given for a URL that carried a
-query covers any query string at that path, one given for a URL that
-carried credentials covers any credentials at it, and one given for a
-clean URL covers only itself; a pattern is written in the config file
-between sessions.
+query or fragment covers any query string at that path, one given for
+a URL that carried credentials covers any credentials at it, and one
+given for a clean URL covers only itself; a pattern is written in the
+config file between sessions.
