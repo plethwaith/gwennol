@@ -750,7 +750,7 @@ mod tests {
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
     /// `cursor - start` underflowed once `width < 3`; and, with a
     /// prompt open, `render_prompt`'s own block and rows the same way
-    /// at heights 1–4. Mutation: drop either of the first two guards —
+    /// at heights 1–4 and 20. Mutation: drop either of the first two guards —
     /// `TestBackend::new(80, 1)` or `(80, 2)` then panics with "index
     /// outside of buffer"; a 5-char buffer at width 1 or 2 panics with
     /// "attempt to subtract with overflow". Also: `render_prompt`
@@ -758,7 +758,7 @@ mod tests {
     /// `regions`' own `Layout` never hands it in practice (every
     /// region it returns already fits `area`), but the direct call
     /// below bypasses that and drives the guard itself — must not
-    /// panic either, at heights 1–4 inside a 5x2 buffer. Mutation for
+    /// panic either, at heights 1–4 and 20 inside a 5x2 buffer. Mutation for
     /// that case: drop the `intersection` in `render_prompt`.
     #[test]
     fn a_too_small_terminal_neither_panics_nor_runs_the_cursor_past_the_window() {

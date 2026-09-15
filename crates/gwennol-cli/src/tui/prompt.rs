@@ -37,8 +37,9 @@ pub struct Prompt {
     pub id: u64,
     /// What is being asked.
     pub request: ApprovalRequest,
-    /// Why no rule short of `any` could judge this — the reason the
-    /// prompt exists at all.
+    /// Why no rule short of `any` could judge this. `None` for the
+    /// ordinary case, no rule matched; `Some` names the reason the
+    /// prompt exists at all when it is something else.
     pub unjudgeable: Option<Unjudgeable>,
     /// `ShowAccess` of the request, as `approve` rendered it.
     pub access_line: String,
@@ -278,7 +279,8 @@ fn compute_lines(prompt: &Prompt) -> Vec<String> {
 
 /// The key legend for `prompt`: the full [`KEYS`] when a session rule
 /// can hold this request, else [`KEYS_ONCE`] (never a prefix of
-/// either — [`height`] and [`render_prompt`] wrap it in full).
+/// either — [`height`] and [`render_prompt`] wrap it in full, though a
+/// box too short for it shows only its first rows).
 fn key_line(prompt: &Prompt) -> &'static str {
     if prompt.subject.is_some() {
         KEYS
@@ -311,9 +313,8 @@ pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
 /// last inner rows, never scrolled. When the box is shorter than
 /// [`height`] asked for (D5's "terminal shorter than the box"), at
 /// least one content row is reserved before the legend — the legend
-/// is what gets clipped when the box cannot hold both, down to
-/// nothing when the box is one row of content or shorter, which is
-/// then clipped to the box.
+/// is what gets clipped, losing its last wrapped rows first, down to
+/// none at all when the box has room for only the one content row.
 pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -858,6 +859,11 @@ pub(crate) mod tests {
         assert!(
             frame.iter().any(|r| r.contains("write /ws/out.txt")),
             "no access line on screen at 80x7: {frame:?}"
+        );
+        let first_legend_row = ui::wrap(KEYS, INNER_W)[0].clone();
+        assert!(
+            frame.iter().any(|r| r.contains(&first_legend_row)),
+            "no legend at all on screen at 80x7: {frame:?}"
         );
     }
 

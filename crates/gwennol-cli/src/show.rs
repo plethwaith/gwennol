@@ -101,10 +101,12 @@ fn http_subject(method: &str, url: &str) -> Option<String> {
 /// for every such request. Built
 /// through the same helpers [`ShowAccess`] renders with, so the two
 /// cannot drift: a session rule matches exactly the text the prompt
-/// showed — for `http` that text is already the *scrubbed* URL, so
-/// one answer covers every URL that scrubs to the same text: any query
-/// string at that path when the one shown carried a query or fragment,
-/// and any credentials at it when the one shown carried userinfo.
+/// showed — for `http` that text is the *scrubbed* URL with a marker
+/// for what was cut, so one answer covers every URL with the same
+/// scrubbed text and the same markers: any query string at that path
+/// when the one shown carried a query or fragment, any credentials at
+/// it when the one shown carried userinfo, and only the URL itself
+/// when it carried neither.
 pub fn subject(access: &Access, workspace: &Path) -> Option<String> {
     match access {
         Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {

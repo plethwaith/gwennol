@@ -4,10 +4,10 @@
 //! is never left behind. `Session::run` is never called: it stops at
 //! the first turn that does not complete, and a session must carry on
 //! past a failed or cancelled one. Keys go to an open approval prompt
-//! before anything else typed reaches it (a Ctrl-C notice is still
-//! retired first; a resize or a read error never reaches the prompt
-//! at all, and a paste is dropped rather than routed to it), so `Esc`
-//! there denies rather than cancels.
+//! before anything else typed reaches the editor or the token (a
+//! Ctrl-C notice is still retired first; a resize or a read error
+//! never reaches the prompt at all, and a paste is dropped rather
+//! than routed to it), so `Esc` there denies rather than cancels.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -462,11 +462,15 @@ mod tests {
         // "/exi" above cannot check this — it parses to
         // `Command::Unknown`, which has no path to `exiting` at all —
         // so this is the only assertion that a *recognized* command
-        // cannot take effect behind a prompt. The buffer is cleared
-        // first: "/exi" left uncommitted (`Command::Unknown` never
-        // commits) would otherwise glue onto "/exit" as "/exi/exit",
-        // which also parses to `Unknown` and never reaches `exiting`
-        // regardless of whether the fix below is reverted.
+        // cannot take effect behind a prompt, though it is not
+        // independently mutation-sensitive: the sole production guard
+        // is the prompt-routing arm above, and dropping it fails at
+        // this test's earlier `Esc` assertion, before this block ever
+        // runs. The buffer is cleared first: "/exi" left uncommitted
+        // (`Command::Unknown` never commits) would otherwise glue onto
+        // "/exit" as "/exi/exit", which also parses to `Unknown` and
+        // never reaches `exiting` regardless of whether the
+        // prompt-routing arm in `handle_key` is reverted.
         shared.update(|ui| ui.editor.commit());
         for c in "/exit".chars() {
             handle_key(

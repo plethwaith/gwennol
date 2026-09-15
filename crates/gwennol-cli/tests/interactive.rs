@@ -1268,10 +1268,10 @@ async fn scenario() {
             type_line(&tx, &format!("read {}", outside.display()));
             // Waits for either outcome, so a second prompt opening
             // (the mutation this run guards: passing `&[]` for the
-            // session slice) fails this wait itself, sub-second and by
-            // name, instead of leaving the `prompts.is_empty()`
-            // assertion below unreachable behind this call's 10 s
-            // timeout.
+            // session slice) ends this wait at once, so the
+            // `prompts.is_empty()` assertion below fails by name in
+            // about a second instead of being left unreachable behind
+            // this call's 10 s timeout.
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
@@ -1349,10 +1349,10 @@ async fn scenario() {
             let mid = shared.lock().entries.len();
             type_line(&tx, "grep needle");
             // Waits for either outcome, so a second prompt opening
-            // (the mutation this run guards) fails this wait itself,
-            // sub-second and by name, instead of leaving the
-            // `prompts.is_empty()` assertion below unreachable behind
-            // this call's 10 s timeout.
+            // (the mutation this run guards) ends this wait at once,
+            // so the `prompts.is_empty()` assertion below fails by
+            // name in about a second instead of being left
+            // unreachable behind this call's 10 s timeout.
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
@@ -1465,12 +1465,25 @@ async fn scenario() {
         let shared = shared.clone();
         tokio::spawn(async move {
             type_line(&tx, "write forbidden.txt");
+            // Waits for either outcome, so a prompt opening (the
+            // mutation this run guards: no compiled `deny` for the
+            // subject) ends this wait at once, so the
+            // `prompts.is_empty()` assertion below fails by name in
+            // about a second instead of being left unreachable behind
+            // this call's 10 s timeout.
             await_ui(
                 &shared,
-                |ui| outcomes_since(ui, start) >= 1,
-                "run N: outcome",
+                |ui| outcomes_since(ui, start) >= 1 || !ui.prompts.is_empty(),
+                "run N: outcome or a prompt",
             )
             .await;
+            {
+                let ui = shared.lock();
+                assert!(
+                    ui.prompts.is_empty(),
+                    "run N: a prompt opened for a compiled deny"
+                );
+            }
             type_line(&tx, "/exit");
         })
     };
@@ -1490,10 +1503,6 @@ async fn scenario() {
                 |e| matches!(e, Entry::Trace(t) if t.starts_with("gwennol: !! write toolu_s1: "))
             ),
             "run N: {entries:?}"
-        );
-        assert!(
-            ui.prompts.is_empty(),
-            "run N: a prompt opened for a compiled deny"
         );
         let user_at = entries
             .iter()
@@ -1575,10 +1584,10 @@ async fn scenario() {
             let mid = shared.lock().entries.len();
             type_line(&tx, "elsewhere");
             // Waits for either outcome, so a second prompt opening
-            // (the bug this guards against) fails this wait itself,
-            // sub-second and by name, instead of leaving the
-            // `prompts.is_empty()` assertion below unreachable behind
-            // this call's 10 s timeout.
+            // (the bug this guards against) ends this wait at once,
+            // so the `prompts.is_empty()` assertion below fails by
+            // name in about a second instead of being left
+            // unreachable behind this call's 10 s timeout.
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
