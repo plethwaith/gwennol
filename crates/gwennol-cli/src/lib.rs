@@ -5,8 +5,8 @@
 //! text on stdout and the trace on stderr, no input. A session decides
 //! by a rule when one matches and asks at a prompt otherwise,
 //! remembering an `a`/`d` answer for the rest of the session when the
-//! request can hold one (not a spawn carrying stdin, nor a kind this
-//! frontend does not know); a print run decides by rules alone and
+//! request can hold one (not every request can: see
+//! [`show::subject`]); a print run decides by rules alone and
 //! denies what none matches. Both trace
 //! every decision — a session into its transcript pane, a print run to
 //! stderr — and both go through [`frontend::start`] and share

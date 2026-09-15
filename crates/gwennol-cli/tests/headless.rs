@@ -416,10 +416,8 @@ fn a_request_no_rule_matches_is_denied_and_the_model_is_told() {
 
 /// Guards D6's "print mode unchanged": the empty-policy warning still
 /// fires when a run has no `--allow`/`--deny` flag and no `[[rules]]`
-/// table at all — this is the only run in this file that reaches
-/// `frontend::start` with an empty policy (several others pass no
-/// rule flag either, but exit before a policy is even compiled).
-/// Mutation: delete the `tracing::warn!` in `frontend.rs`.
+/// table at all — this is the only run in this file that asserts on that
+/// warning. Mutation: delete the `tracing::warn!` in `frontend.rs`.
 #[test]
 fn a_run_with_no_rules_at_all_still_warns_to_the_log() {
     let f = fixture();

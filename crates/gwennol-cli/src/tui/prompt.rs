@@ -55,7 +55,10 @@ pub struct Prompt {
     /// construction, so the rows never do either. Populated lazily by
     /// [`lines`]'s first call rather than eagerly here, since a
     /// prompt's rows are otherwise never needed before the first
-    /// render.
+    /// render. If any of the three ever becomes mutable, clear this
+    /// cache (`.take()` it) wherever it changes: nothing enforces the
+    /// invariant today, since `Prompt` is `pub` and reachable through
+    /// `pub prompts: Vec<Prompt>`.
     lines_cache: std::cell::OnceCell<Vec<String>>,
     answer: Option<oneshot::Sender<Decision>>,
 }
@@ -307,8 +310,9 @@ pub fn height(prompt: &Prompt, width: u16, area_height: u16) -> u16 {
 /// the key legend (`key_line`), wrapped at the same width, as the
 /// last inner rows, never scrolled. When the box is shorter than
 /// [`height`] asked for (D5's "terminal shorter than the box"), the
-/// legend is clipped to what remains rather than overrunning the
-/// content rows.
+/// legend keeps its rows and the content window shrinks to what is
+/// left — to nothing when the box is shorter than the legend itself,
+/// which is then clipped to the box.
 pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
@@ -359,6 +363,15 @@ pub(crate) mod tests {
     use crate::tui::keys::Input;
     use crate::tui::operator::Interactive;
 
+    /// The `TestBackend` width every test below renders at, and the
+    /// inner width (`FRAME_W` minus the two border columns) every
+    /// `ui::wrap(_, ..)` legend check wraps at: one constant so the
+    /// two can never drift apart, as they did when the legend checks
+    /// hardcoded `78` (this file's inner width) independently of the
+    /// `80` `render_frame` hardcoded as the outer one.
+    const FRAME_W: u16 = 80;
+    const INNER_W: usize = (FRAME_W - 2) as usize;
+
     /// An `Interactive` judging by `policy` for workspace `/ws`, and
     /// the `Shared` it renders through (with `workspace` already set,
     /// as `tui::start` sets it before any turn runs).
@@ -402,7 +415,7 @@ pub(crate) mod tests {
     }
 
     fn render_frame(shared: &Arc<Shared>) -> Vec<String> {
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(FRAME_W, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::tui::ui::render(&shared.lock(), f))
@@ -625,12 +638,30 @@ pub(crate) mod tests {
         }
         // The full legend, not a prefix `KEYS` also shares: every
         // wrapped row of `KEYS_ONCE` must reach the screen.
-        for row in ui::wrap(KEYS_ONCE, 78) {
+        for row in ui::wrap(KEYS_ONCE, INNER_W) {
             assert!(
                 frame.iter().any(|r| r.contains(&row)),
                 "missing legend row {row:?} in {frame:?}"
             );
         }
+        // 10 content rows (access line, "asked by", the model-asked
+        // line, the 3-line pretty-printed arguments, the stdin header,
+        // the stdin itself, and the unjudgeable note) plus the 2-row
+        // `KEYS_ONCE` legend, under the cap: unlike `KEYS`, `KEYS_ONCE`
+        // had no height assertion pinning it, so it could be emptied
+        // to `""` and the suite would stay green — `ui::wrap` returns
+        // `[""]` for an empty string, so the loop above still passes.
+        {
+            let ui = shared.lock();
+            let prompt = &ui.prompts[0];
+            assert_eq!(height(prompt, FRAME_W, 24), 14, "10 + 2 + 2, under the cap");
+        }
+        // The wording itself, pinned by something other than the
+        // constant it quotes.
+        assert!(
+            frame.iter().any(|r| r.contains("cannot be remembered")),
+            "{frame:?}"
+        );
 
         let cancel = CancellationToken::new();
         let _ = crate::tui::drive::handle_key(
@@ -687,7 +718,7 @@ pub(crate) mod tests {
         assert!(frame.iter().any(|r| r.contains("\"k00\"")), "{frame:?}");
         assert!(!frame.iter().any(|r| r.contains("\"k39\"")), "{frame:?}");
         // The full legend, not a prefix `KEYS_ONCE` also shares.
-        for row in ui::wrap(KEYS, 78) {
+        for row in ui::wrap(KEYS, INNER_W) {
             assert!(
                 frame.iter().any(|r| r.contains(&row)),
                 "missing legend row {row:?} in {frame:?}"
@@ -703,8 +734,8 @@ pub(crate) mod tests {
         {
             let ui = shared.lock();
             let prompt = &ui.prompts[0];
-            assert_eq!(height(prompt, 80, 24), 16, "the `* 2 / 3` cap, not 49");
-            assert_eq!(height(prompt, 80, 3), 4, "the `max(4)` floor");
+            assert_eq!(height(prompt, FRAME_W, 24), 16, "the `* 2 / 3` cap, not 49");
+            assert_eq!(height(prompt, FRAME_W, 3), 4, "the `max(4)` floor");
         }
 
         let mut presses = 0;
@@ -724,7 +755,7 @@ pub(crate) mod tests {
             assert!(presses <= 10, "k39 never scrolled into view");
         }
         let frame = render_frame(&shared);
-        for row in ui::wrap(KEYS, 78) {
+        for row in ui::wrap(KEYS, INNER_W) {
             assert!(
                 frame.iter().any(|r| r.contains(&row)),
                 "missing legend row {row:?} in {frame:?}"
@@ -777,7 +808,7 @@ pub(crate) mod tests {
         {
             let ui = shared2.lock();
             let prompt = &ui.prompts[0];
-            assert_eq!(height(prompt, 80, 24), 7, "3 + 2 + 2, under the cap");
+            assert_eq!(height(prompt, FRAME_W, 24), 7, "3 + 2 + 2, under the cap");
         }
     }
 

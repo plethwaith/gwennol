@@ -4,8 +4,8 @@
 the model's text streams into a transcript pane, a line editor takes
 the next turn, and an approval no rule decides is asked at a prompt,
 `y`/`n` once, `a`/`d` for the rest of the session when the request can
-be remembered (not a spawn carrying stdin, nor an access of a kind
-this frontend does not know); a rule always decides first, and every
+be remembered (not every request can: see `show::subject`); a rule
+always decides first, and every
 decision traces into the pane, in the same
 words this file's examples show on stderr. `-p`/`--print` — what the
 rest of this file walks through — is one task run headlessly instead,
@@ -107,10 +107,10 @@ nothing; a real restriction names a program that is not a shell
 workspace root matches no `spawn` rule at all, since the grammar cannot
 judge those; only `any` reaches them, in either direction — a
 `deny spawn:*` does not stop such a spawn that a later `allow any`
-admits; `deny any` does — and the trace says so, and a session asks
-at a prompt for them instead of denying — a spawn outside the
-workspace root can then be remembered for the session, one carrying
-stdin cannot. An `http`
+admits; `deny any` does — and the trace says so. When no rule, not
+even `any`, decides them, a session asks at a prompt instead of
+denying — a spawn outside the workspace root can then be remembered
+for the session, one carrying stdin cannot. An `http`
 pattern names the method first — `http:POST …`, upper-case, one space,
 or `http:* …` for any method — because a URL that may be fetched is
 not one that may be posted to; a method that could never match is

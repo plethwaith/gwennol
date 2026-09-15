@@ -345,11 +345,13 @@ impl Rule {
 }
 
 /// A rule the user made at a prompt for the rest of the session:
-/// exact text, never a glob, never written to disk — except for
-/// `http`, whose subject is the *scrubbed* URL ([`crate::show::subject`]):
-/// one answer admits any query string at the same path, not only the
-/// one that was asked about. Tried after every compiled rule, so it
-/// can never pre-empt a file's `deny`.
+/// never a glob, never written to disk, and exact text — except for
+/// `http`, whose subject is the *scrubbed* URL ([`crate::show::subject`]),
+/// so the exact text is the scrubbed one: when the URL carried a
+/// query or fragment (scrubbed to `?…`), one answer admits any query
+/// string at the same path; a URL with no query or fragment matches
+/// only itself. Tried after every compiled rule, so it can never
+/// pre-empt a file's `deny`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRule {
     /// Allow or deny.
@@ -558,11 +560,11 @@ impl Policy {
         self.judge_with(request, &[])
     }
 
-    /// Judge a request: the first matching compiled rule, then —
-    /// compiled rules being tried first, not session rules being
-    /// tried in the order they were made — the first matching session
-    /// rule, so a session rule can never pre-empt a compiled `deny`;
-    /// else the default denial.
+    /// Judge a request: the first matching compiled rule, else the
+    /// first matching session rule, in the order they were made;
+    /// else the default denial. Compiled rules being tried first —
+    /// not the order the session rules are in — is what keeps a
+    /// session rule from pre-empting a compiled `deny`.
     pub fn judge_with<'a>(
         &'a self,
         request: &ApprovalRequest,

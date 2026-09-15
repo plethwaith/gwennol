@@ -21,9 +21,9 @@ use clap::{CommandFactory, FromArgMatches};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gwennol::tui::drive::drive;
 use gwennol::tui::keys::Input;
-use gwennol::tui::prompt::TITLE;
+use gwennol::tui::prompt::{KEYS_ONCE, TITLE};
 use gwennol::tui::screen::{Kitty, Screen};
-use gwennol::tui::ui::{Entry, Shared, TurnState, Ui, render};
+use gwennol::tui::ui::{Entry, Shared, TurnState, Ui, render, wrap};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
 use gwennol_core::Session;
 use provider_anthropic::PLUGIN_NAME as PROVIDER;
@@ -133,11 +133,11 @@ const TOOL_ELSEWHERE_MANIFEST: &str = r#"{
 "#;
 
 struct Fixture {
-    /// The fixture's own root: the workspace's parent, and where
-    /// `outside.txt` sits — a path outside the workspace, so run K's
-    /// `read` of it matches no rule and must be asked at a prompt. No
-    /// spawn in this suite runs outside the workspace; that case is
-    /// unit-tested in `policy.rs`.
+    /// The fixture's own root: the workspace's parent, where
+    /// `outside.txt` sits — a path outside the workspace, so run K's `read`
+    /// of it matches no rule and must be asked at a prompt — and the `cwd`
+    /// run P's `tool-elsewhere` spawn runs at, raising
+    /// `Unjudgeable::SpawnElsewhere`.
     root: PathBuf,
     workspace: PathBuf,
     key_file: PathBuf,
@@ -312,7 +312,7 @@ fn box_rows(shared: &std::sync::Arc<Shared>) -> Vec<String> {
     let f = frame(shared);
     let top = f
         .iter()
-        .position(|r| r.starts_with('┌'))
+        .position(|r| r.starts_with(&format!("┌{TITLE}")))
         .expect("box_rows: no open box (no row starts with the top border)");
     let bottom = f[top + 1..]
         .iter()
@@ -404,8 +404,7 @@ fn assistant_text_from_transcript(transcript: &[Value], from: usize) -> String {
         .collect()
 }
 
-/// The `check` most `await_ui` calls in this file wait for: a request
-/// no rule decided has reached a prompt.
+/// Whether an approval prompt is open.
 fn prompt_open(ui: &Ui) -> bool {
     !ui.prompts.is_empty()
 }
@@ -1395,11 +1394,15 @@ async fn scenario() {
                     "run M: missing {needle:?} in {rows:?}"
                 );
             }
-            let keys_once_head: String = gwennol::tui::prompt::KEYS_ONCE.chars().take(30).collect();
-            assert!(
-                rows.iter().any(|r| r.contains(&keys_once_head)),
-                "run M: {rows:?}"
-            );
+            // The full legend, wrapped as `render_prompt` wraps it (78
+            // = the 80-wide frame's inner width), not a prefix `KEYS`
+            // also shares.
+            for row in wrap(KEYS_ONCE, 78) {
+                assert!(
+                    rows.iter().any(|r| r.contains(&row)),
+                    "run M: missing legend row {row:?} in {rows:?}"
+                );
+            }
             key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
             await_ui(
                 &shared,
@@ -1563,10 +1566,15 @@ async fn scenario() {
             // with no second prompt.
             let mid = shared.lock().entries.len();
             type_line(&tx, "elsewhere");
+            // Waits for either outcome, so a second prompt opening
+            // (the bug this guards against) fails this wait itself,
+            // sub-second and by name, instead of leaving the
+            // `prompts.is_empty()` assertion below unreachable behind
+            // this call's 10 s timeout.
             await_ui(
                 &shared,
-                |ui| outcomes_since(ui, mid) >= 1,
-                "run P: second outcome",
+                |ui| outcomes_since(ui, mid) >= 1 || !ui.prompts.is_empty(),
+                "run P: second outcome or a second prompt",
             )
             .await;
             {

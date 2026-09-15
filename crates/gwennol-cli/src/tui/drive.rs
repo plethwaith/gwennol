@@ -59,7 +59,9 @@ pub(crate) fn handle_key(
         let key = match input {
             Input::Resize => return,
             Input::Paste(text) => {
-                // A prompt swallows a paste too, the same as a key:
+                // A prompt swallows a paste too, dropped rather than
+                // routed to it (never reaching `prompt::key`, unlike
+                // a key, so it can never answer or scroll a prompt):
                 // pasted text must not accumulate behind an open
                 // prompt, silently, for the editor to submit later.
                 if ui.prompts.is_empty() {
@@ -355,10 +357,16 @@ mod tests {
     }
 
     /// Guards D4: while a prompt is open, every key is the prompt's —
-    /// `Esc` denies rather than reaching the token, typing `/exit`
-    /// never reaches the editor or `exiting`, and Ctrl-C sets no
-    /// notice — until the prompt itself is answered. Mutation: drop
-    /// the prompt-routing arm in `handle_key`.
+    /// `Esc` denies rather than reaching the token, typing `/exi`
+    /// never reaches the editor — `/exit` would not catch the
+    /// mutation, since `Command::Exit`'s own arm commits the editor
+    /// either way (`drive.rs:116`) — a recognized `/exit` + Enter
+    /// still never sets `exiting`, a bracketed paste never reaches
+    /// the editor either, and Ctrl-C sets no notice — until the
+    /// prompt itself is answered. Mutations: drop the prompt-routing
+    /// arm in `handle_key` (the key case); drop the
+    /// `ui.prompts.is_empty()` guard around `ui.editor.paste` (the
+    /// paste case).
     #[test]
     fn keys_go_to_an_open_prompt_never_to_the_editor_or_the_token() {
         use std::path::Path;
@@ -402,6 +410,23 @@ mod tests {
         // `ui.editor.key` is ever called — leaves the editor empty.
         let mut fut2 = interactive.approve(write_req());
         assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
+
+        // A bracketed paste is swallowed the same as a key: it must
+        // not reach the editor while a prompt is open, and it must
+        // not answer or scroll the prompt either (the `Paste` arm
+        // returns before the key-routing branch is ever reached).
+        handle_key(&shared, &cancel, true, Input::Paste("rm -rf /".to_string()));
+        assert_eq!(
+            shared.lock().editor.text(),
+            "",
+            "a paste reached the editor while a prompt was open"
+        );
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "a paste answered or closed the prompt"
+        );
+
         for c in "/exi".chars() {
             handle_key(
                 &shared,
@@ -426,6 +451,36 @@ mod tests {
             "typed text reached the editor while a prompt was open"
         );
         assert!(!shared.lock().exiting);
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "the prompt closed on its own"
+        );
+
+        // A whole recognized command, typed the same way: `/exit` +
+        // Enter still never sets `exiting` while the prompt is open.
+        // "/exi" above cannot check this — it parses to
+        // `Command::Unknown`, which has no path to `exiting` at all —
+        // so this is the only assertion that a *recognized* command
+        // cannot take effect behind a prompt.
+        for c in "/exit".chars() {
+            handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(
+            !shared.lock().exiting,
+            "a recognized /exit reached exiting while a prompt was open"
+        );
         assert_eq!(
             shared.lock().prompts.len(),
             1,

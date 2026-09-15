@@ -111,11 +111,11 @@ pub struct Ui {
     pub session_rules: Vec<SessionRule>,
     /// The canonical workspace, set once by `tui::start` (`tui/mod.rs:56`)
     /// before the frontend runs a turn: what a prompt's key handler
-    /// renders the answered request's trace line against
-    /// (`show::decided`, `prompt.rs:201`). A session rule's own subject
-    /// is not taken from here — `Interactive::approve` computes it
-    /// from its own workspace (`operator.rs:91`) and the prompt
-    /// carries it.
+    /// renders the answered request's trace line against (what
+    /// `answer_prompt` passes to `show::decided`). A session rule's
+    /// own subject is not taken from here — `Interactive::approve`
+    /// computes it from its own workspace (`operator.rs:91`) and the
+    /// prompt carries it.
     pub workspace: PathBuf,
 }
 
@@ -744,7 +744,7 @@ mod tests {
     }
 
     /// Guards two panics on a terminal under three rows: `regions`
-    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:392-401;
+    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:399-402;
     /// `h` is zero with no prompt open), so below three rows the
     /// status or editor area's `y` falls outside the buffer and
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
