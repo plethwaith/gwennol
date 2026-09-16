@@ -45,12 +45,13 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// which this module keeps and the declared-secret warnings below
 /// consult; and the canonical workspace. `workspace` must already
 /// be canonical, as [`workspace`] returns it: the compiled policy
-/// is rooted at it verbatim. `warnings` receives the two kinds of
-/// startup warning a frontend with no stderr should still show — the
-/// empty-policy one, and one per declared secret with no source — in
-/// the same words their log lines carry. Other warnings raised while
-/// starting (`policy::walk`'s unresolvable-prefix one) go only to the
-/// log. The returned session has run no turn.
+/// is rooted at it verbatim. `warnings` receives the startup warnings
+/// a frontend with no stderr should still show — one per declared
+/// secret with no source — in the same words their log lines carry.
+/// The no-rules warning goes only to the log: it describes print
+/// mode's default, and a session asks instead. Other warnings raised
+/// while starting (`policy::walk`'s unresolvable-prefix one) go only
+/// to the log too. The returned session has run no turn.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
@@ -78,9 +79,7 @@ pub fn start(
         tracing::info!(rule = %rule.spec(), "rule");
     }
     if policy.rules().is_empty() {
-        let message = "no approval rules: every request will be denied";
-        tracing::warn!("{message}");
-        warnings.push(message.to_string());
+        tracing::warn!("no approval rules: every request will be denied");
     }
 
     // ---- the secrets: flags, then the config.

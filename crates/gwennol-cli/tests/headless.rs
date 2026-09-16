@@ -414,6 +414,23 @@ fn a_request_no_rule_matches_is_denied_and_the_model_is_told() {
     );
 }
 
+/// Guards D6's "print mode unchanged": the empty-policy warning still
+/// fires when a run has no `--allow`/`--deny` flag and no `[[rules]]`
+/// table at all — this is the only run in this file that asserts on that
+/// warning. Mutation: delete the `tracing::warn!` in `frontend.rs`.
+#[test]
+fn a_run_with_no_rules_at_all_still_warns_to_the_log() {
+    let f = fixture();
+    let config = f.config("norules", "/norules", "");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .arg("Say hi."));
+    r.stderr_has("no approval rules: every request will be denied");
+}
+
 #[test]
 fn rules_are_tried_in_order_and_file_rules_name_their_file() {
     let f = fixture();

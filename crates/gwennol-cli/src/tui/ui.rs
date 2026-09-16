@@ -4,8 +4,11 @@
 //! another task — a running turn, a host step asking for approval —
 //! reaches it: a `Mutex` (poison-proof: a panic elsewhere must not
 //! stop later updates from landing) plus a `watch` generation the loop
-//! and tests wait on.
+//! and tests wait on. `Ui` also holds the open approval prompts and
+//! the session rules an `a`/`d` answer at one has made, both read and
+//! written under the same lock a judgement runs under.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -17,8 +20,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 use tokio::sync::watch;
 
+use crate::policy::SessionRule;
 use crate::show;
 use crate::tui::editor::Editor;
+use crate::tui::prompt::{self, Prompt};
 
 /// One line in the transcript pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +98,25 @@ pub struct Ui {
     /// `render_pane`'s last computed rows, and the `(revision, width)`
     /// they were computed at.
     pane_cache: std::cell::RefCell<Option<PaneCache>>,
+    /// Open approval prompts: the first is shown, and answered first;
+    /// the rest wait behind it. [`crate::tui::prompt::PromptGuard`]
+    /// and [`crate::tui::prompt::key`] are the only writers — the
+    /// `entries` doc's "only read" rule applies here too.
+    pub prompts: Vec<Prompt>,
+    /// The last id assigned to a prompt; [`crate::tui::prompt::PromptGuard::open`]
+    /// increments and assigns it.
+    pub prompt_seq: u64,
+    /// Rules made at prompts, in the order made: tried after every
+    /// compiled rule by `Interactive::approve` under this same lock.
+    pub session_rules: Vec<SessionRule>,
+    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs:56`)
+    /// before the frontend runs a turn: what a prompt's key handler
+    /// renders the answered request's trace line against (what
+    /// `answer_prompt` passes to `show::decided`). A session rule's
+    /// own subject is not taken from here — `Interactive::approve`
+    /// computes it from its own workspace (`operator.rs:91`) and the
+    /// prompt carries it.
+    pub workspace: PathBuf,
 }
 
 /// `render_pane`'s wrapped, styled rows and the `(revision, width)`
@@ -111,6 +135,10 @@ impl Default for Ui {
             tick: 0,
             revision: 0,
             pane_cache: std::cell::RefCell::new(None),
+            prompts: Vec::new(),
+            prompt_seq: 0,
+            session_rules: Vec::new(),
+            workspace: PathBuf::new(),
         }
     }
 }
@@ -276,7 +304,8 @@ impl Shared {
 pub const HELP: &[&str] = &[
     "/exit ends the session (twice while a turn is unwinding: exit at once, status 130)",
     "/help lists the commands",
-    "Esc cancels the running turn",
+    "Esc cancels the running turn (denies once instead, at an open approval prompt)",
+    "y n a d answer an open approval prompt: once, or for the rest of the session; Esc denies once",
 ];
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -358,10 +387,17 @@ fn editor_window(text: &[char], cursor: usize, width: usize) -> (String, usize) 
     (window, cursor - start)
 }
 
-/// The three fixed regions a frame is split into.
-fn regions(area: Rect) -> [Rect; 3] {
+/// The four regions a frame is split into: the pane, the approval box
+/// (zero height with no prompt open), the status line, and the
+/// editor.
+fn regions(ui: &Ui, area: Rect) -> [Rect; 4] {
+    let h = ui
+        .prompts
+        .first()
+        .map_or(0, |p| prompt::height(p, area.width, area.height));
     Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(h),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -372,8 +408,13 @@ struct View<'a>(&'a Ui);
 
 impl Widget for View<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let [pane, status, editor] = regions(area);
+        let [pane, prompt_area, status, editor] = regions(self.0, area);
         render_pane(self.0, pane, buf);
+        if let Some(prompt) = self.0.prompts.first()
+            && prompt_area.height > 0
+        {
+            prompt::render_prompt(prompt, prompt_area, buf);
+        }
         render_status(self.0, status, buf);
         render_editor(self.0, editor, buf);
     }
@@ -381,10 +422,11 @@ impl Widget for View<'_> {
 
 fn render_pane(ui: &Ui, area: Rect, buf: &mut Buffer) {
     // `regions` can hand back a rect [`Layout`] could not actually fit
-    // inside `buf`'s area when the frame is shorter than the three
-    // fixed rows it asks for (`Length(1)` twice plus `Min(1)`); clipped
-    // to what the buffer really has before any `set_stringn` below
-    // indexes it, rather than trusting the sub-rect's own bounds.
+    // inside `buf`'s area when the frame is shorter than the fixed
+    // rows it asks for (`Length(1)` twice, `Length(h)` for an open
+    // prompt, plus `Min(1)`); clipped to what the buffer really has
+    // before any `set_stringn` below indexes it, rather than trusting
+    // the sub-rect's own bounds.
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
         return;
@@ -461,11 +503,11 @@ fn render_editor(ui: &Ui, area: Rect, buf: &mut Buffer) {
     buf.set_stringn(area.x, area.y, format!("> {window}"), width, Style::new());
 }
 
-/// Draw one frame: the pane, the status line, the editor, and the
-/// cursor's screen position.
+/// Draw one frame: the pane, the approval box, the status line, the
+/// editor, and the cursor's screen position.
 pub fn render(ui: &Ui, frame: &mut Frame) {
     let area = frame.area();
-    let [_, _, editor_area] = regions(area);
+    let [_, _, _, editor_area] = regions(ui, area);
     frame.render_widget(View(ui), area);
     let width = editor_area.width as usize;
     let chars: Vec<char> = ui.editor.text().chars().collect();
@@ -476,11 +518,30 @@ pub fn render(ui: &Ui, frame: &mut Frame) {
 
 #[cfg(test)]
 mod tests {
-    use gwennol_core::{Failure, ToolCall};
+    use gwennol_core::{Access, ApprovalRequest, Failure, ToolCall};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::tui::prompt::{self, Prompt};
+
+    /// A `Prompt` for a plain write with no cause, for the render
+    /// tests below: never answered, and never needs to be — these
+    /// tests only draw it.
+    fn open_write_prompt() -> Prompt {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        Prompt::new(
+            ApprovalRequest {
+                plugin: "tool-write".to_string(),
+                cause: None,
+                access: Access::WriteFile(std::path::PathBuf::from("/ws/out.txt")),
+            },
+            None,
+            "write /ws/out.txt".to_string(),
+            Some("/ws/out.txt".to_string()),
+            tx,
+        )
+    }
 
     fn call(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -683,13 +744,22 @@ mod tests {
     }
 
     /// Guards two panics on a terminal under three rows: `regions`
-    /// splits `Min(1)/Length(1)/Length(1)`, so below three rows the
+    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:399-402;
+    /// `h` is zero with no prompt open), so below three rows the
     /// status or editor area's `y` falls outside the buffer and
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
-    /// `cursor - start` underflowed once `width < 3`. Mutation: drop
-    /// either guard — `TestBackend::new(80, 1)` or `(80, 2)` then
-    /// panics with "index outside of buffer"; a 5-char buffer at
-    /// width 1 or 2 panics with "attempt to subtract with overflow".
+    /// `cursor - start` underflowed once `width < 3`; and, with a
+    /// prompt open, `render_prompt`'s own block and rows the same way
+    /// at heights 1–4 and 20. Mutation: drop either of the first two guards —
+    /// `TestBackend::new(80, 1)` or `(80, 2)` then panics with "index
+    /// outside of buffer"; a 5-char buffer at width 1 or 2 panics with
+    /// "attempt to subtract with overflow". Also: `render_prompt`
+    /// given an area larger than the buffer it draws into — which
+    /// `regions`' own `Layout` never hands it in practice (every
+    /// region it returns already fits `area`), but the direct call
+    /// below bypasses that and drives the guard itself — must not
+    /// panic either, at heights 1–4 and 20 inside a 5x2 buffer. Mutation for
+    /// that case: drop the `intersection` in `render_prompt`.
     #[test]
     fn a_too_small_terminal_neither_panics_nor_runs_the_cursor_past_the_window() {
         let mut ui = Ui::default();
@@ -710,6 +780,45 @@ mod tests {
                 "width {width}: offset {offset} exceeds window {window:?}"
             );
         }
+
+        let prompt = open_write_prompt();
+        for area_height in [1u16, 2, 3, 4, 20] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 5, 2));
+            prompt::render_prompt(&prompt, Rect::new(0, 0, 20, area_height), &mut buf);
+        }
+    }
+
+    /// Guards the pane's shrink beside an open prompt: `render_pane`
+    /// takes the tail of a long entry from its own, now-smaller
+    /// region, so the row immediately above the box's top border
+    /// (the row carrying the title) is the entry's true last wrapped
+    /// row. Mutation: size the pane's `start` from the frame's full
+    /// height instead of its own area's.
+    #[test]
+    fn the_pane_shows_the_tail_beside_an_open_prompt() {
+        let mut ui = Ui::default();
+        let long: String = (0..100)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ui.push(Entry::Assistant(long.clone()));
+        let expected_last_row = wrap(&long, 20).last().cloned().unwrap();
+        ui.prompts.push(open_write_prompt());
+
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let title_row = (0..12u16)
+            .find(|&y| row(buf, y, 20).contains(prompt::TITLE))
+            .expect("no row carries the prompt's title");
+        assert!(title_row > 0, "the box left no room for the pane above it");
+        assert_eq!(
+            row(buf, title_row - 1, 20).trim_end(),
+            expected_last_row,
+            "the pane's tail was not shown right above the box"
+        );
     }
 
     /// Guards D8's status line, previously pinned only by the idle

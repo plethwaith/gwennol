@@ -3,7 +3,11 @@
 //! polled before the turn future or a redraw so a queued `/exit`
 //! is never left behind. `Session::run` is never called: it stops at
 //! the first turn that does not complete, and a session must carry on
-//! past a failed or cancelled one.
+//! past a failed or cancelled one. Keys go to an open approval prompt
+//! before anything else typed reaches the editor or the token (a
+//! Ctrl-C notice is still retired first; a resize or a read error
+//! never reaches the prompt at all, and a paste is dropped rather
+//! than routed to it), so `Esc` there denies rather than cancels.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -19,12 +23,13 @@ use tokio::sync::watch;
 use crate::show::outcome_line;
 use crate::tui::editor::{Command, Submission};
 use crate::tui::keys::{Input, KeySource};
+use crate::tui::prompt;
 use crate::tui::ui::{Entry, Shared, TurnState, render};
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED, Fatal};
 
 /// What handling one key means for the loop driving it.
 #[derive(Debug, PartialEq, Eq)]
-enum Action {
+pub(crate) enum Action {
     /// Idle only: `Enter` on a turn's text.
     Submit(String),
     /// Idle `/exit`, or the key source closing while idle: `drive`
@@ -37,8 +42,13 @@ enum Action {
 
 /// Apply one key (or paste, or resize) to the editor and the pane,
 /// `running` saying whether a turn is in flight. The only place `Esc`
-/// or a `/exit` reaches [`CancellationToken::cancel`].
-fn handle_key(
+/// or a `/exit` reaches [`CancellationToken::cancel`] — and it does
+/// not while a prompt is open: keys go to the prompt first, so `Esc`
+/// there denies rather than cancels, and nothing typed during a
+/// prompt reaches the editor. `pub(crate)` so `tui::prompt`'s own
+/// tests can drive a key through the same entry point `drive` uses,
+/// rather than a copy of its prompt-routing branch.
+pub(crate) fn handle_key(
     shared: &Shared,
     cancel: &CancellationToken,
     running: bool,
@@ -49,7 +59,14 @@ fn handle_key(
         let key = match input {
             Input::Resize => return,
             Input::Paste(text) => {
-                ui.editor.paste(&text);
+                // A prompt swallows a paste too, dropped rather than
+                // routed to it (never reaching `prompt::key`, unlike
+                // a key, so it can never answer or scroll a prompt):
+                // pasted text must not accumulate behind an open
+                // prompt, silently, for the editor to submit later.
+                if ui.prompts.is_empty() {
+                    ui.editor.paste(&text);
+                }
                 return;
             }
             Input::Errored(message) => {
@@ -64,6 +81,11 @@ fn handle_key(
         // resize or a paste must not clear a Ctrl-C hint the user has
         // not yet read.
         ui.notice = None;
+        if !ui.prompts.is_empty() {
+            let workspace = ui.workspace.clone();
+            prompt::key(ui, &key, &workspace);
+            return;
+        }
         if key.modifiers.is_empty() && key.code == KeyCode::Esc {
             if running {
                 cancel.cancel();
@@ -332,6 +354,172 @@ mod tests {
             shared.lock().notice.is_none(),
             "a key input did not clear the notice"
         );
+    }
+
+    /// Guards D4: while a prompt is open, every key is the prompt's —
+    /// `Esc` denies rather than reaching the token, typing `/exi` never
+    /// reaches the editor, a recognized `/exit` + Enter still never sets
+    /// `exiting`, a bracketed paste never reaches the editor either, and
+    /// Ctrl-C sets no notice — until the prompt itself is answered.
+    /// Neither the `/exi` block nor the `/exit` block discriminates the
+    /// prompt-routing-arm mutation on its own; the `Esc` assertion above
+    /// them does, and each block's own comment says what it is for.
+    /// Mutations: drop the prompt-routing arm in `handle_key` (the key
+    /// case); drop the `ui.prompts.is_empty()` guard around
+    /// `ui.editor.paste` (the paste case).
+    #[test]
+    fn keys_go_to_an_open_prompt_never_to_the_editor_or_the_token() {
+        use std::path::Path;
+        use std::task::{Context, Poll, Waker};
+
+        use gwennol_core::{Decision, Operator};
+
+        use crate::tui::prompt::tests::{op, write_req};
+
+        let (interactive, shared) =
+            op(crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        let cancel = CancellationToken::new();
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "Esc reached the token while a prompt was open"
+        );
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+
+        // A second prompt: typing past it reaches neither the editor
+        // nor `exiting`, and it is still open afterward. "/exi", not
+        // "/exit": a fix that intercepted only recognized commands
+        // would still leave `editor.text()` empty for "/exit", since
+        // `Command::Exit`'s own handling always calls `commit()`; "/exi"
+        // is `Command::Unknown`, whose arm never commits, so it is the
+        // one that would catch a fix narrowed to recognized commands
+        // instead of every key. It is not independently
+        // mutation-sensitive to the prompt-routing arm itself, though:
+        // dropping that arm fails earlier, at this test's `Esc`
+        // assertion above, before this block or the "/exit" block below
+        // ever runs.
+        let mut fut2 = interactive.approve(write_req());
+        assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
+
+        // A bracketed paste is swallowed the same as a key: it must
+        // not reach the editor while a prompt is open, and it must
+        // not answer or scroll the prompt either (the `Paste` arm
+        // returns before the key-routing branch is ever reached).
+        handle_key(&shared, &cancel, true, Input::Paste("rm -rf /".to_string()));
+        assert_eq!(
+            shared.lock().editor.text(),
+            "",
+            "a paste reached the editor while a prompt was open"
+        );
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "a paste answered or closed the prompt"
+        );
+
+        for c in "/exi".chars() {
+            handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        let action = handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(
+            action, None,
+            "typed text reached the editor's own submission while a prompt was open"
+        );
+        assert_eq!(
+            shared.lock().editor.text(),
+            "",
+            "typed text reached the editor while a prompt was open"
+        );
+        assert!(!shared.lock().exiting);
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "the prompt closed on its own"
+        );
+
+        // A whole recognized command, typed the same way: `/exit` +
+        // Enter still never sets `exiting` while the prompt is open.
+        // "/exi" above cannot check this — it parses to
+        // `Command::Unknown`, which has no path to `exiting` at all —
+        // so this is the only assertion that a *recognized* command
+        // cannot take effect behind a prompt, though it is not
+        // independently mutation-sensitive: the sole production guard
+        // is the prompt-routing arm above, and dropping it fails at
+        // this test's earlier `Esc` assertion, before this block ever
+        // runs. The buffer is cleared first: "/exi" left uncommitted
+        // (`Command::Unknown` never commits) would otherwise glue onto
+        // "/exit" as "/exi/exit", which also parses to `Unknown` and
+        // never reaches `exiting` regardless of whether the
+        // prompt-routing arm in `handle_key` is reverted.
+        shared.update(|ui| ui.editor.commit());
+        for c in "/exit".chars() {
+            handle_key(
+                &shared,
+                &cancel,
+                true,
+                Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(
+            !shared.lock().exiting,
+            "a recognized /exit reached exiting while a prompt was open"
+        );
+        assert_eq!(
+            shared.lock().prompts.len(),
+            1,
+            "the prompt closed on its own"
+        );
+
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert!(
+            shared.lock().notice.is_none(),
+            "Ctrl-C set a notice while a prompt was open"
+        );
+
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        );
+        assert!(matches!(
+            fut2.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
     }
 
     /// Guards the forced-exit path directly and deterministically. The
