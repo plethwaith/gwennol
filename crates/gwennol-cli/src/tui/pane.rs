@@ -634,11 +634,12 @@ mod tests {
     /// row into the window the next frame would draw, moving the scroll
     /// only when it is not there already — the first fixture below
     /// toggles an entry whose head row the last frame did show, and the
-    /// scroll moves all the same (`reveal` still re-normalises a kept
-    /// `scroll`; `collapsing_an_expanded_entry_normalises_the_kept_scroll`
-    /// pins that). Mutations: drop `reveal` in the
-    /// toggle path; drop it in the `Tab` path; drop it in the `BackTab`
-    /// arm.
+    /// scroll moves all the same, because the expansion's own recount
+    /// puts the tail window past that row: `reveal`'s `else` arm, not
+    /// its kept-scroll arm, which
+    /// `collapsing_an_expanded_entry_normalises_the_kept_scroll` pins
+    /// instead. Mutations: drop `reveal` in the toggle path; drop it in
+    /// the `Tab` path; drop it in the `BackTab` arm.
     #[test]
     fn a_toggle_or_a_focus_move_keeps_the_head_row_on_screen() {
         let shared = shared_with(vec![

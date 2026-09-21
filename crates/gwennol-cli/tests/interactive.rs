@@ -1824,7 +1824,9 @@ async fn scenario() {
             // true of the approval box's pretty-printed JSON, which
             // wraps through the same function; `pretty_lines` in this
             // file already compares against trimmed lines for that
-            // reason. What the pane preserves is one row per line.
+            // reason. What the pane preserves is a row boundary per
+            // line — one row each here, since no line is wider than
+            // the pane.
             // Checked from the entry's own head row, positionally: the
             // model's follow-up turn echoes this same content back as
             // its answer (`"It says: {content}"`, `tests/common/mod.rs`),

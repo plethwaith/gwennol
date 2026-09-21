@@ -165,7 +165,7 @@ pub struct Ui {
     /// Rules made at prompts, in the order made: tried after every
     /// compiled rule by `Interactive::approve` under this same lock.
     pub session_rules: Vec<SessionRule>,
-    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs:56`)
+    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs`)
     /// before the frontend runs a turn: what a prompt's key handler
     /// renders the answered request's trace line against (what
     /// `answer_prompt` passes to `show::decided`). A session rule's
@@ -268,7 +268,7 @@ impl Ui {
     /// Map one loop event onto the pane and the turn state (D6): a
     /// tool result starts expanded when `verbosity` is 1 or more —
     /// print mode's `-v` — and a tool call never starts expanded,
-    /// since print mode never shows arguments whole either.
+    /// since print mode never writes a call's arguments as rows either.
     pub fn apply(&mut self, event: Event, verbosity: u8) {
         self.revision = self.revision.wrapping_add(1);
         match event {
@@ -959,8 +959,8 @@ mod tests {
     }
 
     /// Guards two panics on a terminal under three rows: `regions`
-    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:399-402;
-    /// `h` is zero with no prompt open), so below three rows the
+    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (`regions` in this
+    /// file; `h` is zero with no prompt open), so below three rows the
     /// status or editor area's `y` falls outside the buffer and
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
     /// `cursor - start` underflowed once `width < 3`; and, with a
