@@ -245,14 +245,7 @@ fn compute_lines(prompt: &Prompt) -> Vec<String> {
                 call.name,
                 call.id.as_deref().unwrap_or("")
             ));
-            match serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                Ok(value) => {
-                    let pretty = serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|_| call.arguments.clone());
-                    out.extend(pretty.lines().map(str::to_string));
-                }
-                Err(_) => out.push(call.arguments.clone()),
-            }
+            out.extend(show::arguments_lines(&call.arguments));
         }
         None => out.push("started by the frontend, not by a tool call".to_string()),
     }

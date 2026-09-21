@@ -4,7 +4,8 @@
 the model's text streams into a transcript pane, a line editor takes
 the next turn, and an approval no rule decides is asked at a prompt,
 `y`/`n` once, `a`/`d` for the rest of the session when the request can
-be remembered (not every request can: see `show::subject`); a rule
+be remembered (a spawn carrying stdin, or an `http` URL that fails to
+parse, cannot be); a rule
 always decides first, and every
 decision traces into the pane, in the same
 words this file's examples show on stderr. `-p`/`--print` — what the
@@ -64,6 +65,55 @@ binary, in that order. `--trust-runtime` (or the config's
 own script runtime, and Gwead's rule is that the embedder must say so
 as well as the manifest ([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
 
+## Session
+
+Without `-p` the screen is three parts: a transcript pane (the
+model's text, trace lines in the words this file's stderr examples
+use, and an outcome line per turn), a status line (the turn's state
+and elapsed seconds while one runs; a notice such as a Ctrl-C hint or
+an unknown command; the `scrolled up · End follows the tail` marker
+when the pane is not following the tail), and a line editor.
+
+| Keys | Do |
+|---|---|
+| `Enter` | Send the line as the next turn |
+| `Esc` | Cancel the running turn |
+| `Up` / `Down` | Walk the input history |
+| `Alt+Left`, `Ctrl+Left`, `Alt+b` | Word left |
+| `Alt+Right`, `Ctrl+Right`, `Alt+f` | Word right |
+| `Alt+Backspace`, `Ctrl+Backspace`, `Ctrl+w` | Delete the word behind the cursor |
+| `Alt+d`, `Alt+Delete` | Delete the word ahead of the cursor |
+| `Home`/`End`, `Ctrl+a`/`Ctrl+e` | Start/end of the line |
+| `PageUp` / `PageDown` | Page the pane |
+| `Home` / `End` (editor empty) | Reach the pane's top / its tail |
+| `Tab` / `Shift+Tab` | Focus a tool call or result, newest first |
+| `Enter` (editor empty, an entry focused) | Expand or collapse it |
+
+An open approval prompt takes every key itself instead: `y`/`n` allow
+or deny once, `a`/`d` for the rest of the session (see "Rules" for
+what that can and cannot cover), `Esc` denies once, and `Up`/`Down`/
+`PageUp`/`PageDown` scroll its own box. Ctrl-C is bound to nothing but
+a hint (`Esc` cancels the turn, `/exit` ends the session): raw mode
+makes it an ordinary key whose meaning differs by platform, so it is
+never wired to cancel.
+
+Slash commands: `/exit` cancels a running turn first and ends the
+session once it has unwound; a second `/exit` sent while the first is
+still unwinding leaves at once, status 130. `/help` lists the keys and
+commands. Anything else starting with `/` is an unknown command,
+reported on the status line rather than sent to the model. A pasted
+line never submits by itself: its newlines become spaces, so a
+multi-line paste lands as one line the editor still waits on `Enter`
+for.
+
+`--log FILE` collects the host's log there instead of discarding it (a
+session without `--log` collects none, so nothing competes with the
+pane); `-v`/`-vv` raise its level the same way they do in a print run,
+and `RUST_LOG` overrides the level either sets. `-v` also starts every
+tool result's pane entry expanded, matching a print run's `-v`.
+`--transcript` is print mode only; a session refuses it at startup
+rather than silently writing nothing.
+
 ## Rules
 
 A rule is `<kind>:<pattern>`:
@@ -120,7 +170,9 @@ Rules are tried in order — `--allow`/`--deny` flags in command-line
 order, then the `--policy` file's `[[rules]]`, then the config file's —
 and the first match decides. A request no rule matches is **denied**
 in a print run, and the trace says `denied: no rule matched`; a
-session asks at a prompt instead. So a narrow deny goes
+session asks at a prompt instead. In a session an `a`/`d` answer adds
+an exact-text rule tried after all of these, so it can never pre-empt
+a flag's or a file's rule. So a narrow deny goes
 before the broad allow it carves out of:
 
 ```sh
@@ -211,30 +263,37 @@ never invented, so the vendor's refusal is what ends that turn.
 
 | Status | Meaning                                                       |
 |--------|---------------------------------------------------------------|
-| 0      | the turn completed (`done (…)` on stderr names the stop reason) |
-| 1      | the turn failed: the provider refused, a contract was broken   |
+| 0      | the turn completed (`done (…)` names the stop reason), or the user ended the session |
+| 1      | the turn failed: the provider refused, a contract was broken; or the session ended right after a failed turn |
 | 2      | usage, configuration or startup error                         |
-| 130    | cancelled by Ctrl-C                                           |
+| 130    | print run: cancelled by Ctrl-C; session: a second `/exit` while the first is still unwinding |
 
-Ctrl-C cancels the turn through the loop's token: a pending approval
-is withdrawn, a running tool step is cancelled, a stream being read is
-closed, and the process exits 130 once the exchange is stored. When the
-cut hid a failure of the stream itself — the vendor's body went quiet
-past its idle timeout in the same instant — the line says so:
+In a print run, Ctrl-C cancels the turn through the loop's token: a
+pending approval is withdrawn, a running tool step is cancelled, a
+stream being read is closed, and the process exits 130 once the
+exchange is stored. When the cut hid a failure of the stream itself —
+the vendor's body went quiet past its idle timeout in the same
+instant — the line says so:
 `gwennol: cancelled; the stream's source failed with:
-provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at once.
+provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at
+once. In a session Ctrl-C only shows a hint: `Esc` cancels the turn,
+and `/exit` ends the session.
 
-`--transcript FILE` writes the conversation as the provider saw it —
-the whole chat input: the system prompt, the tools as harvested from
-the manifests, every message with thinking carried as `opaque` blocks,
-and the generation settings — at the end, after a failure too. It is
-what the provider was handed on the last round plus that round's
-answer, so the file can be read or replayed as a request. The outcome line comes first; a transcript that
-cannot be written is reported after it and makes a completed turn
-exit 2, while a failed or cancelled turn keeps its own status.
+Print mode only: `--transcript FILE` writes the conversation as the
+provider saw it — the whole chat input: the system prompt, the tools
+as harvested from the manifests, every message with thinking carried
+as `opaque` blocks, and the generation settings — at the end, after a
+failure too. It is what the provider was handed on the last round plus
+that round's answer, so the file can be read or replayed as a request.
+The outcome line comes first; a transcript that cannot be written is
+reported after it and makes a completed turn exit 2, while a failed or
+cancelled turn keeps its own status. A session refuses `--transcript`
+outright at startup rather than silently writing nothing.
 
 ## What it does not do
 
+Take more than one line of input, use the mouse, restyle the pane, or
+take a secret at the keyboard: filed, not planned for the MVP.
 Persist or resume a conversation, manage the context window, or
 install plugins from outside the bundle: the roadmap's "Beyond the
 MVP". Author a rule at the prompt or keep a session's answers past it:

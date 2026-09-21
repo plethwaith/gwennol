@@ -371,6 +371,42 @@ prompt exists to paper over it.
   approvals; streamed output.
 - **Done when:** an interactive session runs a task with prompts that name
   the tool call behind each request, and cancelling mid-stream works.
+- **Settled: interactive by default; `-p` is the print run.**
+  `gwennol [options] [prompt]` opens a session, a prompt argument its
+  first turn; `-p`/`--print` is milestone 6's one-turn run, unchanged,
+  and so is any run without a terminal on stdin or stdout, which says
+  so on stderr — prompting needs a person, and denying by rule is the
+  safe direction.
+- **Settled: rules first, then the prompt.** Flags, the policy file,
+  the config file, in order, first match decides, as in a print run;
+  what nothing matches is asked at a prompt in a session and denied in
+  a print run. An answer given for the session is an exact-text rule —
+  the request's kind, the plugin that asked, the text that was shown —
+  tried after every compiled rule, held in memory, never written to
+  disk.
+- **Settled: the prompt is cancel-safe by construction.** `approve`
+  installs the prompt and awaits a one-shot answer; a guard removes
+  the prompt by id when the future is dropped, which is what
+  cancelling the turn does, and an answer whose receiver is gone is
+  ignored.
+- **Settled: the frontend drives `turn`, one token per turn.**
+  `Session::run` stops at the first turn that does not complete; a
+  session must continue past a failed or cancelled one, so the loop
+  awaits the editor, runs each turn on a fresh token, and shows its
+  outcome line.
+- **Settled: slash commands, not control keys.** `/exit` and `/help`;
+  nothing starting with `/` reaches the model; `Esc` cancels the
+  running turn; Ctrl-C is bound to nothing but a hint, since raw mode
+  makes it an ordinary key whose meaning differs by platform.
+- **Settled: the trace in the pane, the log in a file.** Every
+  decision and tool line a print run writes to stderr is a pane entry
+  in the same words; the host's `tracing` log goes to `--log FILE` or
+  is not collected.
+- **Settled: reading the session.** A tool call and a tool result are
+  entries that expand in place to the whole arguments or content —
+  `-v` starts results expanded, as it shows them whole in a print
+  run — and the pane follows the tail until scrolled, with a marker
+  saying when it is not.
 
 Milestones 1–7 are the MVP: a harness that can be pointed at a repository and
 asked to change something, with every reach outside the sandbox declared and

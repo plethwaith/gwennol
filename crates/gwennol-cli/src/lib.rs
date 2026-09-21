@@ -150,9 +150,10 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub log: Option<PathBuf>,
 
-    /// More detail: -v shows tool results whole and raises the host
-    /// log to info, -vv to debug. Print mode puts both on stderr; a
-    /// session puts results in the pane and the log only in --log.
+    /// More detail: -v shows tool results whole and raises the host log
+    /// to info, -vv to debug. Print mode puts both on stderr; a session
+    /// starts each result expanded in the pane and puts the log only in
+    /// --log.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 }

@@ -129,8 +129,8 @@ fn unauthorized(socket: &mut TcpStream) {
 /// block is a tool result rather than text, answers exactly as the
 /// default route's follow-up does), so one session can drive every
 /// scenario `tests/interactive.rs` needs by typing a different first
-/// word each turn; `write`, `read`, `grep` and `sh` ask for those
-/// tools by name, with the rest of the text as the tool's own
+/// word each turn; `write`, `read`, `grep`, `sh` and `bash` ask for
+/// those tools by name, with the rest of the text as the tool's own
 /// argument, and `elsewhere` takes no argument, so the approval suite
 /// can raise a request of each kind.
 fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
@@ -186,6 +186,10 @@ fn handle_scripted(stub: &Stub, socket: &mut TcpStream, body: &Value) {
         }
         "refuse" => stream(socket, REFUSAL_SSE),
         "fail" => unauthorized(socket),
+        "bash" => stream(
+            socket,
+            &calling_sse("bash", &json!({"command": rest}).to_string()),
+        ),
         "sleep" => stream(socket, &calling_sse("bash", r#"{"command": "sleep 30"}"#)),
         "write" => stream(
             socket,

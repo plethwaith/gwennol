@@ -11,12 +11,15 @@
 //! driving [`gwennol_core::agent::Session::turn`] one turn at a time so
 //! a failed or cancelled turn leaves the session running rather than
 //! ending it, as [`gwennol_core::agent::Session::run`] would; `prompt`
-//! is the approval prompt a request no rule decides opens in the pane.
+//! is the approval prompt a request no rule decides opens in the
+//! pane; `pane` is the pane's own keys: paging, and focusing a tool
+//! call or result to expand it.
 
 pub mod drive;
 pub mod editor;
 pub mod keys;
 pub mod operator;
+pub mod pane;
 pub mod prompt;
 pub mod screen;
 pub mod ui;

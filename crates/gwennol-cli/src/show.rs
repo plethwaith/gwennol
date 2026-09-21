@@ -4,9 +4,10 @@
 //! with the URL's userinfo, query and fragment scrubbed because
 //! the screen or the trace is a record and a rule judged the full
 //! URL, and the exact subject a session rule is made of; a tool
-//! call as name and id; a bounded one-line preview; the outcome
-//! line and the exit status it decides; and the trace's lines: a
-//! decision, a call, its result, its failure, a retry.
+//! call as name and id, and its arguments as rows; a bounded
+//! one-line preview; the outcome line and the exit status it
+//! decides; and the trace's lines: a decision, a call, its result,
+//! its failure, a retry.
 
 use std::fmt;
 use std::path::Path;
@@ -148,6 +149,32 @@ pub fn preview(text: &str) -> String {
     out
 }
 
+/// A tool call's arguments as rows: the pretty-printed JSON's lines
+/// when the text parses, else the text's own lines. What the approval
+/// box and an expanded pane entry both show, so the two cannot drift.
+pub fn arguments_lines(arguments: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) => {
+            let pretty =
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| arguments.to_string());
+            pretty.lines().map(str::to_string).collect()
+        }
+        Err(_) => arguments.lines().map(str::to_string).collect(),
+    }
+}
+
+/// A tool call with its arguments whole: `-> name id:` and each of
+/// [`arguments_lines`] on its own row, indented as [`tool_result`]
+/// indents a result shown whole. A session's expanded entry; print
+/// mode never writes this form.
+pub fn tool_call_whole(call: &ToolCall) -> String {
+    let mut out = format!("-> {}:", ShowCall(call));
+    for line in arguments_lines(&call.arguments) {
+        out.push_str(&format!("\n    {line}"));
+    }
+    out
+}
+
 /// [`decided`] with a [`Judgement`] as the verdict: the shape
 /// `Headless::approve` used to print itself, and what a rule (or
 /// session rule) decision traces as.
@@ -177,7 +204,8 @@ pub fn tool_call(call: &ToolCall) -> String {
     format!("-> {}: {}", ShowCall(call), preview(&call.arguments))
 }
 
-/// A tool's result: whole at `-v` and above, a one-line preview
+/// A tool's result: whole when `verbosity` is 1 or more — print
+/// mode's `-v`, or a session's expanded entry — a one-line preview
 /// otherwise.
 pub fn tool_result(call: &ToolCall, content: &str, is_error: bool, verbosity: u8) -> String {
     let verdict = if is_error { "error" } else { "ok" };
