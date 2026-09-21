@@ -532,10 +532,10 @@ mod tests {
         // not still zeroed: `PageUp` reaching the pane from this state
         // would otherwise compute `None` regardless of the gate. The
         // `ToolResult` pushed just below gives `Tab` an expandable
-        // entry to find instead of the `None` `older` returns from a
-        // transcript with nothing expandable in it, so it too would
-        // move `focus` if the gate did not hold, and the mutation
-        // below would go uncaught.
+        // entry to find instead of the `None` `older` hands back from
+        // an unset `focus` when nothing in the transcript is
+        // expandable, so it too would move `focus` if the gate did
+        // not hold, and the mutation below would go uncaught.
         shared.update(|ui| {
             let long: String = (0..100)
                 .map(|n| format!("line{n}"))

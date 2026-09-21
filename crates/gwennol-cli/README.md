@@ -71,8 +71,9 @@ as well as the manifest ([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
 Without `-p` the screen is four parts: a transcript pane (the model's
 text, the user's own submitted lines, trace lines — in the words
 this file's stderr examples use when collapsed; expanded, a result
-shows its whole content exactly as a print run's `-v` writes it, and
-a call shows its whole arguments, a form no print run writes — and
+carries the whole content a print run's `-v` writes, and a call the
+whole arguments no print run writes, both rewrapped to the pane's
+width, which drops the four-space indent both forms carry — and
 an outcome line per turn), the approval box (open only
 while a request awaits an answer; see below), a status line (the
 turn's state and elapsed seconds while one runs; a notice such as a
