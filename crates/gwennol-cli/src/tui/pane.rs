@@ -101,9 +101,15 @@ fn newer(entries: &[Entry], from: Option<usize>) -> Option<usize> {
     (from + 1..entries.len()).find(|&i| expandable(&entries[i]))
 }
 
-/// D6. Puts entry `index`'s head row on the pane's first row when the
-/// last frame did not show it; nothing moves when it was already on
-/// screen.
+/// D6. Compares entry `index`'s head row against the window the
+/// next frame would draw: the rows recounted through `Entry::text`
+/// and `ui::wrap` at the entries' current expansion, at the last
+/// frame's width and height. Outside that window, `scroll` becomes
+/// the head row normalised as D5, so a head row at or past
+/// `max_top` follows the tail instead of sitting on the first row.
+/// Inside it, `scroll` is kept but re-normalised against this
+/// call's row count, so a collapse cannot strand it at or past the
+/// new `max_top`.
 fn reveal(ui: &mut Ui, index: usize) {
     let PaneView { width, height, .. } = ui.pane_view.get();
     let width = (width as usize).max(1);
@@ -124,11 +130,12 @@ fn reveal(ui: &mut Ui, index: usize) {
         // normalise it against this call's own row count. Without
         // this, a `Some(top)` `reveal` leaves alone here can still be
         // at or past a `max_top` a row-count change (a collapse, most
-        // often) just shrank past it, breaking D5's invariant ("no
-        // `Some(top)` survives a row-count change that put it at or
-        // past `max_top`") until the transcript grows again and pins
-        // the pane away from the tail with no scroll having happened.
-        ui.scroll = ui.scroll.and_then(|t| normalise(t.min(max_top), max_top));
+        // often) just shrank past it, leaving a `Some(top)` that D5's
+        // rule for every move ("a `top` at or past `max_top` becomes
+        // `None`") would have cleared had the collapse been a move,
+        // until the transcript grows again and pins the pane away
+        // from the tail with no scroll having happened.
+        ui.scroll = ui.scroll.and(normalise(top, max_top));
     } else {
         ui.scroll = normalise(head, max_top);
     }
@@ -311,8 +318,9 @@ mod tests {
     /// following the tail the moment a later push grows the
     /// transcript back past the stale `top`, with no scroll having
     /// happened in between. Mutation: drop the
-    /// `ui.scroll.and_then(|t| normalise(..))` on `reveal`'s
-    /// kept-scroll branch (keep the early return instead).
+    /// `ui.scroll.and(normalise(top, max_top))` on `reveal`'s
+    /// kept-scroll branch (leave the branch a no-op, as it was
+    /// before this commit).
     #[test]
     fn collapsing_an_expanded_entry_normalises_the_kept_scroll() {
         let shared = shared_with(vec![Entry::Assistant("aaa".to_string()), result("r", 30)]);
@@ -369,8 +377,10 @@ mod tests {
         let max_top = total_rows.saturating_sub(height);
         assert!(max_top > 0, "fixture too small to exercise the clamp");
         // Set directly: `pane::key` never leaves `scroll` here (every
-        // write there normalises against a freshly computed
-        // `max_top`), but a resize can, since it touches nothing.
+        // write there normalises against a `max_top`: the last
+        // frame's `pane_view` in the paging and `Home` arms, a
+        // freshly counted one in `reveal`), but a resize can, since
+        // it touches nothing.
         shared.update(|ui| ui.scroll = Some(total_rows - 1));
         draw(&shared, 40, 8);
         assert_eq!(
@@ -616,10 +626,13 @@ mod tests {
         }
     }
 
-    /// Guards D6: focusing an entry, or toggling one, keeps its head
-    /// row on screen, at the pane's first row when it was not already
-    /// visible. Mutations: drop `reveal` in the toggle path; drop it
-    /// in the `Tab` path.
+    /// Guards D6: focusing an entry, or toggling one, brings its head
+    /// row into the window the next frame would draw, moving the scroll
+    /// only when it is not there already — the first fixture below
+    /// toggles an entry whose head row the last frame did show, and the
+    /// scroll moves all the same. Mutations: drop `reveal` in the
+    /// toggle path; drop it in the `Tab` path; drop it in the `BackTab`
+    /// arm.
     #[test]
     fn a_toggle_or_a_focus_move_keeps_the_head_row_on_screen() {
         let shared = shared_with(vec![

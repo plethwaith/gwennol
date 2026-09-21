@@ -68,12 +68,15 @@ as well as the manifest ([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
 
 ## Session
 
-Without `-p` the screen is three parts: a transcript pane (the
-model's text, trace lines in the words this file's stderr examples
-use, and an outcome line per turn), a status line (the turn's state
-and elapsed seconds while one runs; a notice such as a Ctrl-C hint or
-an unknown command; the `scrolled up · End follows the tail` marker
-when the pane is not following the tail), and a line editor.
+Without `-p` the screen is four parts: a transcript pane (the model's
+text, the user's own submitted lines, trace lines — in the words this
+file's stderr examples use when collapsed, or `-v`'s whole form when
+expanded — and an outcome line per turn), the approval box (open only
+while a request awaits an answer; see below), a status line (the
+turn's state and elapsed seconds while one runs; a notice such as a
+Ctrl-C hint or an unknown command; the `scrolled up · End follows the
+tail` marker when the pane is not following the tail), and a line
+editor.
 
 | Keys | Do |
 |---|---|
@@ -100,8 +103,9 @@ never wired to cancel.
 
 Slash commands: `/exit` cancels a running turn first and ends the
 session once it has unwound; a second `/exit` sent while the first is
-still unwinding leaves at once, status 130. `/help` lists the commands
-and the pane's own keys shown above (not the editor's own bindings).
+still unwinding leaves at once, status 130. `/help` lists the commands,
+`Esc`, the approval prompt's `y`/`n`/`a`/`d`, and the pane's own keys
+shown above — not the editor's own line-editing bindings.
 Anything else starting with `/` is an unknown command,
 reported on the status line rather than sent to the model. A pasted
 line never submits by itself: its newlines become spaces, so a

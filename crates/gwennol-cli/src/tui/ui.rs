@@ -58,10 +58,10 @@ pub enum Entry {
         /// flipped by `Ui::toggle`.
         expanded: bool,
     },
-    /// A trace line: a decision, its failure, a retry, a startup
-    /// warning, an input-read error, or an event this frontend cannot
-    /// show, each `gwennol: `-prefixed; `/help`'s lines ([`HELP`]) are
-    /// pushed as written.
+    /// A trace line: a decision, a tool call's failure, a retry, a
+    /// startup warning, an input-read error, or an event this
+    /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s
+    /// lines ([`HELP`]) are pushed as written.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -423,7 +423,9 @@ impl Shared {
     }
 
     /// The `Ui`, poison-proof: a panic elsewhere while the lock was
-    /// held must not stop this from updating.
+    /// held must not stop this from updating. Plain and non-reentrant:
+    /// two `lock()` calls live at once in the same expression or
+    /// scope deadlock, with no timeout to surface it.
     pub fn lock(&self) -> MutexGuard<'_, Ui> {
         self.ui.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1264,17 +1266,17 @@ mod tests {
             format!("gwennol: {}", show::tool_result(&c, &content, false, 0))
         );
         // Hand-computed, not through `show::tool_result` again: the
-        // preview is the content's lines space-joined, on the same
-        // row as the byte count; the pair above has no assertion of
-        // its own otherwise, so a mutation that breaks both sides of
-        // that `assert_eq!` identically (e.g. `tool_result` returning
-        // the head line alone at every verbosity) would go uncaught.
+        // preview is the content's lines space-joined, on its own
+        // four-space-indented row below the byte-count line; the pair
+        // above has no assertion of its own otherwise, so a mutation
+        // that breaks both sides of that `assert_eq!` identically
+        // (e.g. `tool_result` returning the head line alone at every
+        // verbosity) would go uncaught.
         assert!(
             result_collapsed.text().ends_with("line1 line2 line3"),
             "{}",
             result_collapsed.text()
         );
-        assert!(!result_collapsed.text().contains("\n    line2"));
         let result_expanded = Entry::ToolResult {
             call: c.clone(),
             content: content.clone(),

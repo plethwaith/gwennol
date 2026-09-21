@@ -320,7 +320,9 @@ async fn typed(tx: &UnboundedSender<Input>, shared: &std::sync::Arc<Shared>, c: 
 
 /// Render `shared`'s current `Ui` into a fresh 80x24 backend and
 /// return the raw buffer, for a check that needs more than the plain
-/// text (a cell's style).
+/// text (a cell's style). Not a pure observer: rendering writes
+/// `ui.pane_view` through its `Cell`, the same side effect a real
+/// frame has.
 fn frame_buffer(shared: &std::sync::Arc<Shared>) -> Buffer {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
