@@ -185,14 +185,15 @@ pub struct Ui {
     /// applies to this field's target, same as `open`'s.
     pub focus: Option<usize>,
     /// What the last `render_pane` drew. [`crate::tui::pane::key`]
-    /// pages and reveals against it; `render_status` reads
-    /// `following`.
+    /// pages against it; `reveal` takes only its width and height;
+    /// `render_status` reads `following`.
     pub pane_view: Cell<PaneView>,
 }
 
 /// What the last `render_pane` drew: its area's width and height, the
-/// wrapped row count, and the first row shown. `pane::key` pages and
-/// reveals against it; `render_status` reads `following`.
+/// wrapped row count, and the first row shown. `pane::key` pages
+/// against it; `reveal` takes only its width and height;
+/// `render_status` reads `following`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaneView {
     /// The area's width, in columns.

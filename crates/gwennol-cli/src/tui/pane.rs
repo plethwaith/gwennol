@@ -1,8 +1,10 @@
 //! The pane's own keys — paging it off the tail and back, and
-//! focusing a tool call or result to expand it in place — computed
-//! against what the last frame drew ([`Ui::pane_view`]) and clamped
-//! again at the next render, the shape `prompt::key` and
-//! `render_prompt` share.
+//! focusing a tool call or result to expand it in place. Paging and
+//! `Home` compute against what the last frame drew
+//! ([`Ui::pane_view`]); focusing and toggling recount fresh from the
+//! entries at their current expansion (`reveal`), taking only the
+//! last frame's width and height. Every write clamps again at the
+//! next render, the shape `prompt::key` and `render_prompt` share.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -134,7 +136,10 @@ fn reveal(ui: &mut Ui, index: usize) {
         // rule for every move ("a `top` at or past `max_top` becomes
         // `None`") would have cleared had the collapse been a move,
         // until the transcript grows again and pins the pane away
-        // from the tail with no scroll having happened.
+        // from the tail with no scroll having happened. `.and(` states
+        // that intent (kept only when it was `Some`) rather than
+        // changing the result: `top` already carries `.min(max_top)`,
+        // so `ui.scroll = normalise(top, max_top)` gives the same value.
         ui.scroll = ui.scroll.and(normalise(top, max_top));
     } else {
         ui.scroll = normalise(head, max_top);
@@ -319,8 +324,7 @@ mod tests {
     /// transcript back past the stale `top`, with no scroll having
     /// happened in between. Mutation: drop the
     /// `ui.scroll.and(normalise(top, max_top))` on `reveal`'s
-    /// kept-scroll branch (leave the branch a no-op, as it was
-    /// before this commit).
+    /// kept-scroll branch, leaving it empty.
     #[test]
     fn collapsing_an_expanded_entry_normalises_the_kept_scroll() {
         let shared = shared_with(vec![Entry::Assistant("aaa".to_string()), result("r", 30)]);
@@ -630,7 +634,9 @@ mod tests {
     /// row into the window the next frame would draw, moving the scroll
     /// only when it is not there already — the first fixture below
     /// toggles an entry whose head row the last frame did show, and the
-    /// scroll moves all the same. Mutations: drop `reveal` in the
+    /// scroll moves all the same (`reveal` still re-normalises a kept
+    /// `scroll`; `collapsing_an_expanded_entry_normalises_the_kept_scroll`
+    /// pins that). Mutations: drop `reveal` in the
     /// toggle path; drop it in the `Tab` path; drop it in the `BackTab`
     /// arm.
     #[test]

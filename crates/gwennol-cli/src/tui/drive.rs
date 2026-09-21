@@ -65,8 +65,9 @@ pub(crate) fn handle_key(
             // shrinks `max_top` past a `Some(top)` a previous `reveal`
             // left in place never reaches `pane::reveal` to fix it up;
             // `render_pane`'s own clamp (ui.rs) is what keeps the
-            // pane in range until the next *pane* key rewrites
-            // `ui.scroll`.
+            // pane in range until something rewrites `ui.scroll`: a
+            // pane key, or the `follow_tail` a submitted turn or
+            // `/help` does.
             Input::Resize => return,
             Input::Paste(text) => {
                 // A prompt swallows a paste too, dropped rather than
@@ -531,10 +532,10 @@ mod tests {
         // not still zeroed: `PageUp` reaching the pane from this state
         // would otherwise compute `None` regardless of the gate. The
         // `ToolResult` pushed just below gives `Tab` an expandable
-        // entry to find instead of the `None` an all-`Trace`
-        // transcript would hand `older`, so it too would move `focus`
-        // if the gate did not hold, and the mutation below would go
-        // uncaught.
+        // entry to find instead of the `None` `older` returns from a
+        // transcript with nothing expandable in it, so it too would
+        // move `focus` if the gate did not hold, and the mutation
+        // below would go uncaught.
         shared.update(|ui| {
             let long: String = (0..100)
                 .map(|n| format!("line{n}"))
