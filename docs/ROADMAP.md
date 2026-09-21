@@ -400,8 +400,9 @@ prompt exists to paper over it.
   makes it an ordinary key whose meaning differs by platform.
 - **Settled: the trace in the pane, the log in a file.** Every
   decision and tool line a print run writes to stderr is a pane entry
-  in the same words; the host's `tracing` log goes to `--log FILE` or
-  is not collected.
+  in the same words; in a session the host's `tracing` log goes to
+  `--log FILE` or is not collected at all (a print run without
+  `--log` still puts it on stderr).
 - **Settled: reading the session.** A tool call and a tool result are
   entries that expand in place to the whole arguments or content —
   `-v` starts results expanded, as it shows them whole in a print

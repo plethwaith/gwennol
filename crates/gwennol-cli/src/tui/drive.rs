@@ -61,6 +61,11 @@ pub(crate) fn handle_key(
     let mut action = None;
     shared.update(|ui| {
         let key = match input {
+            // Touches neither `scroll` nor `focus`: a resize that
+            // shrinks `max_top` past a `Some(top)` a previous `reveal`
+            // left in place never reaches `pane::reveal` to fix it up;
+            // `render_pane`'s own clamp (ui.rs) is what keeps the
+            // pane in range until the next key does.
             Input::Resize => return,
             Input::Paste(text) => {
                 // A prompt swallows a paste too, dropped rather than

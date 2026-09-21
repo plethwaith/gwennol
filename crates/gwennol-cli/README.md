@@ -4,8 +4,9 @@
 the model's text streams into a transcript pane, a line editor takes
 the next turn, and an approval no rule decides is asked at a prompt,
 `y`/`n` once, `a`/`d` for the rest of the session when the request can
-be remembered (a spawn carrying stdin, or an `http` URL that fails to
-parse, cannot be); a rule
+be remembered (a spawn carrying stdin, an `http` URL that fails to
+parse, or a request of a kind this frontend does not know, cannot
+be); a rule
 always decides first, and every
 decision traces into the pane, in the same
 words this file's examples show on stderr. `-p`/`--print` — what the
@@ -76,7 +77,7 @@ when the pane is not following the tail), and a line editor.
 
 | Keys | Do |
 |---|---|
-| `Enter` | Send the line as the next turn |
+| `Enter` | Send the line as the next turn (while one is already running, it stays in the editor and the status line says so) |
 | `Esc` | Cancel the running turn |
 | `Up` / `Down` | Walk the input history |
 | `Alt+Left`, `Ctrl+Left`, `Alt+b` | Word left |
@@ -99,8 +100,9 @@ never wired to cancel.
 
 Slash commands: `/exit` cancels a running turn first and ends the
 session once it has unwound; a second `/exit` sent while the first is
-still unwinding leaves at once, status 130. `/help` lists the keys and
-commands. Anything else starting with `/` is an unknown command,
+still unwinding leaves at once, status 130. `/help` lists the commands
+and the pane's own keys shown above (not the editor's own bindings).
+Anything else starting with `/` is an unknown command,
 reported on the status line rather than sent to the model. A pasted
 line never submits by itself: its newlines become spaces, so a
 multi-line paste lands as one line the editor still waits on `Enter`
@@ -293,7 +295,7 @@ outright at startup rather than silently writing nothing.
 ## What it does not do
 
 Take more than one line of input, use the mouse, restyle the pane, or
-take a secret at the keyboard: filed, not planned for the MVP.
+take a secret at the keyboard: out of scope for the MVP.
 Persist or resume a conversation, manage the context window, or
 install plugins from outside the bundle: the roadmap's "Beyond the
 MVP". Author a rule at the prompt or keep a session's answers past it:

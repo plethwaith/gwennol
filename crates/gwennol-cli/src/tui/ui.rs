@@ -713,6 +713,26 @@ mod tests {
         )
     }
 
+    /// Guards the two `/help` lines this change adds. `interactive.rs`'s
+    /// run F pushes `HELP` into the pane and compares the result back
+    /// against `HELP` itself, which stays true regardless of `HELP`'s
+    /// length or content — deleting either line here leaves that
+    /// comparison green, since it slices exactly `HELP.len()` entries
+    /// either way. A literal count and literal text is the only pin.
+    /// Mutations: delete either of the two lines this change adds.
+    #[test]
+    fn help_gained_the_pane_and_focus_lines() {
+        assert_eq!(HELP.len(), 6, "{HELP:?}");
+        assert_eq!(
+            HELP[4],
+            "PageUp PageDown scroll the pane; Home End too while the editor is empty; End follows the tail again"
+        );
+        assert_eq!(
+            HELP[5],
+            "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it"
+        );
+    }
+
     fn call(id: &str, name: &str) -> ToolCall {
         ToolCall {
             id: Some(id.to_string()),
@@ -1198,6 +1218,24 @@ mod tests {
         );
         assert!(expanded.text().contains("\"k39\""), "{}", expanded.text());
         assert!(!expanded.text().contains('…'), "{}", expanded.text());
+        // Computed by hand from `serde_json`'s own pretty-print
+        // (2-space indent, keys sorted), not by calling
+        // `tool_call_whole` again: a mutation that leaves both sides
+        // of the `assert_eq!` above equally wrong (`arguments_lines`
+        // returning `vec![pretty]` as one un-indented blob, so only
+        // the JSON's very first line gains the extra four-space
+        // indent) still fails here, since `"k00"`'s own line and the
+        // closing brace would not.
+        assert!(
+            expanded.text().contains("\n    {\n      \"k00\": 0,"),
+            "{}",
+            expanded.text()
+        );
+        assert!(
+            expanded.text().contains("\"k39\": 39\n    }"),
+            "{}",
+            expanded.text()
+        );
 
         // Non-JSON arguments expand verbatim, one line per row.
         let verbatim = Entry::ToolCall {
@@ -1225,6 +1263,18 @@ mod tests {
             result_collapsed.text(),
             format!("gwennol: {}", show::tool_result(&c, &content, false, 0))
         );
+        // Hand-computed, not through `show::tool_result` again: the
+        // preview is the content's lines space-joined, on the same
+        // row as the byte count; the pair above has no assertion of
+        // its own otherwise, so a mutation that breaks both sides of
+        // that `assert_eq!` identically (e.g. `tool_result` returning
+        // the head line alone at every verbosity) would go uncaught.
+        assert!(
+            result_collapsed.text().ends_with("line1 line2 line3"),
+            "{}",
+            result_collapsed.text()
+        );
+        assert!(!result_collapsed.text().contains("\n    line2"));
         let result_expanded = Entry::ToolResult {
             call: c.clone(),
             content: content.clone(),
@@ -1235,9 +1285,19 @@ mod tests {
             result_expanded.text(),
             format!("gwennol: {}", show::tool_result(&c, &content, false, 1))
         );
+        assert!(
+            result_expanded
+                .text()
+                .ends_with("\n    line1\n    line2\n    line3"),
+            "{}",
+            result_expanded.text()
+        );
 
         // Empty content: collapsed and expanded agree (nothing to show
-        // either way).
+        // either way) — checked against a literal, not against each
+        // other, so a bug that made both sides equally empty (rather
+        // than genuinely equal to the one correct line) would not
+        // pass silently.
         let empty_collapsed = Entry::ToolResult {
             call: c.clone(),
             content: String::new(),
@@ -1250,7 +1310,14 @@ mod tests {
             is_error: false,
             expanded: true,
         };
-        assert_eq!(empty_collapsed.text(), empty_expanded.text());
+        assert_eq!(
+            empty_collapsed.text(),
+            "gwennol: <- write toolu_1: ok, 0 bytes"
+        );
+        assert_eq!(
+            empty_expanded.text(),
+            "gwennol: <- write toolu_1: ok, 0 bytes"
+        );
 
         // `-v`'s default: a result starts expanded at verbosity 1+; a
         // call never does.

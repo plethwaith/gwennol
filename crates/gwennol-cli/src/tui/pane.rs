@@ -9,9 +9,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::tui::ui::{self, Entry, PaneView, Ui};
 
 /// Route one key to the pane. `true` when the pane took it: `PageUp`
-/// and `PageDown` always; `Home` and `End` while the editor holds no
-/// text; `Tab` and `BackTab` always; `Enter` while the editor holds
-/// no text and an entry is focused. Anything else is the editor's.
+/// and `PageDown`, any modifiers; `Home` and `End`, unmodified, while
+/// the editor holds no text; `Tab` and `BackTab`, any modifiers;
+/// `Enter`, any modifiers, while the editor holds no text and an
+/// entry is focused. Anything else is the editor's.
 pub fn key(ui: &mut Ui, event: &KeyEvent) -> bool {
     match event.code {
         KeyCode::PageUp | KeyCode::PageDown => {
@@ -100,7 +101,9 @@ fn newer(entries: &[Entry], from: Option<usize>) -> Option<usize> {
     (from + 1..entries.len()).find(|&i| expandable(&entries[i]))
 }
 
-/// D6. The least scroll that puts entry `index`'s head row on screen.
+/// D6. Puts entry `index`'s head row on the pane's first row when the
+/// last frame did not show it; nothing moves when it was already on
+/// screen.
 fn reveal(ui: &mut Ui, index: usize) {
     let PaneView { width, height, .. } = ui.pane_view.get();
     let width = (width as usize).max(1);
@@ -116,7 +119,17 @@ fn reveal(ui: &mut Ui, index: usize) {
     }
     let max_top = rows.saturating_sub(height);
     let top = ui.scroll.map_or(max_top, |t| t.min(max_top));
-    if !(top..top + height).contains(&head) {
+    if (top..top + height).contains(&head) {
+        // The head row is already on screen: keep the scroll, but
+        // normalise it against this call's own row count. Without
+        // this, a `Some(top)` `reveal` leaves alone here can still be
+        // at or past a `max_top` a row-count change (a collapse, most
+        // often) just shrank past it, breaking D5's invariant ("no
+        // `Some(top)` survives a row-count change that put it at or
+        // past `max_top`") until the transcript grows again and pins
+        // the pane away from the tail with no scroll having happened.
+        ui.scroll = ui.scroll.and_then(|t| normalise(t.min(max_top), max_top));
+    } else {
         ui.scroll = normalise(head, max_top);
     }
 }
@@ -291,6 +304,108 @@ mod tests {
         assert!(!row(&buf, 4).contains(ui::SCROLLED));
     }
 
+    /// Guards D5/D6: collapsing an expanded entry must not strand
+    /// `ui.scroll` at a row `reveal` kept because it was already on
+    /// screen, once the collapse's own smaller row count already put
+    /// that row at or past `max_top` — the pane silently stops
+    /// following the tail the moment a later push grows the
+    /// transcript back past the stale `top`, with no scroll having
+    /// happened in between. Mutation: drop the
+    /// `ui.scroll.and_then(|t| normalise(..))` on `reveal`'s
+    /// kept-scroll branch (keep the early return instead).
+    #[test]
+    fn collapsing_an_expanded_entry_normalises_the_kept_scroll() {
+        let shared = shared_with(vec![Entry::Assistant("aaa".to_string()), result("r", 30)]);
+        draw(&shared, 40, 8);
+        press(&shared, KeyCode::Tab, KeyModifiers::NONE);
+        press(&shared, KeyCode::Enter, KeyModifiers::NONE); // expand
+        press(&shared, KeyCode::Enter, KeyModifiers::NONE); // collapse, no `End` in between
+        let buf = draw(&shared, 40, 8);
+        assert!(
+            shared.lock().pane_view.get().following(),
+            "the collapsed transcript no longer fits the pane: {:?}",
+            shared.lock().pane_view.get()
+        );
+        assert!(
+            !row(&buf, 6).contains(ui::SCROLLED),
+            "marker shown with nothing having scrolled"
+        );
+
+        for n in 0..10 {
+            shared.update(|ui| ui.push(Entry::Trace(format!("gwennol: later{n}"))));
+        }
+        let buf = draw(&shared, 40, 8);
+        assert!(
+            shared.lock().pane_view.get().following(),
+            "the pane stopped following the tail once later pushes grew the \
+             transcript past a scroll the collapse left stale: {:?}",
+            shared.lock().pane_view.get()
+        );
+        assert!(!row(&buf, 6).contains(ui::SCROLLED));
+        assert!(
+            row(&buf, 5).contains("later9"),
+            "the tail is not drawn: {:?}",
+            row(&buf, 5)
+        );
+    }
+
+    /// Guards `render_pane`'s own clamp (`ui.rs`): a `scroll` past
+    /// `max_top` — the state left behind by a resize, which touches
+    /// neither `scroll` nor `focus` and never reaches `reveal` (see
+    /// `drive.rs`'s `Input::Resize` arm) — is clamped to `max_top`,
+    /// not merely to the row count, so the pane still draws a full
+    /// `height` rows rather than trailing blank space below a
+    /// too-large `top`. Mutation:
+    /// `ui.scroll.unwrap_or(max_top).min(rows.len())` in place of
+    /// `ui.scroll.map_or(max_top, |t| t.min(max_top))`.
+    #[test]
+    fn render_pane_clamps_a_stale_scroll_to_max_top_not_to_the_row_count() {
+        let shared = shared_with(vec![result("r", 100)]);
+        draw(&shared, 40, 8);
+        let (total_rows, height) = {
+            let view = shared.lock().pane_view.get();
+            (view.rows, view.height as usize)
+        };
+        let max_top = total_rows.saturating_sub(height);
+        assert!(max_top > 0, "fixture too small to exercise the clamp");
+        // Set directly: `pane::key` never leaves `scroll` here (every
+        // write there normalises against a freshly computed
+        // `max_top`), but a resize can, since it touches nothing.
+        shared.update(|ui| ui.scroll = Some(total_rows - 1));
+        draw(&shared, 40, 8);
+        assert_eq!(
+            shared.lock().pane_view.get().top,
+            max_top,
+            "render_pane clamped to something other than max_top"
+        );
+    }
+
+    /// Guards D7: the pane's keys are not gated on whether a turn is
+    /// running — reading a session back while it is producing output
+    /// is the change's stated purpose (plan section 1) — so `PageUp`
+    /// still moves `scroll` with `running: true`. Mutation: `if
+    /// !running && pane::key(ui, &key)` in `handle_key`.
+    #[test]
+    fn pane_keys_reach_the_pane_while_a_turn_is_running() {
+        let long: String = (0..100)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shared = shared_with(vec![Entry::Assistant(long)]);
+        draw(&shared, 40, 6);
+        let cancel = CancellationToken::new();
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        );
+        assert!(
+            shared.lock().scroll.is_some(),
+            "PageUp did not reach the pane while a turn was running"
+        );
+    }
+
     /// Guards D5: `Home`/`End` reach the pane only while the editor
     /// holds no text, else the editor's own. Mutation: drop the
     /// `is_empty` check.
@@ -335,6 +450,23 @@ mod tests {
         draw(&shared, 40, 6);
         press(&shared, KeyCode::PageUp, KeyModifiers::NONE);
         assert!(shared.lock().scroll.is_some(), "PageUp reached the editor");
+
+        // `Home`/`End` reach the pane only when unmodified, unlike
+        // `PageUp`/`PageDown`/`Tab`/`BackTab`/`Enter`, which take any
+        // modifiers (the editor binds `Home`/`End` the same way, so a
+        // modified one is nobody's). With the editor empty and a
+        // scroll standing away from both 0 and the tail, `Shift+Home`
+        // and `Shift+End` must move it not at all. Mutations: drop
+        // the `KeyModifiers::NONE` guard from `key`'s `Home` arm;
+        // drop it from the `End` arm.
+        shared.update(|ui| {
+            ui.editor = crate::tui::editor::Editor::default();
+            ui.scroll = Some(5);
+        });
+        press(&shared, KeyCode::Home, KeyModifiers::SHIFT);
+        assert_eq!(shared.lock().scroll, Some(5), "Shift+Home reached the pane");
+        press(&shared, KeyCode::End, KeyModifiers::SHIFT);
+        assert_eq!(shared.lock().scroll, Some(5), "Shift+End reached the pane");
     }
 
     /// Guards D4: `Tab` focuses the newest expandable entry and walks
@@ -408,8 +540,9 @@ mod tests {
 
     /// Guards D4 and the cache row: `Enter` on an empty editor toggles
     /// the focused entry's expansion, which changes the row count the
-    /// pane draws; a focused, unexpanded entry with no focus toggles
-    /// nothing. Mutation: drop the `revision` bump in `toggle`.
+    /// pane draws; `Enter` with text in the editor, or with no entry
+    /// focused, toggles nothing. Mutation: drop the `revision` bump in
+    /// `toggle`.
     #[test]
     fn enter_on_an_empty_editor_toggles_the_focused_entry() {
         let shared = shared_with(vec![result("r", 10)]);
@@ -468,11 +601,25 @@ mod tests {
         draw(&fresh, 40, 12);
         let action = press(&fresh, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(action, None);
+        // `press`'s `Action` is `None` whether `pane::key` swallowed
+        // this `Enter` (`true`, no focus) or let it fall to the
+        // editor's own (`false`, an empty submission is also
+        // `Action`-less): calling `key` directly is the only way to
+        // pin the `None` arm itself. Mutation: `None => true` in
+        // `key`'s `Enter` match.
+        {
+            let mut ui = fresh.lock();
+            assert!(
+                !key(&mut ui, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                "Enter with no focus returned true from pane::key"
+            );
+        }
     }
 
     /// Guards D6: focusing an entry, or toggling one, keeps its head
-    /// row on screen — scrolling the least amount necessary. Mutations:
-    /// drop `reveal` in the toggle path; drop it in the `Tab` path.
+    /// row on screen, at the pane's first row when it was not already
+    /// visible. Mutations: drop `reveal` in the toggle path; drop it
+    /// in the `Tab` path.
     #[test]
     fn a_toggle_or_a_focus_move_keeps_the_head_row_on_screen() {
         let shared = shared_with(vec![
@@ -505,6 +652,7 @@ mod tests {
         let mut entries: Vec<Entry> = (0..30)
             .map(|n| Entry::Trace(format!("gwennol: t{n}")))
             .collect();
+        entries[5] = call("older", "{}");
         entries.push(result("s", 1));
         entries.extend((0..5).map(|n| Entry::Trace(format!("gwennol: u{n}"))));
         let second = shared_with(entries);
@@ -512,6 +660,7 @@ mod tests {
         press(&second, KeyCode::Home, KeyModifiers::NONE);
         assert_eq!(second.lock().scroll, Some(0));
         press(&second, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(second.lock().focus, Some(30));
         let head_of_result: usize = second
             .lock()
             .entries
@@ -520,6 +669,39 @@ mod tests {
             .map(|e| ui::wrap(&e.text(), 40).len())
             .sum();
         assert_eq!(second.lock().scroll, Some(head_of_result));
+
+        // `Tab` again walks to the older expandable entry at index 5
+        // (near the top, scrolling back up); `BackTab` returns to the
+        // newer one just focused above, and D6 says its own site
+        // (`reveal` in the `BackTab` arm) must scroll the head row
+        // back into view exactly as the `Tab` path did — nothing pins
+        // this site otherwise, since dropping its `reveal` call left
+        // every other test green. Mutation: drop `reveal` from the
+        // `BackTab` arm.
+        press(&second, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(second.lock().focus, Some(5));
+        assert_ne!(
+            second.lock().scroll,
+            Some(head_of_result),
+            "focusing the older entry did not move the scroll"
+        );
+        press(&second, KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(second.lock().focus, Some(30));
+        assert_eq!(
+            second.lock().scroll,
+            Some(head_of_result),
+            "BackTab's reveal did not bring the newer entry's head back on screen"
+        );
+        let buf = draw(&second, 40, 8);
+        let reversed: Vec<u16> = (0..buf.area.height)
+            .filter(|&y| {
+                buf[(0, y)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .collect();
+        assert_eq!(reversed.len(), 1, "{reversed:?}");
+        assert!(row(&buf, reversed[0]).starts_with("gwennol: <- s"));
     }
 
     /// Guards D5: a submitted turn, or `/help`, returns the pane to
@@ -528,7 +710,7 @@ mod tests {
     #[test]
     fn a_submit_returns_the_pane_to_the_tail_and_drops_the_focus() {
         // A small pane (height 2: 4 rows less the status and editor
-        // lines) so the 3-row transcript below does not fit it whole,
+        // lines) so the 5-row transcript below does not fit it whole,
         // and `Home` has somewhere to scroll to.
         let shared = shared_with(vec![
             Entry::Assistant("aaa bbb ccc ddd eee fff ggg hhh".to_string()),
