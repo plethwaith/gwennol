@@ -245,14 +245,7 @@ fn compute_lines(prompt: &Prompt) -> Vec<String> {
                 call.name,
                 call.id.as_deref().unwrap_or("")
             ));
-            match serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                Ok(value) => {
-                    let pretty = serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|_| call.arguments.clone());
-                    out.extend(pretty.lines().map(str::to_string));
-                }
-                Err(_) => out.push(call.arguments.clone()),
-            }
+            out.extend(show::arguments_lines(&call.arguments));
         }
         None => out.push("started by the frontend, not by a tool call".to_string()),
     }
@@ -474,6 +467,43 @@ pub(crate) mod tests {
         let frame = render_frame(&shared);
         assert!(!frame.iter().any(|r| r.contains(TITLE)), "{frame:?}");
         assert!(shared.lock().entries.is_empty(), "no answer ever came");
+    }
+
+    /// Guards D2: `compute_lines` renders a call's arguments through
+    /// [`show::arguments_lines`], not an inline pretty-print of its
+    /// own — the box and an expanded pane entry cannot drift only if
+    /// both call the one function. Non-JSON arguments with a trailing
+    /// newline distinguish the two: `arguments_lines`'s `.lines()`
+    /// drops it (two rows, `"a"` and `"b"`), while pushing the raw
+    /// text as one `Vec` entry (the pre-refactor shape) would keep it
+    /// embedded in a single row. The JSON case does not distinguish
+    /// them (both paths pretty-print identically), so this must be
+    /// non-JSON. Mutation: revert `compute_lines`'s `Some(call)` arm
+    /// to matching on `serde_json::from_str` directly and pushing
+    /// `call.arguments.clone()` in the `Err` case.
+    #[test]
+    fn compute_lines_renders_arguments_through_show_arguments_lines() {
+        let request = ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: Some(ToolCall {
+                id: Some("t9".to_string()),
+                name: "write".to_string(),
+                arguments: "a\nb\n".to_string(),
+            }),
+            access: Access::WriteFile(std::path::PathBuf::from("/ws/out.txt")),
+        };
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let prompt = Prompt::new(request, None, "write /ws/out.txt".to_string(), None, tx);
+        let rows = lines(&prompt);
+        let idx = rows
+            .iter()
+            .position(|l| l.ends_with("with these arguments:"))
+            .expect("no arguments header");
+        assert_eq!(
+            &rows[idx + 1..],
+            &["a".to_string(), "b".to_string()],
+            "{rows:?}"
+        );
     }
 
     /// Guards D4: a prompt whose receiver is already gone (the guard

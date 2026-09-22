@@ -69,11 +69,23 @@ bundler fills the slot ([plugins/README.md](plugins/README.md)).
 cargo build -p gwennol-cli
 export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/a/repository
+/path/to/gwennol/target/debug/gwennol \
+    --trust-runtime provider-anthropic \
+    --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**'
+```
+
+Opens a session: the model's text streams into a pane, a line editor
+takes each turn, and a request no rule decides is asked at a prompt;
+`/exit` ends it.
+
+```sh
 /path/to/gwennol/target/debug/gwennol -p \
     --trust-runtime provider-anthropic \
     --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**' \
     'What is this repository for?'
 ```
+
+One turn, the model's text on stdout, the trace on stderr.
 
 Every reach outside the sandbox is judged by the `--allow`/`--deny`
 rules and a config file first; a session asks at a prompt for what no

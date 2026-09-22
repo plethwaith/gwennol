@@ -36,7 +36,8 @@ pub struct Interactive {
 impl Interactive {
     /// A frontend judging by `policy`, answering secrets from
     /// `secrets`, for a workspace at `workspace` (canonical), showing
-    /// tool results whole at `-v` and above, through `shared`.
+    /// tool results expanded by default at `-v` and above, through
+    /// `shared`.
     pub fn new(
         policy: Policy,
         secrets: Secrets,
@@ -135,18 +136,23 @@ mod tests {
         }
     }
 
-    fn last_trace(shared: &Arc<Shared>) -> String {
-        match shared.lock().entries.last() {
-            Some(Entry::Trace(t)) => t.clone(),
-            other => panic!("expected a Trace entry, got {other:?}"),
-        }
+    /// The last entry's rendered text, whatever kind of entry it is.
+    fn last_text(shared: &Arc<Shared>) -> String {
+        shared
+            .lock()
+            .entries
+            .last()
+            .expect("an entry")
+            .text()
+            .into_owned()
     }
 
     /// Guards the session's `-v` (no test before this round;
     /// `show::tool_result`'s verbosity branch was exercised only
     /// through `headless.rs`): `emit` passes its own `verbosity`
     /// to `Ui::apply`, not a hardcoded value, so a multi-line result
-    /// shows whole at `-v` and cut to one line without it. Mutation:
+    /// shows whole at `-v` and cut to one line without it, and the
+    /// entry's own `expanded` field carries the same default. Mutation:
     /// hardcode `ui.apply(event, 0)` in `emit` — the first assertion
     /// below fails (the whole-content run instead shows a preview).
     #[test]
@@ -167,12 +173,19 @@ mod tests {
             content: content.clone(),
             is_error: false,
         });
-        let whole = last_trace(&shared);
+        let whole = last_text(&shared);
         assert!(
             whole.contains("\n    line one")
                 && whole.contains("\n    line two")
                 && whole.contains("\n    line three"),
             "verbosity 1 did not show each line on its own indented line: {whole:?}"
+        );
+        assert!(
+            matches!(
+                shared.lock().entries.last(),
+                Some(Entry::ToolResult { expanded: true, .. })
+            ),
+            "verbosity 1 did not start the entry expanded"
         );
 
         let shared0 = Shared::new();
@@ -188,10 +201,20 @@ mod tests {
             content,
             is_error: false,
         });
-        let preview = last_trace(&shared0);
+        let preview = last_text(&shared0);
         assert!(
             !preview.contains("\n    line two"),
             "verbosity 0 showed each line on its own indented line: {preview:?}"
+        );
+        assert!(
+            matches!(
+                shared0.lock().entries.last(),
+                Some(Entry::ToolResult {
+                    expanded: false,
+                    ..
+                })
+            ),
+            "verbosity 0 started the entry expanded"
         );
     }
 
@@ -226,9 +249,9 @@ mod tests {
         ));
         assert!(shared.lock().prompts.is_empty());
         assert!(
-            last_trace(&shared).ends_with(r#"denied by --deny "write:**""#),
+            last_text(&shared).ends_with(r#"denied by --deny "write:**""#),
             "{}",
-            last_trace(&shared)
+            last_text(&shared)
         );
 
         let empty_policy = crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap();
@@ -248,10 +271,10 @@ mod tests {
         ));
         assert!(shared.lock().prompts.is_empty());
         assert!(
-            last_trace(&shared)
+            last_text(&shared)
                 .ends_with("allowed by session rule write:/ws/out.txt for plugin tool-write"),
             "{}",
-            last_trace(&shared)
+            last_text(&shared)
         );
     }
 }

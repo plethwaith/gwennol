@@ -23,12 +23,14 @@ use gwennol::tui::drive::drive;
 use gwennol::tui::keys::Input;
 use gwennol::tui::prompt::{KEYS_ONCE, TITLE};
 use gwennol::tui::screen::{Kitty, Screen};
-use gwennol::tui::ui::{Entry, Shared, TurnState, Ui, render, wrap};
+use gwennol::tui::ui::{Entry, SCROLLED, Shared, TurnState, Ui, render, wrap};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
 use gwennol_core::Session;
 use provider_anthropic::PLUGIN_NAME as PROVIDER;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Modifier;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -284,19 +286,71 @@ async fn await_ui(shared: &std::sync::Arc<Shared>, mut check: impl FnMut(&Ui) ->
     panic!("gave up after 2000 changes waiting for: {what}");
 }
 
+/// Send `c`, wait for it to land in the editor, then delete it and
+/// wait for the editor to be empty again. Keys are handled strictly in
+/// the order they were sent, so once `c` is in the editor every key
+/// sent before it has already been handled: a regression in one of
+/// those keys' own effect then fails at the very next assertion,
+/// rather than at some later run's 180s outer timeout with no clue
+/// which key caused it.
+async fn typed(tx: &UnboundedSender<Input>, shared: &std::sync::Arc<Shared>, c: char) {
+    tx.send(Input::Key(KeyEvent::new(
+        KeyCode::Char(c),
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
+    await_ui(
+        shared,
+        |ui| ui.editor.text() == c.to_string(),
+        "typed: the character landed",
+    )
+    .await;
+    tx.send(Input::Key(KeyEvent::new(
+        KeyCode::Backspace,
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
+    await_ui(
+        shared,
+        |ui| ui.editor.text().is_empty(),
+        "typed: the character was cleared",
+    )
+    .await;
+}
+
 /// Render `shared`'s current `Ui` into a fresh 80x24 backend and
-/// return its rows as plain strings (trailing padding included).
-fn frame(shared: &std::sync::Arc<Shared>) -> Vec<String> {
+/// return the raw buffer, for a check that needs more than the plain
+/// text (a cell's style). Not a pure observer: rendering writes
+/// `ui.pane_view` through its `Cell`, the same side effect a real
+/// frame has.
+fn frame_buffer(shared: &std::sync::Arc<Shared>) -> Buffer {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(&shared.lock(), f)).unwrap();
-    let buf = terminal.backend().buffer();
+    terminal.backend().buffer().clone()
+}
+
+/// Render `shared`'s current `Ui` into a fresh 80x24 backend and
+/// return its rows as plain strings (trailing padding included).
+fn frame(shared: &std::sync::Arc<Shared>) -> Vec<String> {
+    let buf = frame_buffer(shared);
     (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
                 .map(|x| buf[(x, y)].symbol().to_string())
                 .collect()
         })
+        .collect()
+}
+
+/// The rows of `shared`'s current frame whose column-0 cell carries
+/// `Modifier::REVERSED`: the pane's focus highlight (D4), drawn only
+/// on an entry's head row.
+fn reversed_rows(shared: &std::sync::Arc<Shared>) -> Vec<usize> {
+    let buf = frame_buffer(shared);
+    (0..buf.area.height)
+        .filter(|&y| buf[(0, y)].modifier.contains(Modifier::REVERSED))
+        .map(|y| y as usize)
         .collect()
 }
 
@@ -545,12 +599,12 @@ async fn scenario() {
     {
         let ui = shared.lock();
         let entries = &ui.entries[start..];
-        let trace_at = |i: usize, prefix: &str| match &entries[i] {
-            Entry::Trace(t) => assert!(
-                t.starts_with(prefix),
-                "run A entry {i}: {t:?} does not start with {prefix:?}"
-            ),
-            other => panic!("run A entry {i}: expected Trace, got {other:?}"),
+        let trace_at = |i: usize, prefix: &str| {
+            let text = entries[i].text();
+            assert!(
+                text.starts_with(prefix),
+                "run A entry {i}: {text:?} does not start with {prefix:?}"
+            );
         };
         assert_eq!(
             entries[0],
@@ -566,7 +620,8 @@ async fn scenario() {
             "run A entry 2"
         );
         assert!(
-            matches!(&entries[3], Entry::Trace(t) if t.starts_with("gwennol: -> read toolu_01: ") && t.contains("hello.txt")),
+            entries[3].text().starts_with("gwennol: -> read toolu_01: ")
+                && entries[3].text().contains("hello.txt"),
             "run A entry 3: {:?}",
             entries[3]
         );
@@ -819,7 +874,11 @@ async fn scenario() {
             type_line(&tx, "sleep");
             await_ui(
                 &shared,
-                |ui| ui.entries[start..].iter().any(|e| matches!(e, Entry::Trace(t) if t.starts_with("gwennol: -> bash toolu_s1: "))),
+                |ui| {
+                    ui.entries[start..]
+                        .iter()
+                        .any(|e| e.text().starts_with("gwennol: -> bash toolu_s1: "))
+                },
                 "run D: bash tool call traced",
             )
             .await;
@@ -1114,7 +1173,9 @@ async fn scenario() {
             "run I: {entries:?}"
         );
         assert!(
-            entries.iter().any(|e| matches!(e, Entry::Trace(t) if t.starts_with("gwennol: <- write toolu_s1: ok, "))),
+            entries
+                .iter()
+                .any(|e| e.text().starts_with("gwennol: <- write toolu_s1: ok, ")),
             "run I: {entries:?}"
         );
         assert!(
@@ -1669,4 +1730,161 @@ async fn scenario() {
         !f.workspace.join("cancel.txt").exists(),
         "run O: cancel.txt was written"
     );
+
+    reset_editor(&shared);
+    // ---- run Q: a tool result expands in place, its head row focuses
+    // and highlights, and the pane pages off the tail and back.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
+    let start = shared.lock().entries.len();
+    let driver = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            type_line(&tx, "bash echo hi");
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 1,
+                "run Q: outcome",
+            )
+            .await;
+
+            let idx = shared.lock().entries[start..]
+                .iter()
+                .position(|e| matches!(e, Entry::ToolResult { call, .. } if call.name == "bash"))
+                .map(|i| start + i)
+                .expect("run Q: no bash ToolResult entry");
+            {
+                let ui = shared.lock();
+                match &ui.entries[idx] {
+                    Entry::ToolResult {
+                        call,
+                        content,
+                        expanded,
+                        ..
+                    } => {
+                        assert_eq!(call.id.as_deref(), Some("toolu_s1"), "run Q");
+                        assert!(!expanded, "run Q: the result started expanded");
+                        assert!(
+                            content.starts_with("exit status: 0\n\nstdout:\nhi\n"),
+                            "run Q: {content:?}"
+                        );
+                    }
+                    other => panic!("run Q: expected a ToolResult entry, got {other:?}"),
+                }
+                assert!(
+                    ui.entries[idx]
+                        .text()
+                        .starts_with("gwennol: <- bash toolu_s1: ok, "),
+                    "run Q: {:?}",
+                    ui.entries[idx].text()
+                );
+            }
+            let collapsed_rows = frame(&shared);
+            let collapsed_head = collapsed_rows
+                .iter()
+                .position(|r| r.starts_with("gwennol: <- bash toolu_s1"))
+                .expect("run Q: no head row for the result");
+            assert!(
+                collapsed_rows[collapsed_head + 1].contains("exit status: 0")
+                    && collapsed_rows[collapsed_head + 1].contains("stdout: hi"),
+                "run Q: row {} is not the collapsed preview: {:?}",
+                collapsed_head + 1,
+                collapsed_rows
+            );
+
+            // Tab focuses the result: the newest expandable entry.
+            key(&tx, KeyCode::Tab, KeyModifiers::NONE);
+            typed(&tx, &shared, 'x').await;
+            assert_eq!(
+                shared.lock().focus,
+                Some(idx),
+                "run Q: Tab did not focus the result"
+            );
+            let reversed = reversed_rows(&shared);
+            let rows = frame(&shared);
+            assert!(
+                reversed
+                    .iter()
+                    .any(|&y| rows[y].starts_with("gwennol: <- bash toolu_s1")),
+                "run Q: no reversed row starts the result's own line: {reversed:?} {rows:?}"
+            );
+
+            // Enter on the empty editor expands it in place.
+            key(&tx, KeyCode::Enter, KeyModifiers::NONE);
+            typed(&tx, &shared, 'y').await;
+            assert!(
+                matches!(
+                    shared.lock().entries[idx],
+                    Entry::ToolResult { expanded: true, .. }
+                ),
+                "run Q: Enter did not expand the result"
+            );
+            // `ui::wrap` rewraps by words (`split_whitespace`), so the
+            // 4-space indent `show::tool_result` writes for each line
+            // does not survive onto the pane's own rows — the same is
+            // true of the approval box's pretty-printed JSON, which
+            // wraps through the same function; `pretty_lines` in this
+            // file already compares against trimmed lines for that
+            // reason. What the pane preserves is a row boundary per
+            // line — one row each here, since no line is wider than
+            // the pane.
+            // Checked from the entry's own head row, positionally: the
+            // model's follow-up turn echoes this same content back as
+            // its answer (`"It says: {content}"`, `tests/common/mod.rs`),
+            // so a plain `contains` search over the whole frame would
+            // pass whether or not this entry itself ever expanded.
+            let expanded_rows = frame(&shared);
+            let head = expanded_rows
+                .iter()
+                .position(|r| r.starts_with("gwennol: <- bash toolu_s1"))
+                .expect("run Q: the result's head row is gone after expanding");
+            for (offset, needle) in [
+                (1, "exit status: 0"),
+                (2, ""),
+                (3, "stdout:"),
+                (4, "hi"),
+                (5, ""),
+                (6, "stderr:"),
+            ] {
+                assert_eq!(
+                    expanded_rows[head + offset].trim_end(),
+                    needle,
+                    "run Q: row {} of the expanded result: {:?}",
+                    head + offset,
+                    expanded_rows
+                );
+            }
+
+            // PageUp scrolls the pane off the tail; the status line
+            // gains the marker.
+            key(&tx, KeyCode::PageUp, KeyModifiers::NONE);
+            typed(&tx, &shared, 'z').await;
+            assert!(
+                shared.lock().scroll.is_some(),
+                "run Q: PageUp did not scroll"
+            );
+            assert!(
+                frame(&shared)[22].contains(SCROLLED),
+                "run Q: no scrolled marker: {:?}",
+                frame(&shared)[22]
+            );
+
+            // End on the empty editor returns to the tail; the marker
+            // goes with it.
+            key(&tx, KeyCode::End, KeyModifiers::NONE);
+            typed(&tx, &shared, 'w').await;
+            assert!(
+                shared.lock().scroll.is_none(),
+                "run Q: End did not return to the tail"
+            );
+            assert!(
+                !frame(&shared).iter().any(|r| r.contains(SCROLLED)),
+                "run Q: the marker is still shown after End"
+            );
+
+            type_line(&tx, "/exit");
+        })
+    };
+    let code = run_drive(session, &shared, &mut rx, None).await;
+    driver.await.unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "run Q");
 }

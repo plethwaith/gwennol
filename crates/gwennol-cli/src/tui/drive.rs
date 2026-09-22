@@ -7,7 +7,9 @@
 //! before anything else typed reaches the editor or the token (a
 //! Ctrl-C notice is still retired first; a resize or a read error
 //! never reaches the prompt at all, and a paste is dropped rather
-//! than routed to it), so `Esc` there denies rather than cancels.
+//! than routed to it), so `Esc` there denies rather than cancels; the
+//! pane's own keys (paging, focus, expand: [`pane`]) come next, and
+//! the editor last.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,8 +25,8 @@ use tokio::sync::watch;
 use crate::show::outcome_line;
 use crate::tui::editor::{Command, Submission};
 use crate::tui::keys::{Input, KeySource};
-use crate::tui::prompt;
 use crate::tui::ui::{Entry, Shared, TurnState, render};
+use crate::tui::{pane, prompt};
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED, Fatal};
 
 /// What handling one key means for the loop driving it.
@@ -45,7 +47,9 @@ pub(crate) enum Action {
 /// or a `/exit` reaches [`CancellationToken::cancel`] — and it does
 /// not while a prompt is open: keys go to the prompt first, so `Esc`
 /// there denies rather than cancels, and nothing typed during a
-/// prompt reaches the editor. `pub(crate)` so `tui::prompt`'s own
+/// prompt reaches the editor; the pane's keys are taken before the
+/// editor's, so `Home` on an empty editor scrolls rather than moving a
+/// cursor that has nowhere to go. `pub(crate)` so `tui::prompt`'s own
 /// tests can drive a key through the same entry point `drive` uses,
 /// rather than a copy of its prompt-routing branch.
 pub(crate) fn handle_key(
@@ -57,6 +61,13 @@ pub(crate) fn handle_key(
     let mut action = None;
     shared.update(|ui| {
         let key = match input {
+            // Touches neither `scroll` nor `focus`: a resize that
+            // shrinks `max_top` past a `Some(top)` a previous `reveal`
+            // left in place never reaches `pane::reveal` to fix it up;
+            // `render_pane`'s own clamp (ui.rs) is what keeps the
+            // pane in range until something rewrites `ui.scroll`: a
+            // pane key, or the `follow_tail` a submitted turn or
+            // `/help` does.
             Input::Resize => return,
             Input::Paste(text) => {
                 // A prompt swallows a paste too, dropped rather than
@@ -96,6 +107,9 @@ pub(crate) fn handle_key(
             ui.notice = Some("Esc cancels the turn, /exit leaves".to_string());
             return;
         }
+        if pane::key(ui, &key) {
+            return;
+        }
         if !ui.editor.key(&key) {
             return;
         }
@@ -106,6 +120,7 @@ pub(crate) fn handle_key(
                     ui.notice = Some("a turn is running; Esc cancels it".to_string());
                 } else {
                     ui.editor.commit();
+                    ui.follow_tail();
                     action = Some(Action::Submit(text));
                 }
             }
@@ -130,6 +145,7 @@ pub(crate) fn handle_key(
                     ui.push(Entry::Trace((*line).to_string()));
                 }
                 ui.editor.commit();
+                ui.follow_tail();
             }
             Submission::Command(Command::Unknown(word)) => {
                 ui.notice = Some(format!("unknown command: {word}; /help lists them"));
@@ -508,6 +524,61 @@ mod tests {
         assert!(
             shared.lock().notice.is_none(),
             "Ctrl-C set a notice while a prompt was open"
+        );
+
+        // The pane's own keys are swallowed the same way: with a
+        // prompt open, `PageUp` and `Tab` change neither `scroll` nor
+        // `focus`. A long entry and a render first, so `pane_view` is
+        // not still zeroed: `PageUp` reaching the pane from this state
+        // would otherwise compute `None` regardless of the gate. The
+        // `ToolResult` pushed just below gives `Tab` an expandable
+        // entry to find instead of the `None` `older` hands back from
+        // an unset `focus` when nothing in the transcript is
+        // expandable, so it too would move `focus` if the gate did
+        // not hold, and the mutation below would go uncaught.
+        shared.update(|ui| {
+            let long: String = (0..100)
+                .map(|n| format!("line{n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            ui.push(Entry::Assistant(long));
+            ui.push(Entry::ToolResult {
+                call: gwennol_core::ToolCall {
+                    id: None,
+                    name: "r".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                content: "c".to_string(),
+                is_error: false,
+                expanded: false,
+            });
+        });
+        {
+            let backend = TestBackend::new(20, 6);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(&shared.lock(), f)).unwrap();
+        }
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        );
+        assert_eq!(
+            shared.lock().scroll,
+            None,
+            "PageUp reached the pane while a prompt was open"
+        );
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        );
+        assert_eq!(
+            shared.lock().focus,
+            None,
+            "Tab reached the pane while a prompt was open"
         );
 
         handle_key(

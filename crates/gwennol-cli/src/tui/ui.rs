@@ -4,15 +4,18 @@
 //! another task — a running turn, a host step asking for approval —
 //! reaches it: a `Mutex` (poison-proof: a panic elsewhere must not
 //! stop later updates from landing) plus a `watch` generation the loop
-//! and tests wait on. `Ui` also holds the open approval prompts and
-//! the session rules an `a`/`d` answer at one has made, both read and
-//! written under the same lock a judgement runs under.
+//! and tests wait on. `Ui` also holds the open approval prompts, the
+//! session rules an `a`/`d` answer at one has made, and the pane's
+//! scroll and focus, all read and written under the same lock a
+//! judgement runs under.
 
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use gwennol_core::Event;
+use gwennol_core::{Event, ToolCall};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,13 +36,65 @@ pub enum Entry {
     /// A chunk of the model's answer. Consecutive `Text` events append
     /// to the most recent open one rather than opening a new entry.
     Assistant(String),
-    /// A trace line: a decision, a call, its result, its failure, a
-    /// retry, a startup warning, an input-read error, or an event this
-    /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s lines
-    /// ([`HELP`]) are pushed as written.
+    /// A tool call: print mode's one-line form, or the arguments
+    /// whole.
+    ToolCall {
+        /// The call itself.
+        call: ToolCall,
+        /// Drawn whole rather than as print mode's one-line form;
+        /// flipped by `Ui::toggle`.
+        expanded: bool,
+    },
+    /// A tool result: print mode's one-line preview, or the content
+    /// whole.
+    ToolResult {
+        /// The call this is the result of.
+        call: ToolCall,
+        /// The tool's own output.
+        content: String,
+        /// Whether the tool reported an error.
+        is_error: bool,
+        /// Drawn whole rather than as print mode's one-line form;
+        /// flipped by `Ui::toggle`.
+        expanded: bool,
+    },
+    /// A trace line: a decision, a tool call's failure, a retry, a
+    /// startup warning, an input-read error, or an event this
+    /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s
+    /// lines ([`HELP`]) are pushed as written.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
+}
+
+impl Entry {
+    /// The text the pane draws for this entry at its current
+    /// expansion; for a tool call or result, print mode's line
+    /// collapsed and the whole form expanded.
+    pub fn text(&self) -> Cow<'_, str> {
+        match self {
+            Entry::User(s) | Entry::Assistant(s) | Entry::Trace(s) | Entry::Outcome(s) => {
+                Cow::Borrowed(s.as_str())
+            }
+            Entry::ToolCall { call, expanded } => Cow::Owned(format!(
+                "gwennol: {}",
+                if *expanded {
+                    show::tool_call_whole(call)
+                } else {
+                    show::tool_call(call)
+                }
+            )),
+            Entry::ToolResult {
+                call,
+                content,
+                is_error,
+                expanded,
+            } => Cow::Owned(format!(
+                "gwennol: {}",
+                show::tool_result(call, content, *is_error, u8::from(*expanded))
+            )),
+        }
+    }
 }
 
 /// What the status line shows while idle, working or streaming.
@@ -89,11 +144,12 @@ pub struct Ui {
     /// Bumped on every redraw tick, for the spinner frame.
     pub tick: usize,
     /// Bumped whenever `entries` or `open` changes in a way that could
-    /// change what `render_pane` draws (every [`Ui::push`] and every
-    /// call to [`Ui::apply`]). `render_pane` rewraps the whole
-    /// transcript only when this, or the pane's width, differs from
-    /// the cached frame: the 100ms tick and a redraw it triggers
-    /// otherwise rewrap on every frame for a spinner character alone.
+    /// change what `render_pane` draws (every [`Ui::push`], every call
+    /// to [`Ui::apply`], and every [`Ui::toggle`]). `render_pane`
+    /// rewraps the whole transcript only when this, or the pane's
+    /// width, differs from the cached frame: the 100ms tick and a
+    /// redraw it triggers otherwise rewrap on every frame for a
+    /// spinner character alone.
     revision: u64,
     /// `render_pane`'s last computed rows, and the `(revision, width)`
     /// they were computed at.
@@ -109,19 +165,67 @@ pub struct Ui {
     /// Rules made at prompts, in the order made: tried after every
     /// compiled rule by `Interactive::approve` under this same lock.
     pub session_rules: Vec<SessionRule>,
-    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs:56`)
+    /// The canonical workspace, set once by `tui::start` (`tui/mod.rs`)
     /// before the frontend runs a turn: what a prompt's key handler
     /// renders the answered request's trace line against (what
     /// `answer_prompt` passes to `show::decided`). A session rule's
     /// own subject is not taken from here — `Interactive::approve`
-    /// computes it from its own workspace (`operator.rs:91`) and the
-    /// prompt carries it.
+    /// computes it from its own workspace via `show::subject` and
+    /// the prompt carries it.
     pub workspace: PathBuf,
+    /// `None` while the pane follows the tail; `Some(top)` names the
+    /// first row shown, clamped again at every render. Written by
+    /// [`crate::tui::pane::key`] and reset by [`Ui::follow_tail`]; the
+    /// `entries` doc's "only read" rule does not apply here — this is
+    /// `pane`'s own state, not derived from `entries`.
+    pub scroll: Option<usize>,
+    /// The index of the entry a `Tab`/`Shift+Tab`/`Enter` acts on, if
+    /// any. Written by [`crate::tui::pane::key`] and reset by
+    /// [`Ui::follow_tail`]; the `entries` doc's "only read" rule
+    /// applies to this field's target, same as `open`'s.
+    pub focus: Option<usize>,
+    /// What the last `render_pane` drew. [`crate::tui::pane::key`]'s
+    /// paging and `Home` arms compute against it; `reveal` takes only
+    /// its width and height; `render_status` reads `following`.
+    pub pane_view: Cell<PaneView>,
 }
 
-/// `render_pane`'s wrapped, styled rows and the `(revision, width)`
+/// What the last `render_pane` drew: its area's width and height, the
+/// wrapped row count, and the first row shown. `pane::key`'s paging and
+/// `Home` arms compute against it; `reveal` takes only its width and
+/// height; `render_status` reads `following`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneView {
+    /// The area's width, in columns.
+    pub width: u16,
+    /// The area's height, in rows.
+    pub height: u16,
+    /// The whole wrapped row count.
+    pub rows: usize,
+    /// The first row shown.
+    pub top: usize,
+}
+
+impl PaneView {
+    /// Whether the last row drawn was the last row there is.
+    pub fn following(&self) -> bool {
+        self.top + (self.height as usize) >= self.rows
+    }
+}
+
+/// One of `render_pane`'s wrapped, styled rows: which entry it belongs
+/// to, and whether it is that entry's first (head) row — the one a
+/// focus highlight draws on.
+struct PaneRow {
+    text: String,
+    style: Style,
+    entry: usize,
+    head: bool,
+}
+
+/// `render_pane`'s last computed rows, and the `(revision, width)`
 /// they were computed at.
-type PaneCache = (u64, u16, Vec<(String, Style)>);
+type PaneCache = (u64, u16, Vec<PaneRow>);
 
 impl Default for Ui {
     fn default() -> Self {
@@ -139,6 +243,9 @@ impl Default for Ui {
             prompt_seq: 0,
             session_rules: Vec::new(),
             workspace: PathBuf::new(),
+            scroll: None,
+            focus: None,
+            pane_view: Cell::new(PaneView::default()),
         }
     }
 }
@@ -158,7 +265,10 @@ impl Ui {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Map one loop event onto the pane and the turn state (D6).
+    /// Map one loop event onto the pane and the turn state (D6): a
+    /// tool result starts expanded when `verbosity` is 1 or more —
+    /// print mode's `-v` — and a tool call never starts expanded,
+    /// since print mode never writes a call's arguments as rows either.
     pub fn apply(&mut self, event: Event, verbosity: u8) {
         self.revision = self.revision.wrapping_add(1);
         match event {
@@ -185,7 +295,10 @@ impl Ui {
                 };
             }
             Event::ToolCall(call) => {
-                self.push(Entry::Trace(format!("gwennol: {}", show::tool_call(&call))));
+                self.push(Entry::ToolCall {
+                    call,
+                    expanded: false,
+                });
                 self.turn = TurnState::Streaming {
                     since: self.since(),
                 };
@@ -195,10 +308,12 @@ impl Ui {
                 content,
                 is_error,
             } => {
-                self.push(Entry::Trace(format!(
-                    "gwennol: {}",
-                    show::tool_result(&call, &content, is_error, verbosity)
-                )));
+                self.push(Entry::ToolResult {
+                    call,
+                    content,
+                    is_error,
+                    expanded: verbosity >= 1,
+                });
                 self.turn = TurnState::Working {
                     since: self.since(),
                 };
@@ -264,6 +379,29 @@ impl Ui {
             })
             .collect()
     }
+
+    /// Flip `expanded` on the entry at `index`, if it can expand
+    /// (D4), bumping `revision` so the next frame rewraps at the new
+    /// size. `false`, with nothing changed, when the index is out of
+    /// range or the entry cannot expand.
+    pub fn toggle(&mut self, index: usize) -> bool {
+        match self.entries.get_mut(index) {
+            Some(Entry::ToolCall { expanded, .. } | Entry::ToolResult { expanded, .. }) => {
+                *expanded = !*expanded;
+                self.revision = self.revision.wrapping_add(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Return the pane to the tail and drop any focus: what a
+    /// submitted turn or `/help` does, since the answer they are
+    /// about to produce belongs at the tail.
+    pub fn follow_tail(&mut self) {
+        self.scroll = None;
+        self.focus = None;
+    }
 }
 
 /// A shared handle to the `Ui` a loop drives and other tasks
@@ -286,7 +424,9 @@ impl Shared {
     }
 
     /// The `Ui`, poison-proof: a panic elsewhere while the lock was
-    /// held must not stop this from updating.
+    /// held must not stop this from updating. Plain and non-reentrant:
+    /// two `lock()` calls live at once in the same expression or
+    /// scope deadlock, with no timeout to surface it.
     pub fn lock(&self) -> MutexGuard<'_, Ui> {
         self.ui.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -306,7 +446,12 @@ pub const HELP: &[&str] = &[
     "/help lists the commands",
     "Esc cancels the running turn (denies once instead, at an open approval prompt)",
     "y n a d answer an open approval prompt: once, or for the rest of the session; Esc denies once",
+    "PageUp PageDown scroll the pane; Home End too while the editor is empty; End follows the tail again",
+    "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it",
 ];
+
+/// The status line's marker for a pane not following the tail.
+pub const SCROLLED: &str = "scrolled up · End follows the tail";
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -357,13 +502,9 @@ fn style_of(entry: &Entry) -> Style {
     match entry {
         Entry::User(_) => Style::new().add_modifier(Modifier::BOLD),
         Entry::Assistant(_) => Style::new(),
-        Entry::Trace(_) | Entry::Outcome(_) => Style::new().add_modifier(Modifier::DIM),
-    }
-}
-
-fn text_of(entry: &Entry) -> &str {
-    match entry {
-        Entry::User(s) | Entry::Assistant(s) | Entry::Trace(s) | Entry::Outcome(s) => s,
+        Entry::Trace(_) | Entry::Outcome(_) | Entry::ToolCall { .. } | Entry::ToolResult { .. } => {
+            Style::new().add_modifier(Modifier::DIM)
+        }
     }
 }
 
@@ -429,6 +570,10 @@ fn render_pane(ui: &Ui, area: Rect, buf: &mut Buffer) {
     // the sub-rect's own bounds.
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
+        // A stale `pane_view` from a previous, taller frame must not
+        // go on claiming the pane follows (or does not follow) the
+        // tail once there is no pane to draw at all.
+        ui.pane_view.set(PaneView::default());
         return;
     }
     let width = area.width as usize;
@@ -441,19 +586,36 @@ fn render_pane(ui: &Ui, area: Rect, buf: &mut Buffer) {
     let mut cache = ui.pane_cache.borrow_mut();
     let fresh = matches!(&*cache, Some((rev, w, _)) if *rev == ui.revision && *w == area.width);
     if !fresh {
-        let mut rows: Vec<(String, Style)> = Vec::new();
-        for entry in &ui.entries {
+        let mut rows: Vec<PaneRow> = Vec::new();
+        for (entry_idx, entry) in ui.entries.iter().enumerate() {
             let style = style_of(entry);
-            for row in wrap(text_of(entry), width) {
-                rows.push((row, style));
+            for (i, row) in wrap(&entry.text(), width).into_iter().enumerate() {
+                rows.push(PaneRow {
+                    text: row,
+                    style,
+                    entry: entry_idx,
+                    head: i == 0,
+                });
             }
         }
         *cache = Some((ui.revision, area.width, rows));
     }
     let rows = &cache.as_ref().expect("just populated above").2;
-    let start = rows.len().saturating_sub(height);
-    for (i, (row, style)) in rows[start..].iter().enumerate() {
-        buf.set_stringn(area.x, area.y + i as u16, row, width, *style);
+    let max_top = rows.len().saturating_sub(height);
+    let top = ui.scroll.map_or(max_top, |t| t.min(max_top));
+    ui.pane_view.set(PaneView {
+        width: area.width,
+        height: area.height,
+        rows: rows.len(),
+        top,
+    });
+    for (i, row) in rows[top..].iter().take(height).enumerate() {
+        let style = if row.head && ui.focus == Some(row.entry) {
+            row.style.add_modifier(Modifier::REVERSED)
+        } else {
+            row.style
+        };
+        buf.set_stringn(area.x, area.y + i as u16, &row.text, width, style);
     }
 }
 
@@ -488,6 +650,17 @@ fn render_status(ui: &Ui, area: Rect, buf: &mut Buffer) {
         width,
         Style::new().add_modifier(Modifier::DIM),
     );
+    if !ui.pane_view.get().following() {
+        let x = area.x + (area.width).saturating_sub(SCROLLED.chars().count() as u16);
+        let remaining = (area.width as usize).saturating_sub((x - area.x) as usize);
+        buf.set_stringn(
+            x,
+            area.y,
+            SCROLLED,
+            remaining,
+            Style::new().add_modifier(Modifier::BOLD),
+        );
+    }
 }
 
 fn render_editor(ui: &Ui, area: Rect, buf: &mut Buffer) {
@@ -541,6 +714,26 @@ mod tests {
             Some("/ws/out.txt".to_string()),
             tx,
         )
+    }
+
+    /// Guards the two `/help` lines this change adds. `interactive.rs`'s
+    /// run F pushes `HELP` into the pane and compares the result back
+    /// against `HELP` itself, which stays true regardless of `HELP`'s
+    /// length or content — deleting either line here leaves that
+    /// comparison green, since it slices exactly `HELP.len()` entries
+    /// either way. A literal count and literal text is the only pin.
+    /// Mutations: delete either of the two lines this change adds.
+    #[test]
+    fn help_gained_the_pane_and_focus_lines() {
+        assert_eq!(HELP.len(), 6, "{HELP:?}");
+        assert_eq!(
+            HELP[4],
+            "PageUp PageDown scroll the pane; Home End too while the editor is empty; End follows the tail again"
+        );
+        assert_eq!(
+            HELP[5],
+            "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it"
+        );
     }
 
     fn call(id: &str, name: &str) -> ToolCall {
@@ -618,6 +811,28 @@ mod tests {
         assert_eq!(
             streamed.assistant_text_since(1),
             "Let me read it.It says: x"
+        );
+        assert!(
+            matches!(
+                streamed.entries[2],
+                Entry::ToolCall {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            streamed.entries[2]
+        );
+        assert!(
+            matches!(
+                streamed.entries[3],
+                Entry::ToolResult {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            streamed.entries[3]
         );
 
         // The same events, buffered: every `Text` of a round after the
@@ -744,8 +959,8 @@ mod tests {
     }
 
     /// Guards two panics on a terminal under three rows: `regions`
-    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (ui.rs:399-402;
-    /// `h` is zero with no prompt open), so below three rows the
+    /// splits `Min(1)/Length(h)/Length(1)/Length(1)` (`regions` in this
+    /// file; `h` is zero with no prompt open), so below three rows the
     /// status or editor area's `y` falls outside the buffer and
     /// `buf.set_stringn` indexed it unconditionally; `editor_window`'s
     /// `cursor - start` underflowed once `width < 3`; and, with a
@@ -759,12 +974,24 @@ mod tests {
     /// region it returns already fits `area`), but the direct call
     /// below bypasses that and drives the guard itself — must not
     /// panic either, at heights 1–4 and 20 inside a 5x2 buffer. Mutation for
-    /// that case: drop the `intersection` in `render_prompt`.
+    /// that case: drop the `intersection` in `render_prompt`. A scrolled,
+    /// focused `ToolResult` at width 5 (narrower than [`SCROLLED`]
+    /// itself) must not panic either: mutation, drop the
+    /// `saturating_sub` in `render_status`'s marker `x` — overflow at
+    /// width 5.
     #[test]
     fn a_too_small_terminal_neither_panics_nor_runs_the_cursor_past_the_window() {
         let mut ui = Ui::default();
         ui.push(Entry::Assistant("hi".to_string()));
-        for (w, h) in [(80u16, 1u16), (80, 2), (80, 3), (1, 6)] {
+        ui.push(Entry::ToolResult {
+            call: call("toolu_1", "read"),
+            content: "l1\nl2\nl3".to_string(),
+            is_error: false,
+            expanded: false,
+        });
+        ui.scroll = Some(3);
+        ui.focus = Some(1);
+        for (w, h) in [(80u16, 1u16), (80, 2), (80, 3), (1, 6), (5, 3)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
@@ -894,8 +1121,9 @@ mod tests {
     }
 
     /// Guards `style_of`, previously unpinned: each entry kind renders
-    /// with its own style. Mutation: collapse every arm to
-    /// `Style::new()` — every assertion below fails.
+    /// with its own style, the two D1 variants included. Mutation:
+    /// collapse every arm to `Style::new()` — every assertion below
+    /// fails.
     #[test]
     fn entries_render_with_their_kind_style() {
         let mut ui = Ui::default();
@@ -903,7 +1131,21 @@ mod tests {
         ui.push(Entry::Assistant("a".to_string()));
         ui.push(Entry::Trace("t".to_string()));
         ui.push(Entry::Outcome("o".to_string()));
-        let backend = TestBackend::new(20, 7);
+        ui.push(Entry::ToolCall {
+            call: call("c", "x"),
+            expanded: false,
+        });
+        ui.push(Entry::ToolResult {
+            call: call("c", "x"),
+            content: "r".to_string(),
+            is_error: false,
+            expanded: false,
+        });
+        // Wide enough that none of the six one- or two-row entries
+        // below wraps unexpectedly and pushes the `User` row (row 0,
+        // following the tail) off the top of a pane sized to hold
+        // them exactly.
+        let backend = TestBackend::new(40, 9);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&ui, f)).unwrap();
         let buf = terminal.backend().buffer();
@@ -927,6 +1169,226 @@ mod tests {
             buf[(0, 3)].modifier.contains(Modifier::DIM),
             "Outcome is not dim"
         );
+        assert!(
+            buf[(0, 4)].modifier.contains(Modifier::DIM)
+                && !buf[(0, 4)].modifier.contains(Modifier::BOLD),
+            "ToolCall is not dim"
+        );
+        assert!(
+            buf[(0, 5)].modifier.contains(Modifier::DIM)
+                && !buf[(0, 5)].modifier.contains(Modifier::BOLD),
+            "ToolResult is not dim"
+        );
+    }
+
+    /// Guards D1, D2, D3: `Entry::text` collapsed is byte-identical to
+    /// print mode's line, and expanded to the whole form; `-v`'s
+    /// default (results start expanded, calls never); a `Retry` or a
+    /// `Text` event leaves a focused expandable entry, and its focus,
+    /// untouched. Mutations: `text` uses the whole form for both;
+    /// `expanded: false` unconditionally; `tool_call_whole` built from
+    /// `preview`.
+    #[test]
+    fn a_tool_entry_renders_collapsed_or_whole() {
+        let mut fields = serde_json::Map::new();
+        for i in 0..40 {
+            fields.insert(format!("k{i:02}"), serde_json::json!(i));
+        }
+        let arguments = serde_json::Value::Object(fields).to_string();
+        let c = call("toolu_1", "write");
+        let c = ToolCall {
+            arguments: arguments.clone(),
+            ..c
+        };
+
+        let collapsed = Entry::ToolCall {
+            call: c.clone(),
+            expanded: false,
+        };
+        assert_eq!(
+            collapsed.text(),
+            format!("gwennol: {}", show::tool_call(&c))
+        );
+        assert!(collapsed.text().ends_with('…'), "{}", collapsed.text());
+
+        let expanded = Entry::ToolCall {
+            call: c.clone(),
+            expanded: true,
+        };
+        assert_eq!(
+            expanded.text(),
+            format!("gwennol: {}", show::tool_call_whole(&c))
+        );
+        assert!(expanded.text().contains("\"k39\""), "{}", expanded.text());
+        assert!(!expanded.text().contains('…'), "{}", expanded.text());
+        // Computed by hand from `serde_json`'s own pretty-print
+        // (2-space indent, keys sorted), not by calling
+        // `tool_call_whole` again: a mutation that leaves both sides
+        // of the `assert_eq!` above equally wrong (`arguments_lines`
+        // returning `vec![pretty]` as one un-indented blob, so only
+        // the JSON's very first line gains the extra four-space
+        // indent) still fails here, since `"k00"`'s own line and the
+        // closing brace would not.
+        assert!(
+            expanded.text().contains("\n    {\n      \"k00\": 0,"),
+            "{}",
+            expanded.text()
+        );
+        assert!(
+            expanded.text().contains("\"k39\": 39\n    }"),
+            "{}",
+            expanded.text()
+        );
+
+        // Non-JSON arguments expand verbatim, one line per row.
+        let verbatim = Entry::ToolCall {
+            call: ToolCall {
+                arguments: "a\nb".to_string(),
+                ..call("toolu_2", "write")
+            },
+            expanded: true,
+        };
+        assert!(
+            verbatim.text().contains("\n    a\n    b"),
+            "{}",
+            verbatim.text()
+        );
+
+        // A three-line result.
+        let content = "line1\nline2\nline3".to_string();
+        let result_collapsed = Entry::ToolResult {
+            call: c.clone(),
+            content: content.clone(),
+            is_error: false,
+            expanded: false,
+        };
+        assert_eq!(
+            result_collapsed.text(),
+            format!("gwennol: {}", show::tool_result(&c, &content, false, 0))
+        );
+        // Hand-computed, not through `show::tool_result` again: the
+        // preview is the content's lines space-joined, on its own
+        // four-space-indented row below the byte-count line; the pair
+        // above has no assertion of its own otherwise, so a mutation
+        // that breaks both sides of that `assert_eq!` identically
+        // (e.g. `tool_result` returning the head line alone at every
+        // verbosity) would go uncaught.
+        assert!(
+            result_collapsed.text().ends_with("line1 line2 line3"),
+            "{}",
+            result_collapsed.text()
+        );
+        let result_expanded = Entry::ToolResult {
+            call: c.clone(),
+            content: content.clone(),
+            is_error: false,
+            expanded: true,
+        };
+        assert_eq!(
+            result_expanded.text(),
+            format!("gwennol: {}", show::tool_result(&c, &content, false, 1))
+        );
+        assert!(
+            result_expanded
+                .text()
+                .ends_with("\n    line1\n    line2\n    line3"),
+            "{}",
+            result_expanded.text()
+        );
+
+        // Empty content: collapsed and expanded agree (nothing to show
+        // either way) — checked against a literal, not against each
+        // other, so a bug that made both sides equally empty (rather
+        // than genuinely equal to the one correct line) would not
+        // pass silently.
+        let empty_collapsed = Entry::ToolResult {
+            call: c.clone(),
+            content: String::new(),
+            is_error: false,
+            expanded: false,
+        };
+        let empty_expanded = Entry::ToolResult {
+            call: c.clone(),
+            content: String::new(),
+            is_error: false,
+            expanded: true,
+        };
+        assert_eq!(
+            empty_collapsed.text(),
+            "gwennol: <- write toolu_1: ok, 0 bytes"
+        );
+        assert_eq!(
+            empty_expanded.text(),
+            "gwennol: <- write toolu_1: ok, 0 bytes"
+        );
+
+        // `-v`'s default: a result starts expanded at verbosity 1+; a
+        // call never does.
+        let mut ui = Ui::default();
+        ui.apply(
+            Event::ToolResult {
+                call: c.clone(),
+                content: content.clone(),
+                is_error: false,
+            },
+            1,
+        );
+        assert!(matches!(
+            ui.entries[0],
+            Entry::ToolResult { expanded: true, .. }
+        ));
+        let mut ui0 = Ui::default();
+        ui0.apply(
+            Event::ToolResult {
+                call: c.clone(),
+                content: content.clone(),
+                is_error: false,
+            },
+            0,
+        );
+        assert!(matches!(
+            ui0.entries[0],
+            Entry::ToolResult {
+                expanded: false,
+                ..
+            }
+        ));
+        let mut ui_call = Ui::default();
+        ui_call.apply(Event::ToolCall(c.clone()), 1);
+        assert!(matches!(
+            ui_call.entries[0],
+            Entry::ToolCall {
+                expanded: false,
+                ..
+            }
+        ));
+
+        // A focused expandable entry survives an unrelated event: a
+        // `Retry` retracts only the open `Assistant` entry, never an
+        // expandable one, and `Text`/`Retry` never touch `focus`.
+        let mut ui = Ui::default();
+        ui.apply(Event::ToolCall(c.clone()), 0);
+        ui.apply(
+            Event::ToolResult {
+                call: c.clone(),
+                content: content.clone(),
+                is_error: false,
+            },
+            0,
+        );
+        ui.focus = Some(1);
+        let before = ui.entries[1].clone();
+        ui.apply(Event::Text("thinking".to_string()), 0);
+        ui.apply(
+            Event::Retry {
+                attempt: 1,
+                max_attempts: 2,
+                failure: failure("overloaded"),
+            },
+            0,
+        );
+        assert_eq!(ui.focus, Some(1));
+        assert_eq!(ui.entries[1], before);
     }
 
     /// Guards the pane's render cache: a render after `entries` changed
