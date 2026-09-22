@@ -170,8 +170,8 @@ pub struct Ui {
     /// renders the answered request's trace line against (what
     /// `answer_prompt` passes to `show::decided`). A session rule's
     /// own subject is not taken from here — `Interactive::approve`
-    /// computes it from its own workspace (`operator.rs:91`) and the
-    /// prompt carries it.
+    /// computes it from its own workspace via `show::subject` and
+    /// the prompt carries it.
     pub workspace: PathBuf,
     /// `None` while the pane follows the tail; `Some(top)` names the
     /// first row shown, clamped again at every render. Written by
