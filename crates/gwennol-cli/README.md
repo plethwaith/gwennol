@@ -208,10 +208,10 @@ The trace shows a spawn's argv as a JSON array, so where each argument
 ends is unambiguous even though the pattern matches the space-joined
 form.
 
-The bundled `edit` tool asks twice for one call, as `tool-edit`: a
-`read` of the file, then a `write` of it, each decided like any other
-read or write. A rule that names `plugin = "tool-write"` does not
-cover it.
+The bundled `edit` tool asks, as `tool-edit`, for a `read` of the file
+and then, when it has a change to write, a `write` of it, each decided
+like any other read or write. A rule that names `plugin = "tool-write"`
+does not cover it.
 
 ## Config file
 

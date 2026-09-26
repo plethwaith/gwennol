@@ -131,11 +131,11 @@ impl Outcome {
 /// reproduce the file.
 ///
 /// With `offset`, `limit` or `number_lines`, the file is read line by line
-/// from its start: lines before `offset` are read and dropped, at most
-/// `READ_BYTES_CEILING` bytes are scanned, and the output (line numbers
-/// included) is cut at `max_bytes`; `truncated` says either cut happened.
-/// With none of them, or `offset: 1` alone, this is byte-for-byte the plain
-/// read above.
+/// from its start: lines before `offset` are read and dropped, the scan
+/// stops once more than `READ_BYTES_CEILING` bytes have been read, and the
+/// output (line numbers included) is cut at `max_bytes`; `truncated` says
+/// either cut happened. With none of them, or `offset: 1` alone, this is
+/// byte-for-byte the plain read above.
 pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -283,7 +283,7 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
 /// number (right-aligned in six columns, then a tab) when `numbered`,
 /// keeping its own line ending (`\n` stays; `\r` before it is kept too).
 /// Reading stops when the range is complete, at end of file, once the
-/// output exceeds `max` by one byte, or once more than
+/// output exceeds `max`, or once more than
 /// [`READ_BYTES_CEILING`] bytes of the file have been consumed — the
 /// second element of the result says whether that ceiling stopped it.
 async fn read_lines(
@@ -327,6 +327,12 @@ async fn read_lines(
             }
             line_no += 1;
             at_line_start = true;
+        }
+        // The range may have just completed on the very chunk that also
+        // crossed the ceiling; checking completion first keeps a range
+        // that ends exactly at the ceiling from being reported truncated.
+        if line_no >= offset && limit.is_some_and(|l| kept >= l) {
+            break;
         }
         if consumed > READ_BYTES_CEILING {
             scan_cut = true;

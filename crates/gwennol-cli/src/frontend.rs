@@ -1,11 +1,10 @@
 //! What a run settles before its `Operator` drives a turn: the
 //! workspace, the config and policy files, the compiled policy, the
 //! secret sources, the plugins and their manifests, the process
-//! environment, the kernel, and the session. The one thing that
-//! differs by frontend is the default system prompt, which says how
-//! the run is driven, so `start` takes the `Mode`. Both frontends call
-//! the same two functions and supply their own `Operator` in the
-//! closure, so neither copies any of this.
+//! environment, the kernel, and the session. `start` takes the run's
+//! `Mode`, which picks how the default system prompt describes the
+//! run. Both frontends call the same two functions and supply their
+//! own `Operator` in the closure, so neither copies any of this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +28,7 @@ pub const SESSION: &str = "This is an interactive session: a person reads your o
 
 /// What the default system prompt says about files and commands, in
 /// either mode.
-pub const FILE_TOOLS: &str = "Use read, grep, write and edit for files: read takes a range of lines, and edit changes one exact string in place. Keep bash for running commands. A file request is decided by its path and is more often allowed by a rule; a bash command is judged whole, by its command line.";
+pub const FILE_TOOLS: &str = "Use read, grep, write and edit for files: read takes a range of lines, and edit changes one exact string in place. Keep bash for running commands. A read, write or edit is decided by the file's path; grep and bash are decided by their command line.";
 
 /// The workspace, canonical: the host shows canonical paths, so rules
 /// must be rooted at the same spelling. Settled before the frontend
@@ -341,10 +340,9 @@ mod tests {
     }
 
     /// The default prompt names the run it describes and not the
-    /// other, and neither ever calls a session "headless" — the
-    /// wording this round retired. Mutation: `default_system_prompt`
-    /// ignoring `mode` makes both branches equal, so the two
-    /// `assert_ne!`s below fail.
+    /// other, and neither calls the run "headless". Mutation:
+    /// `default_system_prompt` ignoring `mode` makes both prompts
+    /// equal, so the `assert_ne!` below fails.
     #[test]
     fn the_default_prompt_says_how_the_run_is_driven() {
         let workspace = PathBuf::from("/tmp/ws");
@@ -363,8 +361,7 @@ mod tests {
         assert_ne!(print, session);
     }
 
-    /// `--system` (and, by the same early return, `--system-file` and
-    /// the config's text) wins over the default in both modes.
+    /// `--system` wins over the default in either mode.
     /// Mutation: check the default before the flag.
     #[test]
     fn explicit_system_text_wins_over_the_default_in_either_mode() {
@@ -391,6 +388,10 @@ mod tests {
             verbose: 0,
         };
         let text = system_prompt(&cli, None, &PathBuf::from("/tmp/ws"), Mode::Interactive)
+            .expect("an explicit --system never touches the filesystem");
+        assert_eq!(text, "mine");
+
+        let text = system_prompt(&cli, None, &PathBuf::from("/tmp/ws"), Mode::Print)
             .expect("an explicit --system never touches the filesystem");
         assert_eq!(text, "mine");
     }

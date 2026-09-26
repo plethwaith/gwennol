@@ -477,6 +477,23 @@ async fn fs_read_numbers_lines_and_keeps_their_endings() {
         .await
         .unwrap();
     assert_eq!(out["r"]["content"], "");
+
+    // A line longer than one `BufReader` fill (8 KiB) spans several
+    // `fill_buf` chunks before its newline; the number must be written
+    // once, on the first chunk, not once per chunk.
+    let long_first_line = "x".repeat(20_000);
+    std::fs::write(
+        f.workspace.join("long-line.txt"),
+        format!("{long_first_line}\nb\n"),
+    )
+    .unwrap();
+    let out = run("numberer", json!({"path": "long-line.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        out["r"]["content"],
+        format!("     1\t{long_first_line}\n     2\tb\n")
+    );
 }
 
 #[tokio::test]
@@ -511,8 +528,7 @@ async fn fs_read_returns_a_line_range() {
 
     // `requests_for` accumulates for the whole process, and other tests
     // here call "lines" too on other files, so this filters to
-    // `ten.txt`'s own canonical path: one `ReadFile` per call above,
-    // ranged or not.
+    // `ten.txt`'s own canonical path: one `ReadFile` per call above.
     let ten = Access::ReadFile(f.workspace.join("ten.txt"));
     assert_eq!(
         f.requests_for("lines")
@@ -565,6 +581,40 @@ async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
     assert!(
         err.to_string().contains("param 'limit' must be at least 1"),
         "{err}"
+    );
+}
+
+#[tokio::test]
+async fn fs_read_is_not_truncated_when_a_range_completes_exactly_at_the_ceiling() {
+    let f = fixture();
+    let path = f.workspace.join("ceiling-exact.bin");
+    {
+        // A skipped first line of zero bytes, `READ_BYTES_CEILING - 1`
+        // bytes long including its own newline, so the wanted second
+        // line ends exactly on the last byte `read_lines`'s `take`
+        // allows (`READ_BYTES_CEILING + 1`).
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING - 2)
+            .unwrap();
+    }
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\nz\n").unwrap();
+    }
+    let out = run(
+        "lines",
+        json!({"path": "ceiling-exact.bin", "offset": 2, "limit": 1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["r"]["content"], "     2\tz\n");
+    assert_eq!(
+        out["r"]["truncated"], false,
+        "the range completed on the same chunk that crossed the ceiling"
     );
 }
 

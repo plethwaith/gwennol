@@ -769,6 +769,7 @@ fn verbose_startup_log_carries_the_frontend_target_in_order() {
         .arg("--config")
         .arg(&config)
         .args(["--trust-runtime", PROVIDER])
+        .args(["--trust-runtime", EDIT])
         .args(["--allow", "read:**"])
         .arg("Say hi."));
     let config_at = r

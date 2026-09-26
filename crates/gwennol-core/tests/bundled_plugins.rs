@@ -1156,6 +1156,33 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
         .await;
     assert_eq!(out["is_error"], true);
     assert_eq!(out["content"], "five.txt has fewer than 9 lines");
+
+    // An empty file at the default offset is a plain, complete read, not
+    // the fewer-lines branch: it never had 1 line to be short of.
+    std::fs::write(f.workspace.join("range-empty.txt"), "").unwrap();
+    let out = f
+        .call_tool("read", json!({"path": "range-empty.txt"}))
+        .await;
+    assert_eq!(
+        out,
+        json!({"content": "", "is_error": false, "truncated": false})
+    );
+
+    // A range past the ceiling on a huge file is empty because the scan
+    // was cut short, not because the file is short of lines: `truncated`
+    // must suppress the fewer-lines branch here too.
+    let ceiling_path = f.workspace.join("range-huge.bin");
+    std::fs::File::create(&ceiling_path)
+        .unwrap()
+        .set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 2)
+        .unwrap();
+    let out = f
+        .call_tool("read", json!({"path": "range-huge.bin", "offset": 2}))
+        .await;
+    assert_eq!(
+        out,
+        json!({"content": "", "is_error": false, "truncated": true})
+    );
 }
 
 /// The committed `edit.json`, read raw: its own script-runtime grant
@@ -1263,10 +1290,12 @@ async fn the_edit_tool_replaces_one_exact_string() {
     );
 }
 
-/// Every way `decide` refuses reaches the model as `is_error` with no
-/// write: not found, several matches, a file over the cap, bytes that
-/// are not UTF-8, a missing file, a directory, and a symlink (approved
-/// as a read of the target, then refused as data on the write).
+/// Each case reaches the model as `is_error` and leaves the file's
+/// bytes unchanged: not found, several matches, a file over the cap and
+/// bytes that are not UTF-8 are `decide`'s refusals; a missing file and
+/// a directory are the read's own miss, passed through; a symlink is
+/// read through to its target, and the write, asked under the link's
+/// own name, is refused as `is_symlink`.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_edit_tool_refuses_without_writing() {
@@ -1285,6 +1314,11 @@ async fn the_edit_tool_refuses_without_writing() {
         std::fs::read_to_string(f.workspace.join("no-match.txt")).unwrap(),
         "abc\n"
     );
+    assert!(
+        !f.asked("no-match.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     std::fs::write(f.workspace.join("several.txt"), "x y x\n").unwrap();
     let out = f
@@ -1295,6 +1329,15 @@ async fn the_edit_tool_refuses_without_writing() {
         .await;
     assert_eq!(out["is_error"], true);
     assert!(out["content"].as_str().unwrap().contains("occurs 2 times"));
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("several.txt")).unwrap(),
+        "x y x\n"
+    );
+    assert!(
+        !f.asked("several.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     let big = "x".repeat((tool_edit::READ_MAX_BYTES + 1) as usize);
     std::fs::write(f.workspace.join("big.txt"), &big).unwrap();
@@ -1312,6 +1355,15 @@ async fn the_edit_tool_refuses_without_writing() {
             .contains("more than the 4194304"),
         "{out}"
     );
+    assert_eq!(
+        std::fs::read(f.workspace.join("big.txt")).unwrap(),
+        big.as_bytes()
+    );
+    assert!(
+        !f.asked("big.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     std::fs::write(f.workspace.join("notutf8.txt"), b"a\xffb").unwrap();
     let out = f
@@ -1326,6 +1378,11 @@ async fn the_edit_tool_refuses_without_writing() {
         std::fs::read(f.workspace.join("notutf8.txt")).unwrap(),
         b"a\xffb"
     );
+    assert!(
+        !f.asked("notutf8.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     let out = f
         .call_tool(
@@ -1335,6 +1392,12 @@ async fn the_edit_tool_refuses_without_writing() {
         .await;
     assert_eq!(out["is_error"], true);
     assert!(out["content"].as_str().unwrap().contains("no such file"));
+    assert!(!f.workspace.join("nope/missing.txt").exists());
+    assert!(
+        !f.asked("missing.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     std::fs::create_dir_all(f.workspace.join("edit-dir")).unwrap();
     let out = f
@@ -1345,6 +1408,12 @@ async fn the_edit_tool_refuses_without_writing() {
         .await;
     assert_eq!(out["is_error"], true);
     assert!(out["content"].as_str().unwrap().contains("is a directory"));
+    assert!(f.workspace.join("edit-dir").is_dir());
+    assert!(
+        !f.asked("edit-dir")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
 
     std::fs::write(f.workspace.join("link-target.txt"), "a\n").unwrap();
     std::os::unix::fs::symlink(
@@ -1369,8 +1438,8 @@ async fn the_edit_tool_refuses_without_writing() {
     );
     // The read followed the link and was approved under the target's
     // own canonical name; the write was approved under the link's own
-    // name (its parent canonical) and then refused as data, since the
-    // read succeeded against the symlink's target.
+    // name (its parent canonical) and then refused as data, because
+    // `host_fs.write` never writes through a symlink.
     assert_eq!(
         f.asked("link-target.txt"),
         vec![Access::ReadFile(

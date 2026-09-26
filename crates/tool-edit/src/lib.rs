@@ -10,10 +10,10 @@
 //! crate's one entry point is the glue that reaches it from the
 //! manifest's resolution context.
 //!
-//! The manifest does the read before this runs and the write after, so
-//! a call is approved as the read and the write of one path — an
-//! access a person or a rule already knows how to judge — rather than
-//! as an opaque script step.
+//! The manifest does the read before this runs and, when this says to
+//! write, the write after, so a call is approved as a read of the file
+//! and at most one write of it — accesses a person or a rule already
+//! knows how to judge — rather than as an opaque script step.
 
 use gwennol_guest::{Args, entrypoints};
 use serde_json::{Value, json};
@@ -60,8 +60,9 @@ pub enum Decision {
 /// than one without `replace_all` refuses naming the count.
 ///
 /// `Err` only for a context that is not the manifest's own: `read`
-/// missing a field this depends on (`outcome`, or — once it is `ok` —
-/// `content`, `truncated` or `lossy`), each named. Malformed like this,
+/// missing a field this depends on (`outcome`; `message` when it is
+/// not `ok`; `content`, `truncated` or `lossy` when it is), each
+/// named. Malformed like this,
 /// nothing this function does is a step the manifest could have
 /// produced, so the caller fails the step rather than answer as data.
 pub fn decide(
