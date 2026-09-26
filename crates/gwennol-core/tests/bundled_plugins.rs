@@ -1157,7 +1157,7 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
     assert_eq!(out["is_error"], true);
     assert_eq!(out["content"], "five.txt has fewer than 9 lines");
 
-    // An empty file at the default offset is a plain, complete read, not
+    // An empty file at the default offset is a complete read, not
     // the fewer-lines branch: it never had 1 line to be short of.
     std::fs::write(f.workspace.join("range-empty.txt"), "").unwrap();
     let out = f
@@ -1169,8 +1169,8 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
     );
 
     // A range past the ceiling on a huge file is empty because the scan
-    // was cut short, not because the file is short of lines: `truncated`
-    // must suppress the fewer-lines branch here too.
+    // was cut short: `truncated` must suppress the fewer-lines branch
+    // here too.
     let ceiling_path = f.workspace.join("range-huge.bin");
     std::fs::File::create(&ceiling_path)
         .unwrap()
@@ -1439,7 +1439,7 @@ async fn the_edit_tool_refuses_without_writing() {
     // The read followed the link and was approved under the target's
     // own canonical name; the write was approved under the link's own
     // name (its parent canonical) and then refused as data, because
-    // `host_fs.write` never writes through a symlink.
+    // `host_fs.write` refuses a destination that is a symlink.
     assert_eq!(
         f.asked("link-target.txt"),
         vec![Access::ReadFile(

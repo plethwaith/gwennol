@@ -342,7 +342,7 @@ mod tests {
     /// The default prompt names the run it describes and not the
     /// other, and neither calls the run "headless". Mutation:
     /// `default_system_prompt` ignoring `mode` makes both prompts
-    /// equal, so the `assert_ne!` below fails.
+    /// equal, so the test fails.
     #[test]
     fn the_default_prompt_says_how_the_run_is_driven() {
         let workspace = PathBuf::from("/tmp/ws");

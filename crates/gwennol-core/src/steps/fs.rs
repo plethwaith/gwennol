@@ -328,9 +328,9 @@ async fn read_lines(
             line_no += 1;
             at_line_start = true;
         }
-        // The range may have just completed on the very chunk that also
-        // crossed the ceiling; checking completion first keeps a range
-        // that ends exactly at the ceiling from being reported truncated.
+        // The range may have just completed on the chunk that also crossed
+        // the ceiling; checking completion first keeps it from being
+        // reported truncated.
         if line_no >= offset && limit.is_some_and(|l| kept >= l) {
             break;
         }

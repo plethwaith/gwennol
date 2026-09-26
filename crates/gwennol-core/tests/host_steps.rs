@@ -585,11 +585,11 @@ async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
 }
 
 #[tokio::test]
-async fn fs_read_is_not_truncated_when_a_range_completes_exactly_at_the_ceiling() {
+async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_crosses_the_ceiling() {
     let f = fixture();
     let path = f.workspace.join("ceiling-exact.bin");
     {
-        // A skipped first line of zero bytes, `READ_BYTES_CEILING - 1`
+        // A skipped first line of NUL bytes, `READ_BYTES_CEILING - 1`
         // bytes long including its own newline, so the wanted second
         // line ends exactly on the last byte `read_lines`'s `take`
         // allows (`READ_BYTES_CEILING + 1`).
