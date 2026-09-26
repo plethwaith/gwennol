@@ -33,7 +33,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::policy::RuleSpec;
-use crate::{Cli, Fatal, frontend};
+use crate::{Cli, Fatal, Mode, frontend};
 use drive::drive;
 use keys::TerminalKeys;
 use operator::Interactive;
@@ -62,6 +62,7 @@ pub fn start(
         cli,
         workspace,
         flag_rules,
+        Mode::Interactive,
         |policy, secrets, workspace| {
             Arc::new(Interactive::new(
                 policy,
@@ -153,6 +154,8 @@ mod tests {
             plugins_dir.to_str().unwrap(),
             "--trust-runtime",
             provider_anthropic::PLUGIN_NAME,
+            "--trust-runtime",
+            tool_edit::PLUGIN_NAME,
             "--config",
             config_path.to_str().unwrap(),
             "--secret",

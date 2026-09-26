@@ -26,6 +26,7 @@ export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/some/repo
 /path/to/gwennol/target/debug/gwennol -p \
     --trust-runtime provider-anthropic \
+    --trust-runtime tool-edit \
     --allow 'http:POST https://api.anthropic.com/*' \
     --allow 'read:**' --allow 'spawn:grep *' \
     'What does the README say this project is for?'
@@ -40,8 +41,8 @@ prefixed `gwennol:`:
 gwennol: POST https://api.anthropic.com/v1/messages from provider-anthropic: allowed by --allow "http:POST https://api.anthropic.com/*"
 gwennol: -> read toolu_01: {"path":"README.md"}
 gwennol: read /path/to/some/repo/README.md from tool-read (call read toolu_01): allowed by --allow "read:**"
-gwennol: <- read toolu_01: ok, 2140 bytes
-    # some-repo  some-repo turns a pile of one-off scripts into one binary that watches a directory, rebuilds on change, and reports failures to a channel a team already reads, instead of a shared drive n…
+gwennol: <- read toolu_01: ok, 236 bytes
+         1	# some-repo      2	      3	some-repo turns a pile of one-off scripts into one binary that watches a directory, rebuilds on change, and reports failures to a channel a team already reads, instea…
 gwennol: -> bash toolu_02: {"command":"cargo test"}
 gwennol: spawn ["bash","-c","cargo test"] from tool-bash (call bash toolu_02): denied: no rule matched
 gwennol: !! bash toolu_02: "bash" failed before producing a result: Execution error: operator denied spawn of bash for plugin 'tool-bash'
@@ -63,9 +64,10 @@ judged the full URL.
 The plugins directory is found from `--plugins`, `$GWENNOL_PLUGINS`,
 the config file, or `target/bundle/plugins` beside a `cargo`-built
 binary, in that order. `--trust-runtime` (or the config's
-`trust_runtimes`) is required for the bundled provider: it supplies its
-own script runtime, and Gwead's rule is that the embedder must say so
-as well as the manifest ([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
+`trust_runtimes`) is required for the bundled provider and the `edit`
+tool: each supplies its own script runtime, and Gwead's rule is that
+the embedder must say so as well as the manifest
+([docs/SUBSTRATE.md](../../docs/SUBSTRATE.md)).
 
 ## Session
 
@@ -206,6 +208,11 @@ The trace shows a spawn's argv as a JSON array, so where each argument
 ends is unambiguous even though the pattern matches the space-joined
 form.
 
+The bundled `edit` tool asks twice for one call, as `tool-edit`: a
+`read` of the file, then a `write` of it, each decided like any other
+read or write. A rule that names `plugin = "tool-write"` does not
+cover it.
+
 ## Config file
 
 `--config FILE`, else `$XDG_CONFIG_HOME/gwennol/config.toml`
@@ -218,11 +225,11 @@ section is optional; flags override fields one by one.
 ```toml
 [plugins]
 dir = "/path/to/gwennol/target/bundle/plugins"
-trust_runtimes = ["provider-anthropic"]
+trust_runtimes = ["provider-anthropic", "tool-edit"]
 
 [session]
 provider = "provider-anthropic"   # only needed when several are loaded
-system_file = "system.md"         # or system = "…"; default names the workspace
+system_file = "system.md"         # or system = "…"; default names the workspace and says whether this is a session or a print run
 max_tokens = 8192
 max_rounds = 32
 stream = true

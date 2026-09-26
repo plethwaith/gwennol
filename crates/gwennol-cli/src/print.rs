@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::operator::Headless;
 use crate::policy::RuleSpec;
 use crate::show::outcome_line;
-use crate::{Cli, EXIT_CANCELLED, Fatal, frontend};
+use crate::{Cli, EXIT_CANCELLED, Fatal, Mode, frontend};
 
 /// Run the one task in `cli.prompt` (or stdin) to completion.
 pub async fn run(
@@ -40,6 +40,7 @@ pub async fn run(
         &cli,
         workspace,
         flag_rules,
+        Mode::Print,
         |policy, secrets, workspace| {
             Arc::new(Headless::new(
                 policy,

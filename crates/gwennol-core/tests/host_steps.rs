@@ -149,6 +149,22 @@ fn fixture_plugins() -> Vec<Value> {
             json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}", "max_bytes": "{{$input.max_bytes}}"}}]),
         ),
         plugin(
+            "lines",
+            &["step_type:host_fs.read"],
+            json!([{"id": "r", "type": "host_fs.read", "params": {
+                "path": "{{$input.path}}",
+                "max_bytes": "{{$input.max_bytes ?? 1048576}}",
+                "offset": "{{$input.offset ?? 1}}",
+                "limit": "{{$input.limit ?? 67108864}}",
+                "number_lines": "{{$input.number_lines ?? true}}"
+            }}]),
+        ),
+        plugin(
+            "numberer",
+            &["step_type:host_fs.read"],
+            json!([{"id": "r", "type": "host_fs.read", "params": {"path": "{{$input.path}}", "number_lines": true}}]),
+        ),
+        plugin(
             "writer",
             &["step_type:host_fs.write", "step_type:host_fs.list"],
             json!([
@@ -442,6 +458,136 @@ async fn fs_read_truncates_on_utf8_boundary() {
     assert_eq!(out["r"]["content"], "h");
     assert_eq!(out["r"]["truncated"], true);
     assert_eq!(out["r"]["size"], 6);
+}
+
+#[tokio::test]
+async fn fs_read_numbers_lines_and_keeps_their_endings() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("ab.txt"), "a\nb").unwrap();
+    let out = run("numberer", json!({"path": "ab.txt"})).await.unwrap();
+    assert_eq!(out["r"]["content"], "     1\ta\n     2\tb");
+    assert_eq!(out["r"]["lossy"], false);
+
+    std::fs::write(f.workspace.join("crlf.txt"), "x\r\n").unwrap();
+    let out = run("numberer", json!({"path": "crlf.txt"})).await.unwrap();
+    assert_eq!(out["r"]["content"], "     1\tx\r\n");
+
+    std::fs::write(f.workspace.join("empty-numbered.txt"), "").unwrap();
+    let out = run("numberer", json!({"path": "empty-numbered.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "");
+}
+
+#[tokio::test]
+async fn fs_read_returns_a_line_range() {
+    let f = fixture();
+    let content: String = (1..=10).map(|n| format!("l{n}\n")).collect();
+    std::fs::write(f.workspace.join("ten.txt"), &content).unwrap();
+
+    let out = run("lines", json!({"path": "ten.txt", "offset": 3, "limit": 2}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "     3\tl3\n     4\tl4\n");
+    assert_eq!(out["r"]["truncated"], false);
+
+    let out = run("lines", json!({"path": "ten.txt", "offset": 9, "limit": 5}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "     9\tl9\n    10\tl10\n");
+    assert_eq!(out["r"]["truncated"], false);
+
+    let out = run("lines", json!({"path": "ten.txt", "offset": 11}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "");
+    assert_eq!(out["r"]["truncated"], false);
+    assert_eq!(
+        out["r"]["size"],
+        std::fs::metadata(f.workspace.join("ten.txt"))
+            .unwrap()
+            .len()
+    );
+
+    // `requests_for` accumulates for the whole process, and other tests
+    // here call "lines" too on other files, so this filters to
+    // `ten.txt`'s own canonical path: one `ReadFile` per call above,
+    // ranged or not.
+    let ten = Access::ReadFile(f.workspace.join("ten.txt"));
+    assert_eq!(
+        f.requests_for("lines")
+            .into_iter()
+            .filter(|a| *a == ten)
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn fs_read_cuts_a_numbered_range_at_max_bytes() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("elan.txt"), "é\né\né\né\n").unwrap();
+    let out = run("lines", json!({"path": "elan.txt", "max_bytes": 10}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "     1\té\n");
+    assert!(out["r"]["content"].as_str().unwrap().len() <= 10);
+    assert_eq!(out["r"]["truncated"], true);
+}
+
+#[tokio::test]
+async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
+    let f = fixture();
+    let path = f.workspace.join("huge.bin");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 2)
+            .unwrap();
+    }
+    let out = run("lines", json!({"path": "huge.bin", "offset": 2}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "");
+    assert_eq!(out["r"]["truncated"], true, "the ceiling stopped the scan");
+
+    let err = run("lines", json!({"path": "huge.bin", "offset": 0}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("param 'offset' counts lines from 1"),
+        "{err}"
+    );
+
+    let err = run("lines", json!({"path": "huge.bin", "limit": 0}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("param 'limit' must be at least 1"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn fs_read_reports_bytes_that_are_not_utf8() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("bad.bin"), b"a\xffb").unwrap();
+    let out = run("reader", json!({"path": "bad.bin", "max_bytes": 100}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["lossy"], true);
+    assert_eq!(out["r"]["content"], "a\u{FFFD}b");
+
+    std::fs::write(f.workspace.join("clean.txt"), "hello, weaver\n").unwrap();
+    let out = run("reader", json!({"path": "clean.txt", "max_bytes": 100}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["lossy"], false);
+
+    let out = run("lines", json!({"path": "bad.bin", "max_bytes": 100}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["lossy"], true, "the line path detects it too");
 }
 
 #[tokio::test]

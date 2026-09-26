@@ -17,6 +17,7 @@
 
 mod common;
 use common::{API_KEY, Stub, stub, thinking_block};
+use gwennol::frontend;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -24,6 +25,7 @@ use std::sync::OnceLock;
 
 use provider_anthropic::PLUGIN_NAME as PROVIDER;
 use serde_json::{Value, json};
+use tool_edit::PLUGIN_NAME as EDIT;
 
 /// The convention variable for the provider's key.
 const KEY_VAR: &str = "GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY";
@@ -78,10 +80,11 @@ impl Fixture {
         std::fs::write(
             &path,
             format!(
-                "[plugins]\ndir = {plugins:?}\ntrust_runtimes = [{provider:?}]\n\n\
+                "[plugins]\ndir = {plugins:?}\ntrust_runtimes = [{provider:?}, {edit:?}]\n\n\
                  [plugin_config.{provider}]\nmodel = \"claude-fixture\"\nbase_url = \"http://{addr}{route}\"\n\n{extra}",
                 plugins = self.plugins.display().to_string(),
                 provider = PROVIDER,
+                edit = EDIT,
                 addr = self.stub.addr,
             ),
         )
@@ -197,7 +200,7 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
     // line ended when the tool call interrupted it, then the answer.
     assert_eq!(
         r.stdout,
-        "Let me read it.\nIt says: hello from the workspace\n"
+        "Let me read it.\nIt says:      1\thello from the workspace\n"
     );
 
     // Every decision, with the rule that made it.
@@ -211,7 +214,7 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
     ));
     // The call and its result, as the model saw them.
     r.stderr_has("gwennol: -> read toolu_01: {\"path\":\"hello.txt\"}");
-    r.stderr_has("gwennol: <- read toolu_01: ok, 25 bytes");
+    r.stderr_has("gwennol: <- read toolu_01: ok, 32 bytes");
     r.stderr_has("gwennol: done (EndTurn): 2 rounds, 52 tokens in, 26 out");
     // No prompt exists: nothing on stderr asks anything.
     assert!(!r.stderr.contains('?'), "{}", r.stderr);
@@ -241,12 +244,11 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
     assert_eq!(messages[2]["content"][0]["is_error"], false);
     // The system prompt names the workspace, so the model knows where
     // relative paths go.
-    assert!(
-        follow_up["system"]
-            .as_str()
-            .unwrap()
-            .contains(&f.workspace.display().to_string())
-    );
+    let system = follow_up["system"].as_str().unwrap();
+    assert!(system.contains(&f.workspace.display().to_string()));
+    // A print run, not a session: `print::run` passes `Mode::Print`.
+    assert!(system.contains(frontend::PRINT_RUN), "{system}");
+    assert!(!system.contains(frontend::SESSION), "{system}");
 
     // The transcript file is the conversation as the provider saw it:
     // the whole chat input — system prompt, tools, settings — with the
@@ -263,7 +265,7 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["bash", "grep", "read", "write"]);
+    assert_eq!(tools, ["bash", "edit", "grep", "read", "write"]);
     let messages = saved["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[1]["content"][0]["type"], "opaque");
@@ -310,7 +312,7 @@ fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
     assert!(done < failed, "{}", r.stderr);
     assert_eq!(
         r.stdout,
-        "Let me read it.\nIt says: hello from the workspace\n"
+        "Let me read it.\nIt says:      1\thello from the workspace\n"
     );
 
     // A failed turn keeps its own status: without a key the vendor
@@ -382,7 +384,7 @@ fn a_retried_round_is_not_written_twice() {
     // rounds only, and nothing twice.
     assert_eq!(
         r.stdout,
-        "Let me read it.\nIt says: hello from the workspace\n"
+        "Let me read it.\nIt says:      1\thello from the workspace\n"
     );
     assert!(!r.stdout.contains("so far"), "{}", r.stdout);
 }
@@ -555,7 +557,8 @@ fn plugins_and_trust_come_from_flags_too() {
         .env(KEY_VAR, API_KEY)
         .arg("--plugins")
         .arg(&f.plugins)
-        .args(["--trust-runtime", PROVIDER, "--model", "claude-fixture"])
+        .args(["--trust-runtime", PROVIDER])
+        .args(["--trust-runtime", EDIT, "--model", "claude-fixture"])
         .args(["--allow", &f.allow_stub()])
         .arg("Say hi."));
     // The provider's default base_url is the real API, which the stub
@@ -592,6 +595,17 @@ fn plugins_and_trust_come_from_flags_too() {
     let r = run(f.gwennol().arg("--plugins").arg(&f.plugins).arg("Say hi."));
     assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
     r.stderr_has("anthropic.json: ");
+
+    // The provider trusted and not the edit tool: registration reaches
+    // `tools/` and fails there instead, naming its own file.
+    let r = run(f
+        .gwennol()
+        .arg("--plugins")
+        .arg(&f.plugins)
+        .args(["--trust-runtime", PROVIDER])
+        .arg("Say hi."));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    r.stderr_has("edit.json: ");
 }
 
 #[cfg(unix)]
@@ -813,7 +827,7 @@ fn without_a_terminal_the_binary_runs_in_print_mode_and_says_so() {
     assert!(r.status.success(), "{:?}", r.status);
     assert_eq!(
         r.stdout,
-        "Let me read it.\nIt says: hello from the workspace\n"
+        "Let me read it.\nIt says:      1\thello from the workspace\n"
     );
     let first_line = r.stderr.lines().next().unwrap_or_default();
     assert_eq!(first_line, gwennol::NO_TERMINAL_NOTICE);

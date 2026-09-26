@@ -28,8 +28,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::dir::{Dir, Hold, Kind};
 use super::{
-    StepFuture, bool_param, cancelled, capped, lossy_capped, or_cancelled, resolve, str_param,
-    u64_param,
+    Capped, StepFuture, bool_param, cancelled, capped, lossy_capped, or_cancelled, resolve,
+    str_param, u64_param,
 };
 use crate::host::{approval, approve, resolve_path};
 use crate::operator::Access;
@@ -113,8 +113,9 @@ impl Outcome {
     }
 }
 
-/// `host_fs.read`: `{path, max_bytes?}` → `{outcome: "ok", content,
-/// truncated, size}`, or `{outcome, message}` for a miss.
+/// `host_fs.read`: `{path, max_bytes?, offset?, limit?, number_lines?}` →
+/// `{outcome: "ok", content, truncated, size, lossy}`, or `{outcome,
+/// message}` for a miss.
 ///
 /// The operator is shown the *canonical* path — symlinks resolved — and
 /// the step verifies, by device and inode, that it names the very file
@@ -125,7 +126,16 @@ impl Outcome {
 /// byte past `max_bytes` leaves the file, so a huge file cannot balloon the
 /// host and a special file that never ends still terminates. `size` is the
 /// size the filesystem reports, which for such a file may not be the number
-/// of bytes a full read would produce.
+/// of bytes a full read would produce. `lossy` says whether bytes that are
+/// not UTF-8 were replaced in `content`, so writing it back would not
+/// reproduce the file.
+///
+/// With `offset`, `limit` or `number_lines`, the file is read line by line
+/// from its start: lines before `offset` are read and dropped, at most
+/// `READ_BYTES_CEILING` bytes are scanned, and the output (line numbers
+/// included) is cut at `max_bytes`; `truncated` says either cut happened.
+/// With none of them, or `offset: 1` alone, this is byte-for-byte the plain
+/// read above.
 pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -134,6 +144,25 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             u64_param(&p, "max_bytes", DEFAULT_READ_MAX_BYTES)?,
             READ_BYTES_CEILING,
         );
+        let offset = u64_param(&p, "offset", 1)?;
+        if offset == 0 {
+            return Err(StepError::Failed(
+                "param 'offset' counts lines from 1".into(),
+            ));
+        }
+        let limit = match p.get("limit") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    StepError::Failed("param 'limit' must be a non-negative integer".into())
+                })?;
+                if n == 0 {
+                    return Err(StepError::Failed("param 'limit' must be at least 1".into()));
+                }
+                Some(n)
+            }
+        };
+        let numbered = bool_param(&p, "number_lines", false)?;
         let cancel = ex.cancel_token();
         // Opened before the approval so the approval can describe the very
         // file this handle holds; opening for read has no side effects.
@@ -210,29 +239,104 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
             return Ok(Outcome::IsDirectory.result(&path));
         }
         let size = meta.len();
-        let read = async {
-            let mut bytes = Vec::new();
-            // One byte past the cap distinguishes "exactly the cap" from
-            // "truncated" without reading the rest. The cap is already
-            // clamped; saturating so the arithmetic cannot wrap even for
-            // an unclamped caller.
-            file.take((max as u64).saturating_add(1))
-                .read_to_end(&mut bytes)
-                .await?;
-            std::io::Result::Ok(bytes)
+        let ranged = numbered || offset != 1 || limit.is_some();
+        let (bytes, scan_cut) = if ranged {
+            or_cancelled(&cancel, read_lines(file, offset, limit, numbered, max))
+                .await?
+                .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?
+        } else {
+            let read = async {
+                let mut bytes = Vec::new();
+                // One byte past the cap distinguishes "exactly the cap" from
+                // "truncated" without reading the rest. The cap is already
+                // clamped; saturating so the arithmetic cannot wrap even for
+                // an unclamped caller.
+                file.take((max as u64).saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .await?;
+                std::io::Result::Ok(bytes)
+            };
+            let bytes = or_cancelled(&cancel, read)
+                .await?
+                .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
+            (bytes, false)
         };
-        let bytes = or_cancelled(&cancel, read)
-            .await?
-            .map_err(|e| StepError::Failed(format!("read {}: {e}", path.display())))?;
-        let (content, truncated) = lossy_capped(&bytes, max);
+        let Capped {
+            text: content,
+            truncated,
+            lossy,
+        } = lossy_capped(&bytes, max);
+        let truncated = truncated || scan_cut;
         Ok(json!({
             "outcome": OUTCOME_OK,
             "content": content,
             "truncated": truncated,
             "size": size,
+            "lossy": lossy,
         })
         .into())
     })
+}
+
+/// A line range from `file`: lines before `offset` (1-based) are consumed
+/// and dropped, never buffered whole; each kept line is prefixed with its
+/// number (right-aligned in six columns, then a tab) when `numbered`,
+/// keeping its own line ending (`\n` stays; `\r` before it is kept too).
+/// Reading stops when the range is complete, at end of file, once the
+/// output exceeds `max` by one byte, or once more than
+/// [`READ_BYTES_CEILING`] bytes of the file have been consumed — the
+/// second element of the result says whether that ceiling stopped it.
+async fn read_lines(
+    file: tokio::fs::File,
+    offset: u64,
+    limit: Option<u64>,
+    numbered: bool,
+    max: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut reader = tokio::io::BufReader::new(file.take(READ_BYTES_CEILING + 1));
+    let mut out: Vec<u8> = Vec::new();
+    let mut line_no: u64 = 1;
+    let mut kept: u64 = 0;
+    let mut consumed: u64 = 0;
+    let mut at_line_start = true;
+    let mut scan_cut = false;
+    loop {
+        if line_no >= offset && limit.is_some_and(|l| kept >= l) {
+            break;
+        }
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            break;
+        }
+        let newline_at = buf.iter().position(|&b| b == b'\n');
+        let chunk_len = newline_at.map_or(buf.len(), |i| i + 1);
+        let in_range = line_no >= offset && limit.is_none_or(|l| kept < l);
+        if in_range {
+            if at_line_start && numbered {
+                out.extend_from_slice(format!("{line_no:>6}\t").as_bytes());
+            }
+            out.extend_from_slice(&buf[..chunk_len]);
+            at_line_start = false;
+        }
+        consumed += chunk_len as u64;
+        reader.consume(chunk_len);
+        if newline_at.is_some() {
+            if in_range {
+                kept += 1;
+            }
+            line_no += 1;
+            at_line_start = true;
+        }
+        if consumed > READ_BYTES_CEILING {
+            scan_cut = true;
+            break;
+        }
+        if in_range && out.len() > max {
+            break;
+        }
+    }
+    Ok((out, scan_cut))
 }
 
 /// Resolve a path that need not exist: the deepest ancestor that

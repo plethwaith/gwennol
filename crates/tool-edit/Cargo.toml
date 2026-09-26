@@ -1,0 +1,26 @@
+# The bundled `edit` tool's guest code: the exact-string replacement
+# `plugins/tools/edit.json` cannot express declaratively, compiled to
+# wasm32 and occupying the plugin's own script-runtime slot. The
+# manifest does every read and write; this crate decides what to write
+# and reaches nothing. Compiled for the host target only so lints,
+# docs and the unit tests cover it.
+[package]
+name = "tool-edit"
+description = "Gwennol's bundled edit tool: exact-string replacement, guest-side, reaching nothing else."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+# cdylib is the wasm module; rlib keeps `cargo test` able to link the
+# unit tests and lets the integration suite import the exported names.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gwennol-guest = { path = "../gwennol-guest" }
+serde_json.workspace = true

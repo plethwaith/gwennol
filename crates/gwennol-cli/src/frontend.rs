@@ -1,14 +1,11 @@
-//! What a run settles before its `Operator` drives a turn, and which
-//! is the same for any `Operator`, except the default system prompt
-//! below, which describes a headless run: an interactive frontend
-//! needs its own, and `start` would have to grow a parameter for it,
-//! since its sources are fixed (`system_prompt` states them). What is
-//! shared: the workspace, the config and policy files, the compiled
-//! policy, the secret sources, the plugins and their manifests, the
-//! process environment, the kernel, and the session. A second
-//! frontend added to this binary calls the same two functions and
-//! supplies its own `Operator` in the closure, so it copies none of
-//! this.
+//! What a run settles before its `Operator` drives a turn: the
+//! workspace, the config and policy files, the compiled policy, the
+//! secret sources, the plugins and their manifests, the process
+//! environment, the kernel, and the session. The one thing that
+//! differs by frontend is the default system prompt, which says how
+//! the run is driven, so `start` takes the `Mode`. Both frontends call
+//! the same two functions and supply their own `Operator` in the
+//! closure, so neither copies any of this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +19,17 @@ use serde_json::Value;
 use crate::config::{Config, EnvMode, Loaded, PolicyFile};
 use crate::policy::{Policy, RuleSpec};
 use crate::secrets::{self, Secrets};
-use crate::{Cli, Fatal, plugins};
+use crate::{Cli, Fatal, Mode, plugins};
+
+/// How the default system prompt describes a print run.
+pub const PRINT_RUN: &str = "This is a print run: one task, and no one to ask. Every request to read, change or run something is allowed or denied by rules set before the run, and a request no rule matches is denied.";
+
+/// How the default system prompt describes a session.
+pub const SESSION: &str = "This is an interactive session: a person reads your output as it arrives and sends each turn. Every request to read, change or run something is decided by a rule, or put to that person when no rule decides it.";
+
+/// What the default system prompt says about files and commands, in
+/// either mode.
+pub const FILE_TOOLS: &str = "Use read, grep, write and edit for files: read takes a range of lines, and edit changes one exact string in place. Keep bash for running commands. A file request is decided by its path and is more often allowed by a rule; a bash command is judged whole, by its command line.";
 
 /// The workspace, canonical: the host shows canonical paths, so rules
 /// must be rooted at the same spelling. Settled before the frontend
@@ -52,10 +59,12 @@ pub fn workspace(cli: &Cli) -> Result<PathBuf, Fatal> {
 /// mode's default, and a session asks instead. Other warnings raised
 /// while starting (`policy::walk`'s unresolvable-prefix one) go only
 /// to the log too. The returned session has run no turn.
+/// `mode` picks the default system prompt's description of the run.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
+    mode: Mode,
     operator: impl FnOnce(Policy, &Secrets, &Path) -> Arc<dyn Operator>,
     warnings: &mut Vec<String>,
 ) -> Result<Session, Fatal> {
@@ -179,7 +188,7 @@ pub fn start(
             .or_insert_with(|| Value::Object(Default::default()))["model"] =
             Value::String(model.clone());
     }
-    let system = system_prompt(cli, config.as_ref(), &workspace)?;
+    let system = system_prompt(cli, config.as_ref(), &workspace, mode)?;
     let session_file = config.as_ref().map(|c| &c.value.session);
     let mut session_config = SessionConfig {
         provider,
@@ -218,6 +227,7 @@ fn system_prompt(
     cli: &Cli,
     config: Option<&Loaded<Config>>,
     workspace: &Path,
+    mode: Mode,
 ) -> Result<String, Fatal> {
     if let Some(text) = &cli.system {
         return Ok(text.clone());
@@ -233,7 +243,7 @@ fn system_prompt(
             return read_prompt(&file.resolve(path));
         }
     }
-    Ok(default_system_prompt(workspace))
+    Ok(default_system_prompt(workspace, mode))
 }
 
 fn read_prompt(path: &Path) -> Result<String, Fatal> {
@@ -241,15 +251,20 @@ fn read_prompt(path: &Path) -> Result<String, Fatal> {
         .map_err(|e| Fatal(format!("system prompt {}: {e}", path.display())))
 }
 
-/// What the model is told when nothing else is configured.
-fn default_system_prompt(workspace: &Path) -> String {
+/// What the model is told when nothing else is configured: where it
+/// is, how the run is driven, and which tools to use for files.
+/// Written for the bundled tools.
+fn default_system_prompt(workspace: &Path, mode: Mode) -> String {
+    let run = match mode {
+        Mode::Print => PRINT_RUN,
+        Mode::Interactive => SESSION,
+    };
     format!(
-        "You are Gwennol, a coding agent working headlessly in the directory {}. \
+        "You are Gwennol, a coding agent working in the directory {}. \
          Relative paths resolve against that directory and commands run in it. \
-         Use the tools to read, search and change files and to run commands; \
-         some requests may be refused by policy, in which case work around them \
-         or say what you could not do. Act on the task directly, then report \
-         what you did.",
+         {run} {FILE_TOOLS} When a request is refused, work around it or say \
+         what you could not do. Act on the task directly, then report what \
+         you did.",
         workspace.display()
     )
 }
@@ -301,6 +316,7 @@ mod tests {
             &cli,
             PathBuf::from(".").canonicalize().unwrap(),
             Vec::new(),
+            Mode::Print,
             |policy, secrets, workspace| {
                 called.store(true, Ordering::SeqCst);
                 Arc::new(Headless::new(
@@ -322,5 +338,60 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "the operator factory ran before the plugins failed to load"
         );
+    }
+
+    /// The default prompt names the run it describes and not the
+    /// other, and neither ever calls a session "headless" — the
+    /// wording this round retired. Mutation: `default_system_prompt`
+    /// ignoring `mode` makes both branches equal, so the two
+    /// `assert_ne!`s below fail.
+    #[test]
+    fn the_default_prompt_says_how_the_run_is_driven() {
+        let workspace = PathBuf::from("/tmp/ws");
+        let print = default_system_prompt(&workspace, Mode::Print);
+        assert!(print.contains(PRINT_RUN), "{print}");
+        assert!(print.contains(FILE_TOOLS), "{print}");
+        assert!(print.contains("/tmp/ws"), "{print}");
+        assert!(!print.contains(SESSION), "{print}");
+        assert!(!print.to_lowercase().contains("headless"), "{print}");
+
+        let session = default_system_prompt(&workspace, Mode::Interactive);
+        assert!(session.contains(SESSION), "{session}");
+        assert!(session.contains(FILE_TOOLS), "{session}");
+        assert!(!session.contains(PRINT_RUN), "{session}");
+        assert!(!session.to_lowercase().contains("headless"), "{session}");
+        assert_ne!(print, session);
+    }
+
+    /// `--system` (and, by the same early return, `--system-file` and
+    /// the config's text) wins over the default in both modes.
+    /// Mutation: check the default before the flag.
+    #[test]
+    fn explicit_system_text_wins_over_the_default_in_either_mode() {
+        let cli = Cli {
+            prompt: None,
+            workspace: None,
+            config: None,
+            policy: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            plugins: None,
+            trust_runtime: Vec::new(),
+            secret: Vec::new(),
+            provider: None,
+            model: None,
+            system: Some("mine".to_string()),
+            system_file: None,
+            max_tokens: None,
+            max_rounds: None,
+            no_stream: false,
+            transcript: None,
+            print: false,
+            log: None,
+            verbose: 0,
+        };
+        let text = system_prompt(&cli, None, &PathBuf::from("/tmp/ws"), Mode::Interactive)
+            .expect("an explicit --system never touches the filesystem");
+        assert_eq!(text, "mine");
     }
 }

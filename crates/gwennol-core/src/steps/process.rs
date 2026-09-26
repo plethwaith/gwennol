@@ -7,7 +7,7 @@ use gwead::kernel::{PluginExecution, StepError};
 use gwead::serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{StepFuture, cancelled, capped, lossy_capped, resolve, u64_param};
+use super::{Capped, StepFuture, cancelled, capped, lossy_capped, resolve, u64_param};
 use crate::host::{approval, approve, host, resolve_path};
 use crate::operator::Access;
 
@@ -203,8 +203,16 @@ pub fn process_run<'a>(
                 return Err(cancelled());
             }
         };
-        let (stdout, stdout_truncated) = lossy_capped(&stdout_bytes, max);
-        let (stderr, stderr_truncated) = lossy_capped(&stderr_bytes, max);
+        let Capped {
+            text: stdout,
+            truncated: stdout_truncated,
+            ..
+        } = lossy_capped(&stdout_bytes, max);
+        let Capped {
+            text: stderr,
+            truncated: stderr_truncated,
+            ..
+        } = lossy_capped(&stderr_bytes, max);
         Ok(json!({
             "status": status.code(),
             "stdout": stdout,

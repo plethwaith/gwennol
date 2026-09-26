@@ -1,0 +1,92 @@
+{
+  "formatVersion": 1,
+  "name": "tool-edit",
+  "version": "0.1.0",
+  "description": "The `edit` tool: a host_fs.read of the whole file, guest code that replaces one exact string (crates/tool-edit, filled in by `cargo xtask bundle`), and a host_fs.write when the guest says to write, each outcome branched on as data. Reaches nothing else; the guest reaches nothing at all.",
+  "roles": ["TOOL"],
+  "permissions": ["provide:step_type:script:tool-edit", "step_type:host_fs.read", "step_type:host_fs.write"],
+  "wasmModules": {
+    "guest": { "path": "crates/tool-edit" }
+  },
+  "stepTypeImpls": [
+    { "stepType": "script", "matches": "tool-edit", "wasmModule": "guest" }
+  ],
+  "actions": {
+    "call": {
+      "tool": {
+        "name": "edit",
+        "description": "Replace one exact string in a file with another. old_string must occur exactly once, unless replace_all is set, which replaces every occurrence. Copy old_string from the file itself, whitespace included and without the line numbers read adds. The whole file is read (at most 4194304 bytes) and written back atomically, keeping its permissions; a file that is larger, or not UTF-8 text, is refused unchanged.",
+        "parameters": {
+          "type": "object",
+          "required": ["path", "old_string", "new_string"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "description": "File path, absolute or relative to the workspace root." },
+            "old_string": { "type": "string", "minLength": 1, "description": "The exact text to replace." },
+            "new_string": { "type": "string", "description": "The text to put in its place." },
+            "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring exactly one (default false)." }
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": "read",
+          "type": "host_fs.read",
+          "params": { "path": "{{$input.path}}", "max_bytes": 4194304 }
+        },
+        {
+          "id": "decide",
+          "type": "script",
+          "params": { "language": "tool-edit", "source": "replace" }
+        },
+        {
+          "id": "answer",
+          "type": "ifs",
+          "params": { "ifs": [
+            {
+              "test": "$steps.decide.result.write == true",
+              "then": [
+                {
+                  "id": "write",
+                  "type": "host_fs.write",
+                  "params": { "path": "{{$input.path}}", "content": "{{$steps.decide.result.content}}" }
+                },
+                {
+                  "id": "written",
+                  "type": "ifs",
+                  "params": { "ifs": [
+                    {
+                      "test": "$steps.write.result.outcome == 'ok'",
+                      "then": [
+                        { "id": "ok", "type": "return", "params": { "value": {
+                          "content": "{{$steps.decide.result.message}}",
+                          "is_error": false
+                        } } }
+                      ]
+                    },
+                    {
+                      "then": [
+                        { "id": "miss", "type": "return", "params": { "value": {
+                          "content": "{{$steps.write.result.message}}",
+                          "is_error": true
+                        } } }
+                      ]
+                    }
+                  ] }
+                }
+              ]
+            },
+            {
+              "then": [
+                { "id": "refused", "type": "return", "params": { "value": {
+                  "content": "{{$steps.decide.result.message}}",
+                  "is_error": true
+                } } }
+              ]
+            }
+          ] }
+        }
+      ]
+    }
+  }
+}
