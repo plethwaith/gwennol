@@ -41,6 +41,7 @@ gwennol: POST https://api.anthropic.com/v1/messages from provider-anthropic: all
 gwennol: -> read toolu_01: {"path":"README.md"}
 gwennol: read /path/to/some/repo/README.md from tool-read (call read toolu_01): allowed by --allow "read:**"
 gwennol: <- read toolu_01: ok, 2140 bytes
+    # some-repo  some-repo turns a pile of one-off scripts into one binary that watches a directory, rebuilds on change, and reports failures to a channel a team already reads, instead of a shared drive n…
 gwennol: -> bash toolu_02: {"command":"cargo test"}
 gwennol: spawn ["bash","-c","cargo test"] from tool-bash (call bash toolu_02): denied: no rule matched
 gwennol: !! bash toolu_02: "bash" failed before producing a result: Execution error: operator denied spawn of bash for plugin 'tool-bash'
