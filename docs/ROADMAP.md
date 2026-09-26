@@ -373,7 +373,8 @@ prompt exists to paper over it.
   the tool call behind each request, and cancelling mid-stream works.
 - **Settled: interactive by default; `-p` is the print run.**
   `gwennol [options] [prompt]` opens a session, a prompt argument its
-  first turn; `-p`/`--print` is milestone 6's one-turn run, unchanged,
+  first turn (a `-` or whitespace-only prompt starts the editor
+  empty); `-p`/`--print` is milestone 6's one-turn run, unchanged,
   and so is any run without a terminal on stdin or stdout, which says
   so on stderr — prompting needs a person, and denying by rule is the
   safe direction.
