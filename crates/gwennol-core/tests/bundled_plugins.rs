@@ -1530,9 +1530,9 @@ async fn the_edit_tool_writes_template_syntax_verbatim() {
     );
 }
 
-/// A file right at the cap the guest's fixed 64 MiB memory and 1 B
-/// fuel must still tolerate: one unique marker line replaced, the rest
-/// kept, the file's size unchanged.
+/// A file right at the cap the guest's fixed 64 MiB memory and
+/// 1,000,000,000 fuel units must still tolerate: one unique marker
+/// line replaced, the rest kept, the file's size unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_edit_tool_edits_a_file_at_its_cap() {
     let f = fixture();
