@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::{
-    StepFuture, bool_param, cancelled, capped, lossy_capped, resolve, str_param, u64_param,
+    Capped, StepFuture, bool_param, cancelled, capped, lossy_capped, resolve, str_param, u64_param,
 };
 use crate::host::{approval, approve};
 use crate::operator::Access;
@@ -462,7 +462,11 @@ fn request<'a>(
                 break;
             }
         }
-        let (body, truncated) = lossy_capped(&bytes, max);
+        let Capped {
+            text: body,
+            truncated,
+            ..
+        } = lossy_capped(&bytes, max);
         Ok(StepOutput::with_metadata(
             json!({"status": status, "body": body, "truncated": truncated}),
             metadata,

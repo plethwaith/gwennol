@@ -1,5 +1,5 @@
 //! End to end: the committed manifests under `plugins/`
-//! — the Anthropic provider and the four tools — bundled by the same
+//! — the Anthropic provider and the five tools — bundled by the same
 //! code `cargo xtask bundle` runs, registered on a real kernel, and
 //! driven against a stub that speaks the Messages API.
 //!
@@ -19,16 +19,16 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gwead::kernel::Kernel;
 use gwead::kernel::streams::StreamRegistry;
+use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Session, SessionConfig,
-    StopReason, Turn, spi,
+    Access, ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Session,
+    SessionConfig, StopReason, Turn, spi,
 };
 use provider_anthropic::wire::ANTHROPIC_VERSION;
 use provider_anthropic::{
@@ -43,13 +43,57 @@ use common::{assert_conforms, contracts, drain_stream_events};
 /// The key the provider's `api_key` secret resolves to.
 const API_KEY: &str = "sk-ant-test-fixture";
 
-/// Allows everything; knows exactly one secret, for exactly one plugin.
-struct Keyed;
+/// Allows everything except a write whose file name starts with
+/// `no-write`; knows exactly one secret, for exactly one plugin;
+/// records every request, and simulates another writer landing between
+/// an edit's read and its write for any file named `racing*`.
+#[derive(Default)]
+struct Keyed {
+    requests: Mutex<Vec<ApprovalRequest>>,
+}
+
+impl Keyed {
+    /// Every access recorded so far whose path's file name is
+    /// `file_name`, in request order.
+    fn asked(&self, file_name: &str) -> Vec<Access> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.access.clone())
+            .filter(|a| path_of(a).is_some_and(|p| p.file_name() == Some(file_name.as_ref())))
+            .collect()
+    }
+}
+
+/// The path an access probes, for the ones this fixture's file names
+/// key off.
+fn path_of(access: &Access) -> Option<&Path> {
+    match access {
+        Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => Some(p),
+        _ => None,
+    }
+}
+
+fn file_named(path: &Path, prefix: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(prefix))
+}
 
 #[async_trait::async_trait]
 impl Operator for Keyed {
-    async fn approve(&self, _: ApprovalRequest) -> Decision {
-        Decision::Allow
+    async fn approve(&self, request: ApprovalRequest) -> Decision {
+        let decision = match &request.access {
+            Access::WriteFile(p) if file_named(p, "no-write") => Decision::Deny,
+            Access::WriteFile(p) if file_named(p, "racing") => {
+                std::fs::write(p, "changed meanwhile\n").unwrap();
+                Decision::Allow
+            }
+            _ => Decision::Allow,
+        };
+        self.requests.lock().unwrap().push(request);
+        decision
     }
     async fn secret(&self, plugin: &str, name: &str) -> Option<String> {
         (plugin == PROVIDER && name == "api_key").then(|| API_KEY.to_string())
@@ -67,6 +111,7 @@ struct Fixture {
     workspace: PathBuf,
     stub: &'static Stub,
     bundled: Vec<xtask::BundledPlugin>,
+    keyed: Arc<Keyed>,
 }
 
 fn fixture() -> &'static Fixture {
@@ -76,11 +121,15 @@ fn fixture() -> &'static Fixture {
         std::fs::write(workspace.join("hello.txt"), "hello from the workspace\n").unwrap();
         let bundled = xtask::bundle(&xtask::workspace_root())
             .unwrap_or_else(|e| panic!("bundling plugins/ failed: {e}"));
+        let keyed = Arc::new(Keyed::default());
         let mut kernel = gwennol_core::boot_with(HostConfig {
-            operator: Arc::new(Keyed),
+            operator: keyed.clone(),
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
-            trusted_step_type_providers: vec![PROVIDER.to_string()],
+            trusted_step_type_providers: vec![
+                PROVIDER.to_string(),
+                tool_edit::PLUGIN_NAME.to_string(),
+            ],
             action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
@@ -103,6 +152,7 @@ fn fixture() -> &'static Fixture {
             workspace,
             stub: stub(),
             bundled,
+            keyed,
         }
     })
 }
@@ -133,21 +183,36 @@ impl Fixture {
     /// Run one tool call the way the agent loop does: by harvested
     /// descriptor.
     async fn call_tool(&self, name: &str, input: Value) -> Value {
+        let out = self
+            .call_tool_result(name, input)
+            .await
+            .unwrap_or_else(|e| panic!("tool {name} failed as a step: {e}"));
+        assert_conforms(contracts().call_output, &out);
+        out
+    }
+
+    /// [`Fixture::call_tool`], without unwrapping a step failure: for a
+    /// call the test expects to fail as a step (a denied approval), not
+    /// answer as data.
+    async fn call_tool_result(&self, name: &str, input: Value) -> Result<Value, KernelError> {
         let descriptors = spi::harvest_tools(&self.kernel).unwrap();
         let d = descriptors
             .iter()
             .find(|d| d.tool_name == name)
             .unwrap_or_else(|| panic!("no tool named {name}"));
-        let out = self
+        Ok(self
             .kernel
             .execute(&d.plugin_key, &d.action_name, input)
             .with_config(&json!({}))
             .run()
-            .await
-            .unwrap_or_else(|e| panic!("tool {name} failed as a step: {e}"))
-            .output;
-        assert_conforms(contracts().call_output, &out);
-        out
+            .await?
+            .output)
+    }
+
+    /// Every access recorded for a request whose path's file name is
+    /// `file_name`, in request order.
+    fn asked(&self, file_name: &str) -> Vec<Access> {
+        self.keyed.asked(file_name)
     }
 
     /// One buffered provider turn.
@@ -574,19 +639,27 @@ fn the_step_walker_reaches_every_nesting() {
 
 /// Every tool manifest declares only the host step types its steps
 /// use, and nothing else — no egress, no invoke, no secrets — so the
-/// manifest is an accurate statement of what the tool can reach. The
-/// step types are gathered from the steps themselves, branches
-/// included, and compared to the grants as sets.
+/// manifest is an accurate statement of what the tool can reach. Four
+/// tools are declarative; `tool-edit` supplies its own script runtime
+/// besides, named as its own `provide:` grant, matched by every
+/// `script` step's `language`, and carrying no `passSecrets`. The step
+/// types are gathered from the steps themselves, branches included,
+/// and compared to the grants as sets.
 #[test]
 fn every_tool_manifest_declares_exactly_the_host_steps_it_uses() {
     let f = fixture();
     let tools: Vec<_> = f.bundled.iter().filter(|p| p.group() == "tools").collect();
-    assert_eq!(tools.len(), 4, "read, write, grep, bash");
+    assert_eq!(tools.len(), 5, "read, write, edit, grep, bash");
     for plugin in tools {
         let m = &plugin.manifest;
         let name = plugin.name();
         assert_eq!(m["roles"], json!([spi::tool::ROLE]), "{name}");
-        assert!(plugin.guests.is_empty(), "{name} is declarative");
+        let is_edit = name == tool_edit::PLUGIN_NAME;
+        assert_eq!(
+            plugin.guests.is_empty(),
+            !is_edit,
+            "{name}: guests non-empty iff it supplies its own script runtime"
+        );
         assert_eq!(
             m["actions"].as_object().unwrap().len(),
             1,
@@ -611,13 +684,53 @@ fn every_tool_manifest_declares_exactly_the_host_steps_it_uses() {
             .iter()
             .map(|p| p.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(
-            declared, used_host,
-            "{name}: grants must equal the host steps used"
-        );
+        if is_edit {
+            let mut expected = used_host.clone();
+            expected.insert(format!("provide:step_type:script:{name}"));
+            assert_eq!(
+                declared, expected,
+                "{name}: grants = host steps ∪ its own provide:"
+            );
+            fn scripts<'a>(steps: &'a Value, into: &mut Vec<&'a Value>) {
+                for step in steps.as_array().into_iter().flatten() {
+                    if step["type"] == "script" {
+                        into.push(step);
+                    }
+                    for branch in step["params"]["ifs"].as_array().into_iter().flatten() {
+                        scripts(&branch["then"], into);
+                    }
+                    for key in ["try", "catch", "finally", "steps"] {
+                        scripts(&step["params"][key], into);
+                    }
+                }
+            }
+            let mut its_scripts = Vec::new();
+            scripts(&call["steps"], &mut its_scripts);
+            assert!(!its_scripts.is_empty(), "{name}: it is guest-backed");
+            for step in its_scripts {
+                assert_eq!(step["params"]["language"], name, "{name}");
+                assert!(
+                    step["params"].get("passSecrets").is_none(),
+                    "{name}: the guest sees no secret"
+                );
+            }
+        } else {
+            assert_eq!(
+                declared, used_host,
+                "{name}: grants must equal the host steps used"
+            );
+        }
         assert!(
             !used.iter().any(|t| t == "try"),
             "{name}: outcomes are data; a tool never string-matches a caught error"
+        );
+        assert!(
+            !used.iter().any(|t| t == "invoke"),
+            "{name}: no tool reaches another plugin"
+        );
+        assert!(
+            !declared.iter().any(|p| p.starts_with("invoke:")),
+            "{name}: no tool declares an invoke: grant"
         );
         assert!(
             m.get("usesSecrets").is_none(),
@@ -805,7 +918,7 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
 
     let result = f.call_tool("read", call["input"].clone()).await;
     assert_eq!(result["is_error"], false);
-    assert_eq!(result["content"], "hello from the workspace\n");
+    assert_eq!(result["content"], "     1\thello from the workspace\n");
     let content = spi::tool::render_content(
         result["content"].as_str().unwrap(),
         result["truncated"].as_bool().unwrap_or(false),
@@ -820,7 +933,7 @@ async fn a_model_issued_tool_call_executes_end_to_end() {
     assert_eq!(closing["stop_reason"], "end_turn");
     assert_eq!(
         closing["message"]["content"][0]["text"],
-        "It says: hello from the workspace\n"
+        "It says:      1\thello from the workspace\n"
     );
 
     // What the vendor was sent on the closing turn is the whole
@@ -906,12 +1019,12 @@ async fn the_loop_drives_the_bundled_provider_and_tools() {
         transcript[2],
         json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_01",
-             "content": "hello from the workspace\n", "is_error": false}
+             "content": "     1\thello from the workspace\n", "is_error": false}
         ]})
     );
     assert_eq!(
         transcript[3]["content"][0]["text"],
-        "It says: hello from the workspace\n"
+        "It says:      1\thello from the workspace\n"
     );
 
     let sent = {
@@ -990,7 +1103,7 @@ async fn the_read_tool_reports_hits_misses_and_cuts() {
     let out = f.call_tool("read", json!({"path": "hello.txt"})).await;
     assert_eq!(
         out,
-        json!({"content": "hello from the workspace\n", "is_error": false, "truncated": false})
+        json!({"content": "     1\thello from the workspace\n", "is_error": false, "truncated": false})
     );
 
     let out = f
@@ -1008,17 +1121,457 @@ async fn the_read_tool_reports_hits_misses_and_cuts() {
         .await;
     assert_eq!(
         out,
-        json!({"content": "hello", "is_error": false, "truncated": true})
+        json!({"content": "     ", "is_error": false, "truncated": true}),
+        "the numbered line's own six-column prefix is cut before any of the text"
     );
     assert_eq!(
-        spi::tool::render_content("hello", true),
-        format!("hello\n{}", spi::tool::TRUNCATED_MARKER)
+        spi::tool::render_content("     ", true),
+        format!("     \n{}", spi::tool::TRUNCATED_MARKER)
     );
 
     std::fs::create_dir_all(f.workspace.join("a-dir")).unwrap();
     let out = f.call_tool("read", json!({"path": "a-dir"})).await;
     assert_eq!(out["is_error"], true);
     assert!(out["content"].as_str().unwrap().contains("is a directory"));
+}
+
+/// `read` always numbers its lines and passes `offset`/`limit` through
+/// to `host_fs.read`; a range past the end of the file is the model's
+/// error to see, not an empty ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_tool_numbers_lines_and_takes_a_range() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("five.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+
+    let out = f
+        .call_tool("read", json!({"path": "five.txt", "offset": 2, "limit": 2}))
+        .await;
+    assert_eq!(
+        out,
+        json!({"content": "     2\tl2\n     3\tl3\n", "is_error": false, "truncated": false})
+    );
+
+    let out = f
+        .call_tool("read", json!({"path": "five.txt", "offset": 9}))
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert_eq!(out["content"], "five.txt has fewer than 9 lines");
+
+    // An empty file at the default offset is a complete read, not
+    // the fewer-lines branch: it never had 1 line to be short of.
+    std::fs::write(f.workspace.join("range-empty.txt"), "").unwrap();
+    let out = f
+        .call_tool("read", json!({"path": "range-empty.txt"}))
+        .await;
+    assert_eq!(
+        out,
+        json!({"content": "", "is_error": false, "truncated": false})
+    );
+
+    // A range past the ceiling on a huge file is empty because the scan
+    // was cut short: `truncated` must suppress the fewer-lines branch
+    // here too.
+    let ceiling_path = f.workspace.join("range-huge.bin");
+    std::fs::File::create(&ceiling_path)
+        .unwrap()
+        .set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 2)
+        .unwrap();
+    let out = f
+        .call_tool("read", json!({"path": "range-huge.bin", "offset": 2}))
+        .await;
+    assert_eq!(
+        out,
+        json!({"content": "", "is_error": false, "truncated": true})
+    );
+}
+
+/// The committed `edit.json`, read raw: its own script-runtime grant
+/// and its read cap agree with the guest crate's own constants.
+#[test]
+fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
+    let workspace = xtask::workspace_root();
+    let raw: Value = gwead::serde_json::from_str(
+        &std::fs::read_to_string(workspace.join("plugins/tools/edit.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["name"], tool_edit::PLUGIN_NAME);
+    assert_eq!(
+        raw["permissions"],
+        json!([
+            format!("provide:step_type:script:{}", tool_edit::PLUGIN_NAME),
+            "step_type:host_fs.read",
+            "step_type:host_fs.write"
+        ])
+    );
+    assert_eq!(
+        raw["wasmModules"]["guest"],
+        json!({"path": format!("crates/{}", tool_edit::PLUGIN_NAME)})
+    );
+    assert_eq!(raw["stepTypeImpls"][0]["matches"], tool_edit::PLUGIN_NAME);
+    let steps = &raw["actions"]["call"]["steps"];
+    assert_eq!(steps[0]["id"], tool_edit::READ_STEP);
+    assert_eq!(steps[0]["params"]["max_bytes"], tool_edit::READ_MAX_BYTES);
+    assert_eq!(steps[1]["id"], "decide");
+    assert_eq!(steps[1]["params"]["source"], tool_edit::ENTRY_REPLACE);
+    assert_eq!(
+        raw["actions"]["call"]["tool"]["parameters"]["properties"]["old_string"]["minLength"],
+        1
+    );
+
+    // Not registrable as committed: the guest is named by crate path,
+    // a form the kernel refuses.
+    let mut kernel = gwead::kernel::Kernel::boot(
+        gwead::kernel::KernelConfig::default()
+            .trusting_step_type_provider(tool_edit::PLUGIN_NAME.to_string()),
+    )
+    .unwrap();
+    spi::register(&mut kernel).unwrap();
+    let err = kernel
+        .register_plugin_from_json(&raw.to_string())
+        .expect_err("the committed manifest is not registrable");
+    assert!(err.to_string().contains("path-based"), "{err}");
+
+    // `read.json`'s "through the end" default equals the ceiling
+    // `fs_read`'s line-range scan stops at.
+    let read_json: Value = gwead::serde_json::from_str(
+        &std::fs::read_to_string(workspace.join("plugins/tools/read.json")).unwrap(),
+    )
+    .unwrap();
+    let default_limit = read_json["actions"]["call"]["steps"][0]["params"]["limit"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        default_limit,
+        format!(
+            "{{{{$input.limit ?? {}}}}}",
+            gwennol_core::steps::fs::READ_BYTES_CEILING
+        )
+    );
+}
+
+/// A single occurrence is replaced, the rest of the file kept, and the
+/// call is approved as exactly one read and one write of the canonical
+/// path — a person or a rule judges it like any other file access.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edit_tool_replaces_one_exact_string() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    let path = f.workspace.join("edit-one.txt");
+    std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "edit-one.txt", "old_string": "line two", "new_string": "line TWO"}),
+        )
+        .await;
+    let canonical = path.canonicalize().unwrap();
+    assert_eq!(
+        out,
+        json!({"content": "replaced 1 occurrence in edit-one.txt", "is_error": false})
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "line one\nline TWO\nline three\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        f.asked("edit-one.txt"),
+        vec![
+            Access::ReadFile(canonical.clone()),
+            Access::WriteFile(canonical),
+        ]
+    );
+}
+
+/// Each case reaches the model as `is_error` and leaves the file's
+/// bytes unchanged: not found, several matches, a file over the cap and
+/// bytes that are not UTF-8 are `decide`'s refusals; a missing file and
+/// a directory are the read's own miss, passed through; a symlink is
+/// read through to its target, and the write, asked under the link's
+/// own name, is refused as `is_symlink`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edit_tool_refuses_without_writing() {
+    let f = fixture();
+
+    std::fs::write(f.workspace.join("no-match.txt"), "abc\n").unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "no-match.txt", "old_string": "zzz", "new_string": "y"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert_eq!(out["content"], "old_string does not occur in no-match.txt");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("no-match.txt")).unwrap(),
+        "abc\n"
+    );
+    assert!(
+        !f.asked("no-match.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    std::fs::write(f.workspace.join("several.txt"), "x y x\n").unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "several.txt", "old_string": "x", "new_string": "z"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(out["content"].as_str().unwrap().contains("occurs 2 times"));
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("several.txt")).unwrap(),
+        "x y x\n"
+    );
+    assert!(
+        !f.asked("several.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    let big = "x".repeat((tool_edit::READ_MAX_BYTES + 1) as usize);
+    std::fs::write(f.workspace.join("big.txt"), &big).unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "big.txt", "old_string": "x", "new_string": "y", "replace_all": true}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(
+        out["content"]
+            .as_str()
+            .unwrap()
+            .contains("more than the 4194304"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read(f.workspace.join("big.txt")).unwrap(),
+        big.as_bytes()
+    );
+    assert!(
+        !f.asked("big.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    std::fs::write(f.workspace.join("notutf8.txt"), b"a\xffb").unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "notutf8.txt", "old_string": "a", "new_string": "z"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(out["content"].as_str().unwrap().contains("not valid UTF-8"));
+    assert_eq!(
+        std::fs::read(f.workspace.join("notutf8.txt")).unwrap(),
+        b"a\xffb"
+    );
+    assert!(
+        !f.asked("notutf8.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "nope/missing.txt", "old_string": "a", "new_string": "z"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(out["content"].as_str().unwrap().contains("no such file"));
+    assert!(!f.workspace.join("nope/missing.txt").exists());
+    assert!(
+        !f.asked("missing.txt")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    std::fs::create_dir_all(f.workspace.join("edit-dir")).unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "edit-dir", "old_string": "a", "new_string": "z"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(out["content"].as_str().unwrap().contains("is a directory"));
+    assert!(f.workspace.join("edit-dir").is_dir());
+    assert!(
+        !f.asked("edit-dir")
+            .iter()
+            .any(|a| matches!(a, Access::WriteFile(_)))
+    );
+
+    std::fs::write(f.workspace.join("link-target.txt"), "a\n").unwrap();
+    std::os::unix::fs::symlink(
+        f.workspace.join("link-target.txt"),
+        f.workspace.join("edit-link.txt"),
+    )
+    .unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "edit-link.txt", "old_string": "a", "new_string": "z"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], true);
+    assert!(
+        out["content"].as_str().unwrap().contains("symlink"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("link-target.txt")).unwrap(),
+        "a\n"
+    );
+    // The read followed the link and was approved under the target's
+    // own canonical name; the write was approved under the link's own
+    // name (its parent canonical) and then refused as data, because
+    // `host_fs.write` refuses a destination that is a symlink.
+    assert_eq!(
+        f.asked("link-target.txt"),
+        vec![Access::ReadFile(
+            f.workspace.join("link-target.txt").canonicalize().unwrap()
+        )]
+    );
+    assert_eq!(
+        f.asked("edit-link.txt"),
+        vec![Access::WriteFile(f.workspace.join("edit-link.txt"))]
+    );
+}
+
+/// A write the operator denies is a step error, not an `is_error`
+/// result: the file is untouched and both the read and the write were
+/// asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denied_edit_write_changes_nothing() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("no-write.txt"), "before\n").unwrap();
+    let err = f
+        .call_tool_result(
+            "edit",
+            json!({"path": "no-write.txt", "old_string": "before", "new_string": "after"}),
+        )
+        .await
+        .expect_err("the operator denies the write");
+    assert!(err.to_string().contains("operator denied"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("no-write.txt")).unwrap(),
+        "before\n"
+    );
+    let canonical = f.workspace.join("no-write.txt").canonicalize().unwrap();
+    assert_eq!(
+        f.asked("no-write.txt"),
+        vec![
+            Access::ReadFile(canonical.clone()),
+            Access::WriteFile(canonical)
+        ]
+    );
+}
+
+/// Accepted gap: `edit` reads, decides, then writes, so another writer
+/// landing in between is a plain lost update, not detected.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_racing_another_writer_keeps_its_own_read() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("racing.txt"), "one\n").unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "racing.txt", "old_string": "one", "new_string": "two"}),
+        )
+        .await;
+    assert_eq!(out["is_error"], false, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("racing.txt")).unwrap(),
+        "two\n",
+        "the edit's own read-modify-write overwrote the racing write"
+    );
+}
+
+/// `{{...}}`-shaped text in either string is written verbatim: Gwead
+/// resolves a step's own template once, and `edit`'s write step's
+/// `content` is the guest's plain string, not a template the engine
+/// re-scans.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edit_tool_writes_template_syntax_verbatim() {
+    let f = fixture();
+    std::fs::write(
+        f.workspace.join("templatey.txt"),
+        "before {{$input.path}} marker\n",
+    )
+    .unwrap();
+    let out = f
+        .call_tool(
+            "edit",
+            json!({
+                "path": "templatey.txt",
+                "old_string": "{{$input.path}} marker",
+                "new_string": "{{$steps.read.result.size}} bytes"
+            }),
+        )
+        .await;
+    assert_eq!(out["is_error"], false, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(f.workspace.join("templatey.txt")).unwrap(),
+        "before {{$steps.read.result.size}} bytes\n"
+    );
+}
+
+/// A file right at the cap the guest's fixed 64 MiB memory and
+/// 1,000,000,000 fuel units must still tolerate: one unique marker
+/// line replaced, the rest kept, the file's size unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edit_tool_edits_a_file_at_its_cap() {
+    let f = fixture();
+    let cap = tool_edit::READ_MAX_BYTES as usize;
+    let line = b"the quick brown fox jumps over the lazy dog....\n";
+    let mut content = Vec::with_capacity(cap);
+    while content.len() + line.len() <= cap {
+        content.extend_from_slice(line);
+    }
+    while content.len() < cap {
+        content.push(b'.');
+    }
+    assert_eq!(content.len(), cap);
+    // Plant a unique marker in place of one line, the same length as
+    // the line it replaces, so the total stays exactly at the cap.
+    let old_marker =
+        "UNIQUE-MARKER".to_string() + &".".repeat(line.len() - 1 - "UNIQUE-MARKER".len()) + "\n";
+    assert_eq!(old_marker.len(), line.len());
+    let at = (content.len() / 2 / line.len()) * line.len();
+    content.splice(at..at + old_marker.len(), old_marker.bytes());
+    std::fs::write(f.workspace.join("at-cap.txt"), &content).unwrap();
+    let new_marker = "unique-marker";
+
+    let out = f
+        .call_tool(
+            "edit",
+            json!({"path": "at-cap.txt", "old_string": "UNIQUE-MARKER", "new_string": new_marker}),
+        )
+        .await;
+    assert_eq!(out["is_error"], false, "{out}");
+    let after = std::fs::read(f.workspace.join("at-cap.txt")).unwrap();
+    assert_eq!(
+        after.len(),
+        cap,
+        "old_string and new_string are the same length here"
+    );
+    let after = String::from_utf8(after).unwrap();
+    assert!(after.contains(new_marker));
+    assert!(!after.contains("UNIQUE-MARKER"));
 }
 
 /// `write` creates the file (parents included) and says what it did;

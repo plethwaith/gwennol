@@ -142,17 +142,37 @@ pub(crate) fn bool_param(params: &Value, key: &str, default: bool) -> Result<boo
     }
 }
 
+/// Text cut from a byte buffer by [`lossy_capped`].
+pub(crate) struct Capped {
+    /// The kept bytes, decoded as UTF-8 with replacement characters.
+    pub text: String,
+    /// Bytes past the cap were dropped.
+    pub truncated: bool,
+    /// Some kept bytes were not UTF-8 and were replaced, so `text` does
+    /// not reproduce them.
+    pub lossy: bool,
+}
+
 /// Truncate a byte buffer to `max` bytes, on a UTF-8 boundary, reporting
-/// whether anything was dropped.
-pub(crate) fn lossy_capped(bytes: &[u8], max: usize) -> (String, bool) {
-    if bytes.len() <= max {
-        return (String::from_utf8_lossy(bytes).into_owned(), false);
+/// whether anything was dropped and whether the kept bytes needed lossy
+/// UTF-8 decoding.
+pub(crate) fn lossy_capped(bytes: &[u8], max: usize) -> Capped {
+    let (kept, truncated) = if bytes.len() <= max {
+        (bytes, false)
+    } else {
+        let mut cut = max;
+        while cut > 0 && !bytes.is_char_boundary_lossy(cut) {
+            cut -= 1;
+        }
+        (&bytes[..cut], true)
+    };
+    let decoded = String::from_utf8_lossy(kept);
+    let lossy = matches!(decoded, std::borrow::Cow::Owned(_));
+    Capped {
+        text: decoded.into_owned(),
+        truncated,
+        lossy,
     }
-    let mut cut = max;
-    while cut > 0 && !bytes.is_char_boundary_lossy(cut) {
-        cut -= 1;
-    }
-    (String::from_utf8_lossy(&bytes[..cut]).into_owned(), true)
 }
 
 trait CharBoundary {
@@ -170,12 +190,33 @@ impl CharBoundary for [u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::capped;
+    use super::{capped, lossy_capped};
 
     #[test]
     fn a_cap_beyond_the_ceiling_clamps_instead_of_wrapping_or_ballooning() {
         assert_eq!(capped(u64::MAX, 64 << 20), 64 << 20);
         assert_eq!(capped(0, 64 << 20), 0);
         assert_eq!(capped(5, 64 << 20), 5);
+    }
+
+    /// `truncated` and `lossy` are independent: a cut can land clean, and
+    /// a replacement can happen with nothing cut off.
+    #[test]
+    fn lossy_capped_reports_a_cut_and_a_replacement_apart() {
+        let c = lossy_capped(b"ab", 5);
+        assert!(!c.truncated && !c.lossy, "well under the cap");
+
+        let c = lossy_capped(b"a\xffb", 5);
+        assert!(!c.truncated, "under the cap");
+        assert!(c.lossy, "the bad byte was kept and replaced");
+        assert_eq!(c.text, "a\u{FFFD}b");
+
+        let c = lossy_capped("héllo".as_bytes(), 2);
+        assert!(c.truncated, "cut before the whole string fit");
+        assert!(!c.lossy, "the cut landed on a char boundary");
+
+        let c = lossy_capped(b"ab\xff", 2);
+        assert!(c.truncated, "the bad byte itself was cut off");
+        assert!(!c.lossy, "so it never needed replacing");
     }
 }

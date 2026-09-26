@@ -64,6 +64,10 @@ sse-guest = { path = "../sse-guest" }
 # `cargo package`.
 xtask = { path = "../xtask" }
 provider-anthropic = { path = "../provider-anthropic" }
+# The bundled plugins suite trusts and registers the edit tool's guest
+# the same way, by the name the crate exports. Path-only, stripped by
+# `cargo package`.
+tool-edit = { path = "../tool-edit" }
 # The integration suites pin fixture payloads to the SPI contract
 # schemas with the same validator the loop uses on tool arguments.
 boon = "0.6"

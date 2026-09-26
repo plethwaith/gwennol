@@ -1,7 +1,7 @@
 {
   "formatVersion": 1,
   "name": "host_fs",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Gwennol filesystem step types. Native code; every step asks the operator before acting. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_fs.* grant. Answers the model can act on — no such file, that is a directory, permission denied — are results with an `outcome` naming them, not step errors; step errors are reserved for the operator's denial, the kernel's refusal, cancellation, and I/O failures nobody can act on.",
   "stepTypeDefs": [
     {
@@ -12,19 +12,23 @@
         "additionalProperties": false,
         "properties": {
           "path": { "type": "string", "description": "File path; relative paths resolve against the workspace root." },
-          "max_bytes": { "type": "integer", "minimum": 0, "description": "Cap on returned bytes (default 1 MiB, clamped to 64 MiB). Bounds what is read, not just what is returned; the result reports truncation." }
+          "max_bytes": { "type": "integer", "minimum": 0, "description": "Cap on returned bytes (default 1 MiB, clamped to 64 MiB), line numbers included. The result reports truncation." },
+          "offset": { "type": "integer", "minimum": 1, "description": "First line to return, counting from 1. With offset, limit or number_lines the file is read line by line from its start, stopping once more than 64 MiB of it has been read; a range not complete by then is reported truncated. offset: 1 alone is the plain read." },
+          "limit": { "type": "integer", "minimum": 1, "description": "Most lines to return; absent, through the end of the file." },
+          "number_lines": { "type": "boolean", "default": false, "description": "Prefix each returned line with its number, right-aligned in six columns, and a tab." }
         }
       },
       "outputSchema": {
         "oneOf": [
           {
             "type": "object",
-            "required": ["outcome", "content", "truncated", "size"],
+            "required": ["outcome", "content", "truncated", "size", "lossy"],
             "properties": {
               "outcome": { "const": "ok" },
               "content": { "type": "string", "description": "File contents, lossily decoded as UTF-8." },
               "truncated": { "type": "boolean" },
-              "size": { "type": "integer", "description": "Full size of the file in bytes." }
+              "size": { "type": "integer", "description": "Full size of the file in bytes." },
+              "lossy": { "type": "boolean", "description": "True when bytes that are not UTF-8 were replaced in content: writing content back would not reproduce the file." }
             }
           },
           {

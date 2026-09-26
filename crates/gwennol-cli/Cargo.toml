@@ -55,4 +55,7 @@ futures-util = { version = "0.3", default-features = false }
 # stub Messages API. Path-only.
 xtask = { path = "../xtask" }
 provider-anthropic = { path = "../provider-anthropic" }
+# The suites trust it by the name the crate exports, the same as the
+# provider above.
+tool-edit = { path = "../tool-edit" }
 tempfile = "3"

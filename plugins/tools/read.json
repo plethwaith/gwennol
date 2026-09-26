@@ -1,7 +1,7 @@
 {
   "formatVersion": 1,
   "name": "tool-read",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The `read` tool: one host_fs.read, its outcome branched on as data. Reaches nothing else.",
   "roles": ["TOOL"],
   "permissions": ["step_type:host_fs.read"],
@@ -9,14 +9,16 @@
     "call": {
       "tool": {
         "name": "read",
-        "description": "Read a file from the workspace as UTF-8 text. Relative paths resolve against the workspace root. Output is cut at max_bytes (default 262144) and marked as truncated when it was.",
+        "description": "Read a file from the workspace as UTF-8 text, each line prefixed with its number and a tab. Relative paths resolve against the workspace root. offset and limit select a range of lines. Output, line numbers included, is cut at max_bytes (default 262144) and marked as truncated when it was.",
         "parameters": {
           "type": "object",
           "required": ["path"],
           "additionalProperties": false,
           "properties": {
             "path": { "type": "string", "description": "File path, absolute or relative to the workspace root." },
-            "max_bytes": { "type": "integer", "minimum": 1, "description": "Cap on returned bytes (default 262144)." }
+            "max_bytes": { "type": "integer", "minimum": 1, "description": "Cap on returned bytes (default 262144)." },
+            "offset": { "type": "integer", "minimum": 1, "description": "First line to return, counting from 1 (default 1)." },
+            "limit": { "type": "integer", "minimum": 1, "description": "Most lines to return (default: through the end of the file)." }
           }
         }
       },
@@ -24,12 +26,27 @@
         {
           "id": "read",
           "type": "host_fs.read",
-          "params": { "path": "{{$input.path}}", "max_bytes": "{{$input.max_bytes ?? 262144}}" }
+          "params": {
+            "path": "{{$input.path}}",
+            "max_bytes": "{{$input.max_bytes ?? 262144}}",
+            "offset": "{{$input.offset ?? 1}}",
+            "limit": "{{$input.limit ?? 67108864}}",
+            "number_lines": true
+          }
         },
         {
           "id": "answer",
           "type": "ifs",
           "params": { "ifs": [
+            {
+              "test": "$steps.read.result.outcome == 'ok' && $steps.read.result.content == '' && ($input.offset ?? 1) > 1 && !$steps.read.result.truncated",
+              "then": [
+                { "id": "past_end", "type": "return", "params": { "value": {
+                  "content": "{{$input.path}} has fewer than {{$input.offset}} lines",
+                  "is_error": true
+                } } }
+              ]
+            },
             {
               "test": "$steps.read.result.outcome == 'ok'",
               "then": [
