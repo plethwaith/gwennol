@@ -3,8 +3,9 @@
 //! secret sources, the plugins and their manifests, the process
 //! environment, the kernel, and the session. `start` takes the run's
 //! `Mode`, which picks how the default system prompt describes the
-//! run. Both frontends call the same two functions and supply their
-//! own `Operator` in the closure, so neither copies any of this.
+//! run. Both frontends call `start` and supply their own `Operator`
+//! in the closure, so neither copies any of this; `main` calls
+//! `workspace` once, before either.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
