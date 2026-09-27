@@ -53,9 +53,15 @@ futures-util = { version = "0.3", default-features = false }
 # The headless suite bundles the committed plugins through the same
 # code `cargo xtask bundle` runs and drives the built binary against a
 # stub Messages API. Path-only.
+#
+# Neither `provider-anthropic` nor `tool-edit` is a dev-dependency here:
+# both are guest crates that invoke `gwennol_guest::entrypoints!`, which
+# emits `#[no_mangle] alloc`/`execute` per crate, and this crate's test
+# binaries used to link both rlibs together — a duplicate-symbol error,
+# the trap this crate's `headless` binary hit on Linux (never on
+# macOS). `xtask`'s bundler compiles each guest crate to wasm without
+# linking its rlib into the host binary, so the suites reach the
+# committed manifests' own values instead of a Rust copy the guest
+# crates used to export.
 xtask = { path = "../xtask" }
-provider-anthropic = { path = "../provider-anthropic" }
-# The suites trust it by the name the crate exports, the same as the
-# provider above.
-tool-edit = { path = "../tool-edit" }
 tempfile = "3"

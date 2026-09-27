@@ -114,6 +114,14 @@ mod tests {
 
     use super::*;
 
+    /// The committed provider and edit-tool plugins' own `name` fields
+    /// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`).
+    /// Neither guest crate is a dev-dependency of this binary — see
+    /// `gwennol-cli/Cargo.toml` and `tests/headless.rs`'s copy of this
+    /// comment.
+    const PROVIDER: &str = "provider-anthropic";
+    const EDIT: &str = "tool-edit";
+
     /// `tui::start` shows every startup warning it would otherwise
     /// only log, as the pane's first entries — except the no-rules
     /// one (D6): a session asks at a prompt for what no rule
@@ -153,16 +161,13 @@ mod tests {
             "--plugins",
             plugins_dir.to_str().unwrap(),
             "--trust-runtime",
-            provider_anthropic::PLUGIN_NAME,
+            PROVIDER,
             "--trust-runtime",
-            tool_edit::PLUGIN_NAME,
+            EDIT,
             "--config",
             config_path.to_str().unwrap(),
             "--secret",
-            &format!(
-                "{}:api_key=env:GWENNOL_TEST_STARTUP_WARNING_38_UNSET",
-                provider_anthropic::PLUGIN_NAME
-            ),
+            &format!("{PROVIDER}:api_key=env:GWENNOL_TEST_STARTUP_WARNING_38_UNSET"),
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
         // No --allow/--deny rule at all: the empty-policy warning

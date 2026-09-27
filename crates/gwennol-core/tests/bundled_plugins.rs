@@ -30,10 +30,6 @@ use gwennol_core::{
     Access, ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Session,
     SessionConfig, StopReason, Turn, spi,
 };
-use provider_anthropic::wire::ANTHROPIC_VERSION;
-use provider_anthropic::{
-    ENTRY_CHAT, ENTRY_RELAY, FETCH_ACTION, PLUGIN_NAME as PROVIDER, STREAM_ACTION,
-};
 
 mod common;
 use common::{assert_conforms, contracts, drain_stream_events};
@@ -42,6 +38,26 @@ use common::{assert_conforms, contracts, drain_stream_events};
 
 /// The key the provider's `api_key` secret resolves to.
 const API_KEY: &str = "sk-ant-test-fixture";
+
+/// The committed provider and edit-tool manifests' own `name` fields
+/// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`),
+/// and the manifest-internal identifiers each declares: the entry
+/// names a `script` step's `source` selects, and the two `chat` turn
+/// shapes' own action names. Neither guest crate is a dev-dependency
+/// of this host test binary — `provider-anthropic` and `tool-edit`
+/// both invoke `gwennol_guest::entrypoints!`
+/// (`crates/gwennol-guest/src/entry.rs:163-180`), which emits
+/// `#[no_mangle] alloc`/`execute`, and two such rlibs linked into one
+/// host test binary is a duplicate-symbol error (hit on Linux's
+/// `gwennol-cli` `headless` binary). So these are pinned directly
+/// against the committed JSON below and through `Fixture::manifest`,
+/// not re-declared from the guest crate.
+const PROVIDER: &str = "provider-anthropic";
+const EDIT: &str = "tool-edit";
+const ENTRY_CHAT: &str = "chat";
+const ENTRY_RELAY: &str = "relay_sse";
+const FETCH_ACTION: &str = "fetch_turn";
+const STREAM_ACTION: &str = "stream_turn";
 
 /// Allows everything except a write whose file name starts with
 /// `no-write`; knows exactly one secret, for exactly one plugin;
@@ -126,10 +142,7 @@ fn fixture() -> &'static Fixture {
             operator: keyed.clone(),
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
-            trusted_step_type_providers: vec![
-                PROVIDER.to_string(),
-                tool_edit::PLUGIN_NAME.to_string(),
-            ],
+            trusted_step_type_providers: vec![PROVIDER.to_string(), EDIT.to_string()],
             action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
@@ -158,6 +171,31 @@ fn fixture() -> &'static Fixture {
 }
 
 impl Fixture {
+    /// The bundled manifest for the plugin named `name` — the
+    /// committed JSON with its guest slot filled, otherwise identical
+    /// (`xtask::inject_guests` only fills `wasmModules`; every other
+    /// field, including action params, travels verbatim from the
+    /// file `fixture()` bundled above).
+    fn manifest(&self, name: &str) -> &Value {
+        &self
+            .bundled
+            .iter()
+            .find(|p| p.name() == name)
+            .unwrap_or_else(|| panic!("no bundled plugin named {name}"))
+            .manifest
+    }
+
+    /// The edit tool's read cap, as the committed manifest's `read`
+    /// step declares `max_bytes` (`plugins/tools/edit.json`) — the
+    /// number `tool-edit`'s own `decide` also enforces internally, but
+    /// no Rust import ties the two together any more; see
+    /// `the_committed_edit_manifest_names_its_guest_and_its_cap`.
+    fn edit_read_max_bytes(&self) -> u64 {
+        self.manifest(EDIT)["actions"]["call"]["steps"][0]["params"]["max_bytes"]
+            .as_u64()
+            .expect("edit.json's read step declares max_bytes")
+    }
+
     /// The provider `$config` for a stub route.
     fn config(&self, route: &str) -> Value {
         json!({
@@ -522,7 +560,8 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
         raw["wasmModules"]["guest"],
         json!({"path": format!("crates/{PROVIDER}")})
     );
-    // The names the manifest uses are the ones the guest crate exports.
+    // The manifest's own step-type match and script `source` fields
+    // agree with the entry names it declares elsewhere in this file.
     assert_eq!(raw["stepTypeImpls"][0]["matches"], PROVIDER);
     assert_eq!(
         raw["actions"][spi::llm_chat::CHAT]["steps"][0]["params"]["source"],
@@ -533,9 +572,18 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
         ENTRY_RELAY
     );
     assert!(raw["actions"][FETCH_ACTION].is_object());
+    // Both turn shapes send the same `anthropic-version`: read from
+    // `fetch_turn`'s own header and compared to `stream_turn`'s,
+    // rather than to a Rust copy of the literal (no crate re-declares
+    // it; provider-anthropic is not a dev-dependency of this binary).
+    let anthropic_version =
+        raw["actions"][FETCH_ACTION]["steps"][0]["params"]["headers"]["anthropic-version"]
+            .as_str()
+            .expect("fetch_turn declares anthropic-version")
+            .to_string();
     for action in [FETCH_ACTION, STREAM_ACTION] {
         let headers = &raw["actions"][action]["steps"][0]["params"]["headers"];
-        assert_eq!(headers["anthropic-version"], ANTHROPIC_VERSION, "{action}");
+        assert_eq!(headers["anthropic-version"], anthropic_version, "{action}");
         assert_eq!(headers["x-api-key"], "{{$secrets.api_key}}", "{action}");
     }
     // The key reaches the wire from a declarative step only: no script
@@ -654,7 +702,7 @@ fn every_tool_manifest_declares_exactly_the_host_steps_it_uses() {
         let m = &plugin.manifest;
         let name = plugin.name();
         assert_eq!(m["roles"], json!([spi::tool::ROLE]), "{name}");
-        let is_edit = name == tool_edit::PLUGIN_NAME;
+        let is_edit = name == EDIT;
         assert_eq!(
             plugin.guests.is_empty(),
             !is_edit,
@@ -773,7 +821,13 @@ async fn the_provider_streams_a_turn() {
         (mine[0].1.clone(), mine[0].2.clone())
     };
     assert_eq!(headers["x-api-key"], API_KEY, "the secret reached the wire");
-    assert_eq!(headers["anthropic-version"], ANTHROPIC_VERSION);
+    // Compared to the bundled manifest's own declared header, not a
+    // Rust copy of the literal: the version on the wire is the
+    // declarative template's value, verbatim.
+    assert_eq!(
+        headers["anthropic-version"],
+        f.manifest(PROVIDER)["actions"][STREAM_ACTION]["steps"][0]["params"]["headers"]["anthropic-version"]
+    );
     assert_eq!(headers["content-type"], "application/json");
     assert_eq!(body["model"], "claude-fixture");
     assert_eq!(body["stream"], true);
@@ -1185,8 +1239,11 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
     );
 }
 
-/// The committed `edit.json`, read raw: its own script-runtime grant
-/// and its read cap agree with the guest crate's own constants.
+/// The committed `edit.json`, read raw: its own script-runtime grant,
+/// its read cap, and its step wiring are exactly what is committed —
+/// pinned against the file directly, not against a Rust copy of the
+/// same values (`tool-edit` is not a dev-dependency of this crate; see
+/// the `EDIT` constant's doc comment above).
 #[test]
 fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
     let workspace = xtask::workspace_root();
@@ -1194,25 +1251,25 @@ fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
         &std::fs::read_to_string(workspace.join("plugins/tools/edit.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(raw["name"], tool_edit::PLUGIN_NAME);
+    assert_eq!(raw["name"], EDIT);
     assert_eq!(
         raw["permissions"],
         json!([
-            format!("provide:step_type:script:{}", tool_edit::PLUGIN_NAME),
+            format!("provide:step_type:script:{EDIT}"),
             "step_type:host_fs.read",
             "step_type:host_fs.write"
         ])
     );
     assert_eq!(
         raw["wasmModules"]["guest"],
-        json!({"path": format!("crates/{}", tool_edit::PLUGIN_NAME)})
+        json!({"path": format!("crates/{EDIT}")})
     );
-    assert_eq!(raw["stepTypeImpls"][0]["matches"], tool_edit::PLUGIN_NAME);
+    assert_eq!(raw["stepTypeImpls"][0]["matches"], EDIT);
     let steps = &raw["actions"]["call"]["steps"];
-    assert_eq!(steps[0]["id"], tool_edit::READ_STEP);
-    assert_eq!(steps[0]["params"]["max_bytes"], tool_edit::READ_MAX_BYTES);
+    assert_eq!(steps[0]["id"], "read");
+    assert_eq!(steps[0]["params"]["max_bytes"], 4u64 << 20);
     assert_eq!(steps[1]["id"], "decide");
-    assert_eq!(steps[1]["params"]["source"], tool_edit::ENTRY_REPLACE);
+    assert_eq!(steps[1]["params"]["source"], "replace");
     assert_eq!(
         raw["actions"]["call"]["tool"]["parameters"]["properties"]["old_string"]["minLength"],
         1
@@ -1221,8 +1278,7 @@ fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
     // Not registrable as committed: the guest is named by crate path,
     // a form the kernel refuses.
     let mut kernel = gwead::kernel::Kernel::boot(
-        gwead::kernel::KernelConfig::default()
-            .trusting_step_type_provider(tool_edit::PLUGIN_NAME.to_string()),
+        gwead::kernel::KernelConfig::default().trusting_step_type_provider(EDIT.to_string()),
     )
     .unwrap();
     spi::register(&mut kernel).unwrap();
@@ -1339,7 +1395,7 @@ async fn the_edit_tool_refuses_without_writing() {
             .any(|a| matches!(a, Access::WriteFile(_)))
     );
 
-    let big = "x".repeat((tool_edit::READ_MAX_BYTES + 1) as usize);
+    let big = "x".repeat((f.edit_read_max_bytes() + 1) as usize);
     std::fs::write(f.workspace.join("big.txt"), &big).unwrap();
     let out = f
         .call_tool(
@@ -1536,7 +1592,7 @@ async fn the_edit_tool_writes_template_syntax_verbatim() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_edit_tool_edits_a_file_at_its_cap() {
     let f = fixture();
-    let cap = tool_edit::READ_MAX_BYTES as usize;
+    let cap = f.edit_read_max_bytes() as usize;
     let line = b"the quick brown fox jumps over the lazy dog....\n";
     let mut content = Vec::with_capacity(cap);
     while content.len() + line.len() <= cap {

@@ -55,11 +55,6 @@ use serde_json::{Map, Value, json};
 /// The model used when `$config.model` is absent.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
-/// The Messages API version the manifest's `anthropic-version` header
-/// names. Declared here so the integration suite can pin the manifest
-/// to it; the guest itself sends no headers.
-pub const ANTHROPIC_VERSION: &str = "2023-06-01";
-
 /// `max_tokens` for a buffered turn when neither the input nor
 /// `$config.max_tokens` says: high enough not to cut an answer
 /// mid-thought, low enough that the buffered request finishes inside

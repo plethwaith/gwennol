@@ -26,14 +26,20 @@ use gwennol::tui::screen::{Kitty, Screen};
 use gwennol::tui::ui::{Entry, SCROLLED, Shared, TurnState, Ui, render, wrap};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
 use gwennol_core::Session;
-use provider_anthropic::PLUGIN_NAME as PROVIDER;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tool_edit::PLUGIN_NAME as EDIT;
+
+/// The committed provider and edit-tool plugins' own `name` fields
+/// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`).
+/// Neither guest crate is a dev-dependency of this binary — see
+/// `gwennol-cli/Cargo.toml` and `tests/headless.rs`'s copy of this
+/// comment.
+const PROVIDER: &str = "provider-anthropic";
+const EDIT: &str = "tool-edit";
 
 // ------------------------------------------------------------- fixture
 

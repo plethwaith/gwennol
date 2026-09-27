@@ -18,10 +18,6 @@
 use gwennol_guest::{Args, entrypoints};
 use serde_json::{Value, json};
 
-/// The plugin this module ships inside — its manifest `name` and the
-/// `language` selector of its one script step.
-pub const PLUGIN_NAME: &str = "tool-edit";
-
 /// Entry-point name the manifest's `decide` step selects via `source`.
 pub const ENTRY_REPLACE: &str = "replace";
 
