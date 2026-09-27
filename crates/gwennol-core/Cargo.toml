@@ -62,14 +62,10 @@ sse-guest = { path = "../sse-guest" }
 # same bundler `cargo xtask bundle` runs. Path-only, stripped by
 # `cargo package`.
 #
-# Neither `provider-anthropic` nor `tool-edit` is a dev-dependency here:
-# both are guest crates that invoke `gwennol_guest::entrypoints!`, which
-# emits `#[no_mangle] alloc`/`execute` per crate, and a host test binary
-# that links two such rlibs together hits a duplicate-symbol error (the
-# trap this workspace hit on `gwennol-cli`'s `headless` binary on
-# Linux). The bundled-plugins suite pins the committed manifests'
-# entries and names directly, not against a Rust copy the guest crates
-# used to export.
+# `provider-anthropic` and `tool-edit` are not dev-dependencies: both
+# invoke `gwennol_guest::entrypoints!`, which exports unmangled `alloc`
+# and `execute`, so two of them linked into one test binary can fail
+# with duplicate symbols.
 xtask = { path = "../xtask" }
 # The integration suites pin fixture payloads to the SPI contract
 # schemas with the same validator the loop uses on tool arguments.

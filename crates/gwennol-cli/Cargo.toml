@@ -54,14 +54,9 @@ futures-util = { version = "0.3", default-features = false }
 # code `cargo xtask bundle` runs and drives the built binary against a
 # stub Messages API. Path-only.
 #
-# Neither `provider-anthropic` nor `tool-edit` is a dev-dependency here:
-# both are guest crates that invoke `gwennol_guest::entrypoints!`, which
-# emits `#[no_mangle] alloc`/`execute` per crate, and this crate's test
-# binaries used to link both rlibs together — a duplicate-symbol error,
-# the trap this crate's `headless` binary hit on Linux (never on
-# macOS). `xtask`'s bundler compiles each guest crate to wasm without
-# linking its rlib into the host binary, so the suites reach the
-# committed manifests' own values instead of a Rust copy the guest
-# crates used to export.
+# `provider-anthropic` and `tool-edit` are not dev-dependencies: both
+# invoke `gwennol_guest::entrypoints!`, which exports unmangled `alloc`
+# and `execute`, so two of them linked into one test binary can fail
+# with duplicate symbols.
 xtask = { path = "../xtask" }
 tempfile = "3"

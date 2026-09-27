@@ -31,9 +31,7 @@ const KEY_VAR: &str = "GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY";
 /// The committed provider and edit-tool plugins' own `name` fields
 /// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`).
 /// Neither guest crate is a dev-dependency of this binary: both invoke
-/// `gwennol_guest::entrypoints!`, and this binary's `headless` suite is
-/// exactly where linking both rlibs together produced a duplicate
-/// `alloc`/`execute` symbol on Linux (see `gwennol-cli/Cargo.toml`).
+/// `gwennol_guest::entrypoints!` (see `gwennol-cli/Cargo.toml`).
 const PROVIDER: &str = "provider-anthropic";
 const EDIT: &str = "tool-edit";
 

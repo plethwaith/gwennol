@@ -48,10 +48,9 @@ const API_KEY: &str = "sk-ant-test-fixture";
 /// both invoke `gwennol_guest::entrypoints!`
 /// (`crates/gwennol-guest/src/entry.rs:163-180`), which emits
 /// `#[no_mangle] alloc`/`execute`, and two such rlibs linked into one
-/// host test binary is a duplicate-symbol error (hit on Linux's
-/// `gwennol-cli` `headless` binary). So these are pinned directly
-/// against the committed JSON below and through `Fixture::manifest`,
-/// not re-declared from the guest crate.
+/// host test binary can fail with duplicate symbols. So these are
+/// pinned directly against the committed JSON below and through
+/// `Fixture::manifest`, not re-declared from the guest crate.
 const PROVIDER: &str = "provider-anthropic";
 const EDIT: &str = "tool-edit";
 const ENTRY_CHAT: &str = "chat";
@@ -186,10 +185,7 @@ impl Fixture {
     }
 
     /// The edit tool's read cap, as the committed manifest's `read`
-    /// step declares `max_bytes` (`plugins/tools/edit.json`) — the
-    /// number `tool-edit`'s own `decide` also enforces internally, but
-    /// no Rust import ties the two together any more; see
-    /// `the_committed_edit_manifest_names_its_guest_and_its_cap`.
+    /// step declares `max_bytes` (`plugins/tools/edit.json`).
     fn edit_read_max_bytes(&self) -> u64 {
         self.manifest(EDIT)["actions"]["call"]["steps"][0]["params"]["max_bytes"]
             .as_u64()
