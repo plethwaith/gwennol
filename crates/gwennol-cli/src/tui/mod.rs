@@ -117,8 +117,7 @@ mod tests {
     /// The committed provider and edit-tool plugins' own `name` fields
     /// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`).
     /// Neither guest crate is a dev-dependency of this binary — see
-    /// `gwennol-cli/Cargo.toml` and `tests/headless.rs`'s copy of this
-    /// comment.
+    /// `gwennol-cli/Cargo.toml`.
     const PROVIDER: &str = "provider-anthropic";
     const EDIT: &str = "tool-edit";
 

@@ -17,8 +17,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [lib]
-# cdylib is the wasm module; rlib keeps `cargo test` able to link the
-# unit tests and lets the integration suite import the exported names.
+# cdylib is the wasm module.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

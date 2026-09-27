@@ -50,7 +50,7 @@ const API_KEY: &str = "sk-ant-test-fixture";
 /// `#[no_mangle] alloc`/`execute`, and two such rlibs linked into one
 /// host test binary can fail with duplicate symbols. So these are
 /// pinned directly against the committed JSON below and through
-/// `Fixture::manifest`, not re-declared from the guest crate.
+/// `Fixture::manifest`, not imported from the guest crates.
 const PROVIDER: &str = "provider-anthropic";
 const EDIT: &str = "tool-edit";
 const ENTRY_CHAT: &str = "chat";
@@ -1239,7 +1239,7 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
 /// its read cap, and its step wiring are exactly what is committed —
 /// pinned against the file directly, not against a Rust copy of the
 /// same values (`tool-edit` is not a dev-dependency of this crate; see
-/// the `EDIT` constant's doc comment above).
+/// the comment above `const PROVIDER`).
 #[test]
 fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
     let workspace = xtask::workspace_root();
