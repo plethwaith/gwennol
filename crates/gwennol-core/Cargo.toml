@@ -59,11 +59,14 @@ base64 = "0.22"
 gwennol-guest = { path = "../gwennol-guest" }
 sse-guest = { path = "../sse-guest" }
 # The bundled plugins suite builds the committed manifests through the
-# same bundler `cargo xtask bundle` runs, and pins the provider manifest
-# to the names its guest crate exports. Path-only, stripped by
+# same bundler `cargo xtask bundle` runs. Path-only, stripped by
 # `cargo package`.
+#
+# `provider-anthropic` and `tool-edit` are not dev-dependencies: both
+# invoke `gwennol_guest::entrypoints!`, which exports unmangled `alloc`
+# and `execute`, so two of them linked into one test binary can fail
+# with duplicate symbols.
 xtask = { path = "../xtask" }
-provider-anthropic = { path = "../provider-anthropic" }
 # The integration suites pin fixture payloads to the SPI contract
 # schemas with the same validator the loop uses on tool arguments.
 boon = "0.6"

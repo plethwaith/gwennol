@@ -23,11 +23,16 @@ contracts must be registered before the plugins that claim them.
   `x-api-key` header — and the guest never sees the key.
 - `tools/` — plugins implementing `TOOL`: `read.json`, `write.json`,
   `grep.json` and `bash.json` (`tool-read`, `tool-write`, `tool-grep`,
-  `tool-bash`). Declarative: each is one host step — `host_fs.read`,
+  `tool-bash`) stay declarative: each is one host step — `host_fs.read`,
   `host_fs.write`, `host_process.run` — and a branch on its outcome,
   which the host steps report as data (`docs/SPI.md`, "Outcomes are
-  data"), so no tool ever wraps a step in `try`. Each manifest's
-  `permissions` names exactly the host step it uses, pinned by a test.
+  data"), so no tool ever wraps a step in `try`. `edit.json`
+  (`tool-edit`) is guest-backed: a `host_fs.read`, a guest step that
+  replaces the string (`crates/tool-edit`), and a `host_fs.write` when
+  the guest says to write; the guest reaches nothing, and like the
+  provider it needs `--trust-runtime`. Each manifest's `permissions`
+  names exactly the host steps it uses, and `edit.json` its own
+  script-runtime slot besides, pinned by a test.
 
 ## Guest modules are bundled, not committed
 

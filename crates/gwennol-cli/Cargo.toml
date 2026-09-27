@@ -53,6 +53,10 @@ futures-util = { version = "0.3", default-features = false }
 # The headless suite bundles the committed plugins through the same
 # code `cargo xtask bundle` runs and drives the built binary against a
 # stub Messages API. Path-only.
+#
+# `provider-anthropic` and `tool-edit` are not dev-dependencies: both
+# invoke `gwennol_guest::entrypoints!`, which exports unmangled `alloc`
+# and `execute`, so two of them linked into one test binary can fail
+# with duplicate symbols.
 xtask = { path = "../xtask" }
-provider-anthropic = { path = "../provider-anthropic" }
 tempfile = "3"

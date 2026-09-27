@@ -35,7 +35,7 @@ manifests.
 contracts ([docs/SPI.md](docs/SPI.md)), the plugin substrate (Rust
 guests compiled to wasm32, [docs/SUBSTRATE.md](docs/SUBSTRATE.md)),
 the bundled plugins (the Anthropic provider and the `read`, `write`,
-`grep` and `bash` tools, [plugins/](plugins/)), the agent loop
+`edit`, `grep` and `bash` tools, [plugins/](plugins/)), the agent loop
 (`gwennol_core::agent::Session`) and the `gwennol` CLI (interactive by
 default, `-p` for a print run, rules first, then a prompt in a
 session, every decision traced, [crates/gwennol-cli/](crates/gwennol-cli/)) exist and are
@@ -70,7 +70,7 @@ cargo build -p gwennol-cli
 export GWENNOL_SECRET_PROVIDER_ANTHROPIC_API_KEY=sk-ant-…
 cd /path/to/a/repository
 /path/to/gwennol/target/debug/gwennol \
-    --trust-runtime provider-anthropic \
+    --trust-runtime provider-anthropic --trust-runtime tool-edit \
     --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**'
 ```
 
@@ -80,7 +80,7 @@ takes each turn, and a request no rule decides is asked at a prompt;
 
 ```sh
 /path/to/gwennol/target/debug/gwennol -p \
-    --trust-runtime provider-anthropic \
+    --trust-runtime provider-anthropic --trust-runtime tool-edit \
     --allow 'http:POST https://api.anthropic.com/*' --allow 'read:**' \
     'What is this repository for?'
 ```
@@ -103,6 +103,7 @@ crates/gwennol-cli/    the `gwennol` binary: interactive session or print run; r
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out
 crates/provider-anthropic/  the bundled model provider's guest code
+crates/tool-edit/      the bundled edit tool's guest code
 crates/xtask/          `cargo xtask bundle`: compile guests, fill manifests
 plugins/               bundled SPI contracts, provider and tool manifests
 docs/                  roadmap and design notes

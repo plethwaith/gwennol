@@ -26,13 +26,19 @@ use gwennol::tui::screen::{Kitty, Screen};
 use gwennol::tui::ui::{Entry, SCROLLED, Shared, TurnState, Ui, render, wrap};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
 use gwennol_core::Session;
-use provider_anthropic::PLUGIN_NAME as PROVIDER;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+/// The committed provider and edit-tool plugins' own `name` fields
+/// (`plugins/providers/anthropic.json`, `plugins/tools/edit.json`).
+/// Neither guest crate is a dev-dependency of this binary — see
+/// `gwennol-cli/Cargo.toml`.
+const PROVIDER: &str = "provider-anthropic";
+const EDIT: &str = "tool-edit";
 
 // ------------------------------------------------------------- fixture
 
@@ -183,11 +189,12 @@ fn fixture() -> &'static Fixture {
         std::fs::write(
             &config,
             format!(
-                "[plugins]\ndir = {plugins:?}\ntrust_runtimes = [{provider:?}]\n\n\
+                "[plugins]\ndir = {plugins:?}\ntrust_runtimes = [{provider:?}, {edit:?}]\n\n\
                  [plugin_config.{provider}]\nmodel = \"claude-fixture\"\nbase_url = \"http://{addr}/scripted\"\n\n\
                  [[rules]]\ndeny = \"write:forbidden.txt\"\n",
                 plugins = plugins.display().to_string(),
                 provider = PROVIDER,
+                edit = EDIT,
                 addr = stub.addr,
             ),
         )
@@ -564,6 +571,10 @@ async fn scenario() {
     // ends in seconds rather than at the outer 180s timeout.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
+    // Every request the stub has already seen from any test in this
+    // process: `stub()` is one shared static, so only the delta below
+    // is run A's own.
+    let requests_before_a = stub().requests().len();
     let driver = {
         let shared = shared.clone();
         tokio::spawn(async move {
@@ -634,7 +645,7 @@ async fn scenario() {
         trace_at(6, "gwennol: POST http://");
         assert_eq!(
             entries[7],
-            Entry::Assistant("It says: hello from the workspace\n".to_string()),
+            Entry::Assistant("It says:      1\thello from the workspace\n".to_string()),
             "run A entry 7"
         );
         assert!(
@@ -662,8 +673,16 @@ async fn scenario() {
         assert_eq!(ui_text, transcript_text, "run A invariant (turn 1)");
         assert_eq!(
             ui_text,
-            "Let me read it.It says: hello from the workspace\n"
+            "Let me read it.It says:      1\thello from the workspace\n"
         );
+    }
+    // The default prompt names a session, not a print run: the
+    // interactive frontend passes `Mode::Interactive`.
+    {
+        let first = &stub().requests()[requests_before_a];
+        let system = first.2["system"].as_str().unwrap();
+        assert!(system.contains(frontend::SESSION), "{system}");
+        assert!(!system.contains(frontend::PRINT_RUN), "{system}");
     }
     // The opening round's thinking block is replayed on the follow-up
     // exactly as the headless smoke test pins it, so the interactive
@@ -1320,7 +1339,7 @@ async fn scenario() {
                 );
                 assert!(
                     entries.iter().any(
-                        |e| matches!(e, Entry::Assistant(t) if t.starts_with("It says: outside"))
+                        |e| matches!(e, Entry::Assistant(t) if t.starts_with("It says:      1\toutside"))
                     ),
                     "run K: {entries:?}"
                 );
