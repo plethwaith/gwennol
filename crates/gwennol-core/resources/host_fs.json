@@ -53,7 +53,7 @@
           "path": { "type": "string" },
           "content": { "type": "string" },
           "create_dirs": { "type": "boolean", "default": false, "description": "Create missing parent directories." },
-          "expect_content": { "type": "string", "description": "Write only if the destination, just before it is replaced, is a regular file holding exactly this text. The outcomes a write gives without it come first (a symlink is is_symlink, a directory is_directory, a missing parent not_found); after those checks, if it holds other text, is missing, has become a symlink, or is not a regular file (a FIFO or a socket), nothing is written and the outcome is changed, unless opening it is refused for permission; that, and any other error opening or reading it, is answered as the same error from the write would be (permission_denied when the agent's user may not read it). Cannot be combined with create_dirs." }
+          "expect_content": { "type": "string", "description": "Write only if the destination, just before it is replaced, is a regular file holding exactly this text. The outcomes a write gives without it come first (a symlink is is_symlink, a directory is_directory, a missing parent not_found); after those checks, if it holds other text, is missing, has become a symlink, or is not a regular file (a FIFO or a socket, say), nothing is written and the outcome is changed, unless opening it is refused for permission; that, and any other error opening or reading it, is answered as the same error from the write would be (permission_denied when the agent's user may not read it). Cannot be combined with create_dirs." }
         }
       },
       "outputSchema": {

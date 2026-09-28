@@ -620,12 +620,13 @@ async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
 
 /// D1/D2: the range may complete on the very chunk that also crosses the
 /// ceiling; checking completion first keeps it from being reported
-/// truncated, and the probe never runs. One byte follows the completed
-/// range (`READ_BYTES_CEILING + 1`), so a scan that reached the ceiling
-/// before seeing the range complete would find the file going on and
-/// report it truncated. Mutations: M3, move the ceiling check above the
-/// completion check; M4, delete the completion check; M5, run the probe
-/// unconditionally after the loop. Each → `truncated: true`.
+/// truncated, and the probe never runs. The range ends on byte
+/// `READ_BYTES_CEILING + 1`, the last one the scan may read, and one
+/// byte follows it, so a scan that reached the ceiling before seeing the
+/// range complete would find the file going on and report it truncated.
+/// Mutations: M3, move the ceiling check above the completion check; M4,
+/// delete the completion check; M5, run the probe unconditionally after
+/// the loop. Each → `truncated: true`.
 #[tokio::test]
 async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_crosses_the_ceiling() {
     let f = fixture();
@@ -1173,7 +1174,7 @@ async fn fs_write_with_expected_content_refuses_a_fifo() {
 
 /// D3: a Unix socket at the destination refuses the write as `changed`,
 /// and the socket stays. Opening a socket for reading fails outright
-/// (`EOPNOTSUPP` on macOS, `ENXIO` on Linux); the step still maps that
+/// (`EOPNOTSUPP` on macOS, `ENXIO` on Linux); the step maps that refusal
 /// to `changed`, as it does for a FIFO. Mutation: M6, drop `EOPNOTSUPP`
 /// from `is_special_file_refusal` (macOS); M7, the same under
 /// `GWENNOL_NO_DIR_HANDLES=1`. Each fails at `.expect` with the step
