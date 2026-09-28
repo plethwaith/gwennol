@@ -168,6 +168,17 @@ fn is_nofollow_refusal(e: nix::errno::Errno) -> bool {
     matches!(e, Errno::ELOOP | Errno::EMLINK)
 }
 
+/// An open for reading refused because the name is a special file
+/// that cannot be opened that way: `ENXIO` (a Unix socket on Linux;
+/// a device special file with no device behind it) or `EOPNOTSUPP`
+/// (a socket on macOS). Neither answers an open of a regular file
+/// with the flags [`Dir::holds`] uses.
+#[cfg(unix)]
+fn is_special_file_refusal(e: nix::errno::Errno) -> bool {
+    use nix::errno::Errno;
+    matches!(e, Errno::ENXIO | Errno::EOPNOTSUPP)
+}
+
 impl Dir {
     /// Hold the directory at `path` open, following symlinks on the way
     /// — the caller canonicalises and verifies afterwards, through
@@ -328,10 +339,11 @@ impl Dir {
 
     /// Whether `name` in this directory is a regular file whose bytes
     /// are exactly `expected`, looked at (on unix) without following a
-    /// link and without blocking: missing, a symlink (on unix), or a
-    /// file that opens but is not a regular file is `false`; any other
-    /// error opening or reading it is returned. Reads at most one byte
-    /// past `expected`.
+    /// link and without blocking: missing, a symlink (on unix), or not
+    /// a regular file (one that opens as something else, or, on unix,
+    /// one whose open is refused as a socket or a device with nothing
+    /// behind it) is `false`; any other error opening or reading it is
+    /// returned. Reads at most one byte past `expected`.
     pub fn holds(&self, name: &OsStr, expected: &[u8]) -> io::Result<bool> {
         use std::io::Read as _;
         #[cfg(dir_handles)]
@@ -345,7 +357,7 @@ impl Dir {
             ) {
                 Ok(fd) => std::fs::File::from(fd),
                 Err(nix::errno::Errno::ENOENT) => return Ok(false),
-                Err(e) if is_nofollow_refusal(e) => return Ok(false),
+                Err(e) if is_nofollow_refusal(e) || is_special_file_refusal(e) => return Ok(false),
                 Err(e) => return Err(io::Error::from(e)),
             }
         };
@@ -370,7 +382,8 @@ impl Dir {
                 #[cfg(unix)]
                 Err(e)
                     if e.raw_os_error().is_some_and(|code| {
-                        is_nofollow_refusal(nix::errno::Errno::from_raw(code))
+                        let errno = nix::errno::Errno::from_raw(code);
+                        is_nofollow_refusal(errno) || is_special_file_refusal(errno)
                     }) =>
                 {
                     return Ok(false);

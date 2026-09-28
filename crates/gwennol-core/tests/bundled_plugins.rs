@@ -557,7 +557,7 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
         json!({"path": format!("crates/{PROVIDER}")})
     );
     // The manifest's own step-type match and script `source` fields
-    // agree with the entry names it declares elsewhere in this file.
+    // agree with the constants above.
     assert_eq!(raw["stepTypeImpls"][0]["matches"], PROVIDER);
     assert_eq!(
         raw["actions"][spi::llm_chat::CHAT]["steps"][0]["params"]["source"],
@@ -569,9 +569,10 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
     );
     assert!(raw["actions"][FETCH_ACTION].is_object());
     // Both turn shapes send the same `anthropic-version`: read from
-    // `fetch_turn`'s own header and compared to `stream_turn`'s,
-    // rather than to a Rust copy of the literal (no crate re-declares
-    // it; provider-anthropic is not a dev-dependency of this binary).
+    // `fetch_turn`'s own header and compared to `stream_turn`'s. The
+    // value itself is pinned by provider-anthropic's own tests, against
+    // `wire::ANTHROPIC_VERSION`; that crate is not a dev-dependency of
+    // this binary.
     let anthropic_version =
         raw["actions"][FETCH_ACTION]["steps"][0]["params"]["headers"]["anthropic-version"]
             .as_str()

@@ -9,7 +9,7 @@
     "call": {
       "tool": {
         "name": "write",
-        "description": "Create or replace a file with the given text, creating missing parent directories. The write is atomic: the file is never observable half-written. Refuses to write through a symlink.",
+        "description": "Create or replace a file with the given text, creating missing parent directories. The write is atomic: the file is never observable half-written. Refuses a destination that is a symlink.",
         "parameters": {
           "type": "object",
           "required": ["path", "content"],
