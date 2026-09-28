@@ -97,9 +97,11 @@ fn http_subject(method: &str, url: &str) -> Option<String> {
 /// the three path kinds; for a spawn without stdin, the argv and cwd
 /// `spawn_subject` writes; for `http`, `http_subject`. `None` for
 /// a spawn carrying stdin — the stdin is the payload, and each one is
-/// a new request — for a kind this frontend does not know, and for an
+/// a new request — for a kind this frontend does not know, for an
 /// `http` URL that fails to parse, whose placeholder text is the same
-/// for every such request. Built
+/// for every such request — and for a path, or a shown spawn `cwd`,
+/// that is not UTF-8 — its text is lossy, so two such paths could
+/// share it —. Built
 /// through the same helpers [`ShowAccess`] renders with, so the two
 /// cannot drift: a session rule matches exactly the text the prompt
 /// showed — for `http` that text is the *scrubbed* URL with a marker
@@ -111,13 +113,19 @@ fn http_subject(method: &str, url: &str) -> Option<String> {
 pub fn subject(access: &Access, workspace: &Path) -> Option<String> {
     match access {
         Access::ReadFile(p) | Access::WriteFile(p) | Access::ListDir(p) => {
-            Some(p.display().to_string())
+            p.to_str().map(str::to_string)
         }
         Access::Spawn {
             argv,
             cwd,
             stdin: None,
-        } => Some(spawn_subject(argv, cwd, workspace)),
+        } => {
+            if cwd != workspace && cwd.to_str().is_none() {
+                None
+            } else {
+                Some(spawn_subject(argv, cwd, workspace))
+            }
+        }
         Access::Spawn { stdin: Some(_), .. } => None,
         Access::Http { method, url } => http_subject(method, url),
         _ => None,
@@ -369,6 +377,49 @@ mod tests {
         };
         assert_eq!(show(&unparseable_http), "GET request (unparseable URL)");
         assert_eq!(subject(&unparseable_http, ws), None);
+    }
+
+    /// Guards D6: a path (or a shown spawn `cwd`) that is not valid
+    /// UTF-8 has no subject — its lossy text could be shared by
+    /// another such path — but `ShowAccess` still renders the lossy
+    /// text, since the prompt has nothing else to show. Mutations,
+    /// named in the PR body: revert the path arm of `subject` (the
+    /// `\xff` path gets a subject); revert the spawn `cwd` check (the
+    /// non-UTF-8 `cwd` gets a subject).
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_never_a_subject() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let ws = Path::new("/ws");
+        let lossy = Access::ReadFile(PathBuf::from(OsString::from_vec(b"/ws/a\xff.txt".to_vec())));
+        assert_eq!(subject(&lossy, ws), None);
+        assert_eq!(
+            ShowAccess {
+                access: &lossy,
+                workspace: ws
+            }
+            .to_string(),
+            "read /ws/a\u{FFFD}.txt"
+        );
+
+        let clean = Access::ReadFile(PathBuf::from("/ws/a\u{FFFD}.txt"));
+        assert_eq!(subject(&clean, ws), Some("/ws/a\u{FFFD}.txt".to_string()));
+
+        let elsewhere_lossy = Access::Spawn {
+            argv: vec!["sh".into()],
+            cwd: PathBuf::from(OsString::from_vec(b"/else\xff".to_vec())),
+            stdin: None,
+        };
+        assert_eq!(subject(&elsewhere_lossy, ws), None);
+
+        let at_workspace = Access::Spawn {
+            argv: vec!["sh".into()],
+            cwd: ws.to_path_buf(),
+            stdin: None,
+        };
+        assert!(subject(&at_workspace, ws).is_some());
     }
 
     #[test]

@@ -353,7 +353,9 @@ impl Rule {
 /// URL cut)`), any credentials at it. The markers are part of the
 /// subject, so a URL shown with neither matches only itself, never one
 /// that carried a query or credentials. Tried after every compiled
-/// rule, so it can never pre-empt a file's `deny`.
+/// rule, so it can never pre-empt a file's `deny`. A path that is not
+/// UTF-8, or a spawn shown with a `cwd` that is not, has no subject
+/// ([`crate::show::subject`]) and is never remembered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRule {
     /// Allow or deny.
@@ -374,6 +376,20 @@ impl SessionRule {
         self.plugin == request.plugin
             && Kind::of(&request.access) == Some(self.kind)
             && crate::show::subject(&request.access, root).as_deref() == Some(self.subject.as_str())
+    }
+}
+
+/// Record `rule`, replacing the rule with the same plugin, kind and
+/// subject if there is one: the later answer is the one that stands,
+/// so at most one session rule matches any request.
+pub fn remember(rules: &mut Vec<SessionRule>, rule: SessionRule) {
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|r| r.plugin == rule.plugin && r.kind == rule.kind && r.subject == rule.subject)
+    {
+        *existing = rule;
+    } else {
+        rules.push(rule);
     }
 }
 
@@ -563,10 +579,10 @@ impl Policy {
     }
 
     /// Judge a request: the first matching compiled rule, else the
-    /// first matching session rule, in the order they were made;
-    /// else the default denial. Compiled rules being tried first —
-    /// not the order the session rules are in — is what keeps a
-    /// session rule from pre-empting a compiled `deny`.
+    /// session rule that matches (at most one does: [`remember`] keeps
+    /// one per plugin, kind and subject), else the default denial.
+    /// Compiled rules being tried first is what keeps a session rule
+    /// from pre-empting a compiled `deny`.
     pub fn judge_with<'a>(
         &'a self,
         request: &ApprovalRequest,
@@ -1274,6 +1290,81 @@ mod tests {
         assert_eq!(
             p.judge(&read("/ws/a.txt")).to_string(),
             "denied: no rule matched"
+        );
+    }
+
+    /// Guards D5: a later answer for the same plugin, kind and subject
+    /// replaces the earlier one, so at most one session rule ever
+    /// matches a request; rules for a different plugin, kind or
+    /// subject stand side by side. Mutations, named in the PR body:
+    /// `answer_prompt` pushes instead of calling `remember` (two rules
+    /// would match, and `judge_with`'s first-match order would decide);
+    /// `remember` keys on subject alone (a rule for another plugin
+    /// would be replaced).
+    #[test]
+    fn a_later_answer_replaces_the_rule_for_the_same_request() {
+        let mut rules = Vec::new();
+        remember(
+            &mut rules,
+            SessionRule {
+                decision: Decision::Allow,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/a".to_string(),
+            },
+        );
+        remember(
+            &mut rules,
+            SessionRule {
+                decision: Decision::Deny,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/a".to_string(),
+            },
+        );
+        assert_eq!(
+            rules,
+            vec![SessionRule {
+                decision: Decision::Deny,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/a".to_string(),
+            }]
+        );
+        remember(
+            &mut rules,
+            SessionRule {
+                decision: Decision::Allow,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/b".to_string(),
+            },
+        );
+        remember(
+            &mut rules,
+            SessionRule {
+                decision: Decision::Allow,
+                plugin: "tool-edit".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/a".to_string(),
+            },
+        );
+        assert_eq!(
+            rules.len(),
+            3,
+            "different subjects, plugins and kinds all stand side by side"
+        );
+
+        let p = policy(vec![]);
+        let j = p.judge_with(
+            &request("tool-write", Access::WriteFile(PathBuf::from("/ws/a"))),
+            &rules,
+        );
+        assert_eq!(j.decision, Decision::Deny);
+        assert_eq!(
+            j.session.map(|s| s.decision),
+            Some(Decision::Deny),
+            "the trace should name the Deny rule, the later answer"
         );
     }
 

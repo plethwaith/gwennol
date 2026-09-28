@@ -162,8 +162,14 @@ pub struct Ui {
     /// The last id assigned to a prompt; [`crate::tui::prompt::PromptGuard::open`]
     /// increments and assigns it.
     pub prompt_seq: u64,
-    /// Rules made at prompts, in the order made: tried after every
-    /// compiled rule by `Interactive::approve` under this same lock.
+    /// The earliest instant `y`, `n`, `a` or `d` may answer the first
+    /// prompt: [`crate::tui::prompt::ARM_DELAY`] after it became the
+    /// first, pushed later by every key or paste that reaches it without
+    /// answering. Written by `PromptGuard` and `prompt::key` only.
+    pub prompt_armed_at: Instant,
+    /// Rules made at prompts, at most one per plugin, kind and subject
+    /// ([`crate::policy::remember`]): tried after every compiled rule
+    /// by `Interactive::approve` under this same lock.
     pub session_rules: Vec<SessionRule>,
     /// The canonical workspace, set once by `tui::start` (`tui/mod.rs`)
     /// before the frontend runs a turn: what a prompt's key handler
@@ -241,6 +247,7 @@ impl Default for Ui {
             pane_cache: std::cell::RefCell::new(None),
             prompts: Vec::new(),
             prompt_seq: 0,
+            prompt_armed_at: Instant::now(),
             session_rules: Vec::new(),
             workspace: PathBuf::new(),
             scroll: None,
@@ -445,7 +452,7 @@ pub const HELP: &[&str] = &[
     "/exit ends the session (twice while a turn is unwinding: exit at once, status 130)",
     "/help lists the commands",
     "Esc cancels the running turn (denies once instead, at an open approval prompt)",
-    "y n a d answer an open approval prompt: once, or for the rest of the session; Esc denies once",
+    "y n a d answer an open approval prompt once no key has been pressed for a second: once, or for the rest of the session; Esc denies once at any time",
     "PageUp PageDown scroll the pane; Home End too while the editor is empty; End follows the tail again",
     "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it",
 ];

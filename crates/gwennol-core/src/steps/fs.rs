@@ -70,6 +70,10 @@ pub enum Outcome {
     /// write through or replace (the approved path would not name where
     /// the bytes land, and the rename would destroy the link).
     IsSymlink,
+    /// `host_fs.write` with `expect_content`: the destination does not
+    /// hold that content when the write would replace it — changed,
+    /// removed, or not a regular file. Nothing was written.
+    Changed,
 }
 
 impl Outcome {
@@ -93,6 +97,7 @@ impl Outcome {
             Outcome::NotADirectory => "not_a_directory",
             Outcome::PermissionDenied => "permission_denied",
             Outcome::IsSymlink => "is_symlink",
+            Outcome::Changed => "changed",
         }
     }
 
@@ -107,6 +112,11 @@ impl Outcome {
             Outcome::PermissionDenied => format!("permission denied: {path}"),
             Outcome::IsSymlink => {
                 format!("is a symlink, which the host will not write through or replace: {path}")
+            }
+            Outcome::Changed => {
+                format!(
+                    "no longer holds the content this write expected, so nothing was written: {path}"
+                )
             }
         };
         json!({"outcome": self.name(), "message": message}).into()
@@ -808,10 +818,12 @@ async fn fill_temp(
     Ok(())
 }
 
-/// `host_fs.write`: `{path, content, create_dirs?}` → `{outcome: "ok",
-/// bytes_written}`, or `{outcome, message}` when the destination cannot
-/// take the file (a missing parent without `create_dirs`, a directory or
-/// a non-directory in the way, permission denied, a symlink).
+/// `host_fs.write`: `{path, content, create_dirs?, expect_content?}` →
+/// `{outcome: "ok", bytes_written}`, or `{outcome, message}` when the
+/// destination cannot take the file (a missing parent without
+/// `create_dirs`, a directory or a non-directory in the way, permission
+/// denied, a symlink, or the destination no longer holding
+/// `expect_content`).
 ///
 /// The approved path is what [`deepest_canonical`] spells for the
 /// destination — canonical up to its deepest canonicalisable ancestor, so the
@@ -850,6 +862,13 @@ async fn fill_temp(
 ///
 /// The write goes through a temporary file in the same directory and a
 /// rename, so the destination is never observable half-written.
+///
+/// With `expect_content`, the write goes ahead only if the destination,
+/// looked at just before the rename, is a regular file holding exactly
+/// those bytes; otherwise the temporary is removed and the outcome is
+/// `changed`. The look is after the approval, so a change made while the
+/// operator decided is caught; one landing between the look and the
+/// rename is not. It cannot be combined with `create_dirs`.
 pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -864,6 +883,21 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
             None => return Err(StepError::Failed("missing required param 'content'".into())),
         };
         let create_dirs = bool_param(&p, "create_dirs", false)?;
+        let expect_content = match p.get("expect_content") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(other) => {
+                return Err(StepError::Failed(format!(
+                    "param 'expect_content' must be a string, got {other}"
+                )));
+            }
+        };
+        if expect_content.is_some() && create_dirs {
+            return Err(StepError::Failed(
+                "param 'expect_content' names a file that must already exist; it cannot be combined with create_dirs"
+                    .into(),
+            ));
+        }
         let cancel = ex.cancel_token();
         let failed =
             |e: std::io::Error| StepError::Failed(format!("write {}: {e}", path.display()));
@@ -939,9 +973,28 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
             return Err(cancelled());
         }
         let leftover = in_dir.join(&tmp);
-        let renamed = blocking(move || {
+        // With `expect_content`, the destination is looked at — through
+        // the held directory, without following a link — in the same
+        // blocking call as the rename: a mismatch, a missing file, or
+        // one that is no longer a regular file discards the temporary
+        // and answers `changed` instead of renaming.
+        let renamed = blocking(move || -> std::io::Result<bool> {
+            if let Some(expected) = &expect_content {
+                match dir.holds(&name, expected.as_bytes()) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        discard_temp(&dir, &in_dir, &tmp);
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        discard_temp(&dir, &in_dir, &tmp);
+                        return Err(e);
+                    }
+                }
+            }
             dir.rename(&tmp, &name)
                 .inspect_err(|_| discard_temp(&dir, &in_dir, &tmp))
+                .map(|()| true)
         })
         .await
         .inspect_err(|e| {
@@ -954,26 +1007,32 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
             );
         })
         .map_err(failed)?;
-        if let Err(e) = renamed {
-            // A rename that finds nothing has lost the temporary: with
-            // the directory held, to someone else between its creation
-            // and now; on the path fallback, perhaps to the directory
-            // moving out from under its spelled path, the filled
-            // temporary with it. Either way the bytes are not where
-            // they were made, and that is not the destination's answer.
-            if e.kind() == std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %leftover.display(),
-                    error = %e,
-                    "the temporary file could not be found where it was made"
-                );
-                return Err(failed(std::io::Error::other(
-                    "the temporary file could not be found where it was made",
-                )));
+        match renamed {
+            Ok(true) => Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into()),
+            Ok(false) => Ok(Outcome::Changed.result(&path)),
+            Err(e) => {
+                // A rename that finds nothing has lost the temporary: with
+                // the directory held, to someone else between its creation
+                // and now; on the path fallback, perhaps to the directory
+                // moving out from under its spelled path, the filled
+                // temporary with it. Either way the bytes are not where
+                // they were made, and that is not the destination's answer.
+                // (`holds` maps its own "missing" and "not a regular file"
+                // cases to `Ok(false)` above, so a `NotFound` reaching
+                // here can only be the rename's.)
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %leftover.display(),
+                        error = %e,
+                        "the temporary file could not be found where it was made"
+                    );
+                    return Err(failed(std::io::Error::other(
+                        "the temporary file could not be found where it was made",
+                    )));
+                }
+                destination_answer("write", &approved, &path, e)
             }
-            return destination_answer("write", &approved, &path, e);
         }
-        Ok(json!({"outcome": OUTCOME_OK, "bytes_written": content.len()}).into())
     })
 }
 

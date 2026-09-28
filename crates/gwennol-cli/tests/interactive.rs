@@ -15,13 +15,13 @@ use common::{API_KEY, stub, thinking_block};
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gwennol::tui::drive::drive;
 use gwennol::tui::keys::Input;
-use gwennol::tui::prompt::{KEYS_ONCE, TITLE};
+use gwennol::tui::prompt::{ARM_DELAY, KEYS_ONCE, TITLE};
 use gwennol::tui::screen::{Kitty, Screen};
 use gwennol::tui::ui::{Entry, SCROLLED, Shared, TurnState, Ui, render, wrap};
 use gwennol::{Cli, frontend, ordered_rule_flags, tui};
@@ -264,6 +264,15 @@ fn key(tx: &UnboundedSender<Input>, code: KeyCode, modifiers: KeyModifiers) {
 
 fn esc(tx: &UnboundedSender<Input>) {
     key(tx, KeyCode::Esc, KeyModifiers::NONE);
+}
+
+/// Wait until the first prompt's gate is armed, then send `code` as
+/// its answer — what a person waits through in a real terminal,
+/// rather than a guess at the delay.
+async fn answer(tx: &UnboundedSender<Input>, shared: &std::sync::Arc<Shared>, code: KeyCode) {
+    let at = shared.lock().prompt_armed_at;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+    key(tx, code, KeyModifiers::NONE);
 }
 
 /// Wait until `check` holds, polling on `shared.changed`; bounded at
@@ -1169,7 +1178,29 @@ async fn scenario() {
                     "run I: missing argument row {line:?} in {rows:?}"
                 );
             }
-            key(&tx, KeyCode::Char('y'), KeyModifiers::NONE);
+            // D4: a key that does not answer (here, one the legend
+            // does not bind) still pushes the gate, from the real
+            // instant `drive`'s running loop reads it at — not one
+            // captured once before the loop.
+            let before = shared.lock().prompt_armed_at;
+            let sent = Instant::now();
+            key(&tx, KeyCode::Char('x'), KeyModifiers::NONE);
+            await_ui(
+                &shared,
+                |ui| ui.prompt_armed_at != before,
+                "run I: the gate moved",
+            )
+            .await;
+            assert!(
+                shared.lock().prompt_armed_at >= sent + ARM_DELAY,
+                "run I: the gate did not move from a fresh instant"
+            );
+            assert_eq!(
+                shared.lock().editor.text(),
+                "",
+                "run I: the swallowed key reached the editor"
+            );
+            answer(&tx, &shared, KeyCode::Char('y')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
@@ -1224,7 +1255,7 @@ async fn scenario() {
         tokio::spawn(async move {
             type_line(&tx, "write denied.txt");
             await_ui(&shared, prompt_open, "run J: prompt open").await;
-            key(&tx, KeyCode::Char('n'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('n')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
@@ -1315,7 +1346,7 @@ async fn scenario() {
                 "run K: {:?}",
                 box_rows(&shared)
             );
-            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('a')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
@@ -1405,7 +1436,7 @@ async fn scenario() {
                 rows.iter().any(|r| r.contains("asked by tool-grep")),
                 "run L: {rows:?}"
             );
-            key(&tx, KeyCode::Char('d'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('d')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
@@ -1491,7 +1522,7 @@ async fn scenario() {
                     "run M: missing legend row {row:?} in {rows:?}"
                 );
             }
-            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('a')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
@@ -1522,7 +1553,7 @@ async fn scenario() {
             let mid = shared.lock().entries.len();
             type_line(&tx, "sh echo from stdin");
             await_ui(&shared, prompt_open, "run M: second prompt open").await;
-            key(&tx, KeyCode::Char('y'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('y')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, mid) >= 1,
@@ -1637,7 +1668,7 @@ async fn scenario() {
                 "run P: KEYS_ONCE shown instead of the full legend in {:?}",
                 box_rows(&shared)
             );
-            key(&tx, KeyCode::Char('a'), KeyModifiers::NONE);
+            answer(&tx, &shared, KeyCode::Char('a')).await;
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,

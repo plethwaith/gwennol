@@ -178,6 +178,16 @@ fn fixture_plugins() -> Vec<Value> {
             json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}"}}]),
         ),
         plugin(
+            "expect_writer",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "expect_content": "{{$input.expect}}"}}]),
+        ),
+        plugin(
+            "expect_writer_dirs",
+            &["step_type:host_fs.write"],
+            json!([{"id": "w", "type": "host_fs.write", "params": {"path": "{{$input.path}}", "content": "{{$input.content}}", "expect_content": "{{$input.expect}}", "create_dirs": true}}]),
+        ),
+        plugin(
             "lister",
             &["step_type:host_fs.list"],
             json!([{"id": "l", "type": "host_fs.list", "params": {"path": "{{$input.dir}}", "max_entries": "{{$input.max}}"}}]),
@@ -999,6 +1009,136 @@ async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
         .filter(|n| n.contains("gwennol-tmp"))
         .collect();
     assert_eq!(leftovers, Vec::<String>::new());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_with_expected_content_replaces_a_file_that_still_holds_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("expect-ok")).unwrap();
+    let path = f.workspace.join("expect-ok/x.txt");
+    std::fs::write(&path, "one\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let out = run(
+        "expect_writer",
+        json!({"path": "expect-ok/x.txt", "content": "two\n", "expect": "one\n"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["w"]["outcome"], "ok");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("expect-ok"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn fs_write_with_expected_content_refuses_a_changed_file() {
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("expect-changed")).unwrap();
+    for (name, on_disk) in [
+        ("expect-changed/other.txt", "other\n"),
+        ("expect-changed/longer.txt", "one\nmore\n"),
+        ("expect-changed/shorter.txt", "on"),
+    ] {
+        let path = f.workspace.join(name);
+        std::fs::write(&path, on_disk).unwrap();
+        let out = run(
+            "expect_writer",
+            json!({"path": name, "content": "two\n", "expect": "one\n"}),
+        )
+        .await
+        .expect("not a step error");
+        assert_eq!(out["w"]["outcome"], "changed");
+        assert_eq!(
+            out["w"]["message"],
+            format!(
+                "no longer holds the content this write expected, so nothing was written: {}",
+                path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            on_disk,
+            "the refused write touched the file"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("expect-changed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("gwennol-tmp"))
+            .collect();
+        assert_eq!(leftovers, Vec::<String>::new());
+        assert_eq!(
+            f.requests_for("expect_writer")
+                .into_iter()
+                .filter(|a| *a == Access::WriteFile(path.clone()))
+                .count(),
+            1,
+            "the write's one approval was not asked for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fs_write_with_expected_content_refuses_a_missing_file() {
+    let f = fixture();
+    let path = f.workspace.join("expect-missing.txt");
+    let out = run(
+        "expect_writer",
+        json!({"path": "expect-missing.txt", "content": "two\n", "expect": "one\n"}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "changed");
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_with_expected_content_refuses_a_fifo() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let f = fixture();
+    let path = f.workspace.join("expect.fifo");
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let out = run(
+        "expect_writer",
+        json!({"path": "expect.fifo", "content": "two\n", "expect": ""}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "changed");
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "the FIFO was replaced"
+    );
+}
+
+#[tokio::test]
+async fn fs_write_refuses_expected_content_with_create_dirs() {
+    let f = fixture();
+    let err = run(
+        "expect_writer_dirs",
+        json!({"path": "expect-dirs/missing/below.txt", "content": "two\n", "expect": "one\n"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "param 'expect_content' names a file that must already exist; it cannot be combined with create_dirs"
+        ),
+        "{err}"
+    );
+    assert!(f.requests_for("expect_writer_dirs").is_empty());
+    assert!(!f.workspace.join("expect-dirs").exists());
 }
 
 #[tokio::test]
