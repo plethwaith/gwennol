@@ -1171,13 +1171,13 @@ async fn fs_write_with_expected_content_refuses_a_fifo() {
     );
 }
 
-/// D3: a Unix socket at the destination refuses the write as `changed`
-/// without blocking on it, and the socket stays. Opening a socket for
-/// reading fails outright (`EOPNOTSUPP` on macOS, `ENXIO` on Linux); the
-/// step still maps that to `changed`, as it does for a FIFO. Mutation:
-/// M6, drop `EOPNOTSUPP` from `is_special_file_refusal` (this Mac); M7,
-/// the same under `GWENNOL_NO_DIR_HANDLES=1`. Each fails at `.expect`
-/// with the step error.
+/// D3: a Unix socket at the destination refuses the write as `changed`,
+/// and the socket stays. Opening a socket for reading fails outright
+/// (`EOPNOTSUPP` on macOS, `ENXIO` on Linux); the step still maps that
+/// to `changed`, as it does for a FIFO. Mutation: M6, drop `EOPNOTSUPP`
+/// from `is_special_file_refusal` (macOS); M7, the same under
+/// `GWENNOL_NO_DIR_HANDLES=1`. Each fails at `.expect` with the step
+/// error.
 #[cfg(unix)]
 #[tokio::test]
 async fn fs_write_with_expected_content_refuses_a_socket() {

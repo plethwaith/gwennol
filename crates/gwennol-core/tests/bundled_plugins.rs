@@ -557,7 +557,7 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
         json!({"path": format!("crates/{PROVIDER}")})
     );
     // The manifest's own step-type match and script `source` fields
-    // agree with the entry-name constants above.
+    // agree with the constants above.
     assert_eq!(raw["stepTypeImpls"][0]["matches"], PROVIDER);
     assert_eq!(
         raw["actions"][spi::llm_chat::CHAT]["steps"][0]["params"]["source"],

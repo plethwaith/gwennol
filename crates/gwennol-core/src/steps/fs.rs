@@ -144,9 +144,9 @@ impl Outcome {
 /// from its start: lines before `offset` are read and dropped, the scan
 /// stops once more than `READ_BYTES_CEILING` bytes have been read, and the
 /// output (line numbers included) is cut at `max_bytes`; `truncated` says
-/// either cut happened. The scan's cut is reported only when the file goes
-/// on past what it read: one more byte is read to tell. With none of
-/// them, or `offset: 1` alone, this is byte-for-byte the plain read above.
+/// either cut happened. The scan's cut is reported unless one more byte,
+/// read to tell, finds the end of the file. With none of them, or
+/// `offset: 1` alone, this is byte-for-byte the plain read above.
 pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -876,8 +876,9 @@ async fn fill_temp(
 /// those bytes. The answers above come first; after them, if it holds
 /// other bytes, is missing, has become a symlink, or is not a regular
 /// file (a FIFO or a socket, say), the temporary is removed and the
-/// outcome is `changed`; any other error opening or reading it is
-/// answered as the same error from the rename would be.
+/// outcome is `changed`, unless opening it is refused for permission;
+/// that, and any other error opening or reading it, is answered as the
+/// same error from the rename would be.
 /// The look is after the approval, so a change made while the operator
 /// decided is caught; one landing between the look and the rename is
 /// not. It cannot be combined with `create_dirs`.
@@ -989,8 +990,9 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // the held anchor, without following a link — in the same
         // blocking call as the rename: a mismatch, a missing file, a
         // symlink, or anything that is not a regular file discards the
-        // temporary and answers `changed` instead of renaming; any other
-        // error opening or reading it discards the temporary and is
+        // temporary and answers `changed` instead of renaming, unless
+        // opening it is refused for permission; that, and any other
+        // error opening or reading it, discards the temporary and is
         // returned.
         let renamed = blocking(move || -> std::io::Result<bool> {
             if let Some(expected) = &expect_content {
