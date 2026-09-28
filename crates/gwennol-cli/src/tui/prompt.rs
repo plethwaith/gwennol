@@ -153,8 +153,8 @@ enum Answer {
 }
 
 /// Route one key to the first open prompt. `true` when the key was
-/// the prompt's — every key is, while a prompt is open. `Esc`
-/// denies once at any time. `y`/`n`/`a`/`d` (unmodified only) answer
+/// the prompt's — every key is, while a prompt is open. Unmodified,
+/// `Esc` denies once at any time and `y`/`n`/`a`/`d` answer
 /// once `now` has reached `ui.prompt_armed_at`; before then each is
 /// swallowed and sets [`EARLY`]. The scroll keys move `scroll`
 /// regardless of modifiers. Every key that does not answer pushes

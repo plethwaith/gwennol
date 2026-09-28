@@ -327,10 +327,11 @@ impl Dir {
     }
 
     /// Whether `name` in this directory is a regular file whose bytes
-    /// are exactly `expected`, looked at without following a link and
-    /// without blocking: missing, a symlink, or a file that opens but
-    /// is not a regular file is `false`; any other error opening or
-    /// reading it is returned. Reads at most one byte past `expected`.
+    /// are exactly `expected`, looked at (on unix) without following a
+    /// link and without blocking: missing, a symlink (on unix), or a
+    /// file that opens but is not a regular file is `false`; any other
+    /// error opening or reading it is returned. Reads at most one byte
+    /// past `expected`.
     pub fn holds(&self, name: &OsStr, expected: &[u8]) -> io::Result<bool> {
         use std::io::Read as _;
         #[cfg(dir_handles)]

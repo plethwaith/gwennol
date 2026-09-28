@@ -1297,8 +1297,8 @@ mod tests {
     /// replaces the earlier one, so at most one session rule ever
     /// matches a request; rules for a different plugin, kind or
     /// subject stand side by side. Mutation, named in the PR body:
-    /// `remember` keys on subject alone (a rule for another plugin
-    /// would be replaced).
+    /// `remember` keys on plugin and subject alone (the rule for
+    /// another kind would be replaced).
     #[test]
     fn a_later_answer_replaces_the_rule_for_the_same_request() {
         let mut rules = Vec::new();

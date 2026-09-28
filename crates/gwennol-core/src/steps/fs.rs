@@ -846,10 +846,10 @@ async fn fill_temp(
 /// parent canonical: resolving the link would show the operator a write
 /// to the target that is precisely what will not happen. A link planted
 /// at the destination's name after the approval gets the same answer;
-/// one planted between that check and the rename is replaced by the
-/// rename, in the approved directory under the approved name — the
-/// bytes still land where the operator was told, and only the link is
-/// lost.
+/// one planted between that check and the rename is, without
+/// `expect_content`, replaced by the rename, in the approved directory
+/// under the approved name — the bytes still land where the operator
+/// was told, and only the link is lost.
 ///
 /// While the anchor is held and lets its names be looked at, a
 /// destination nobody can act on — a name too long for the anchor's
@@ -865,10 +865,11 @@ async fn fill_temp(
 ///
 /// With `expect_content`, the write goes ahead only if the destination,
 /// looked at just before the rename, is a regular file holding exactly
-/// those bytes. If it holds other bytes, is missing, is a symlink, or
-/// opens as something other than a regular file, the temporary is
-/// removed and the outcome is `changed`; any other error opening or
-/// reading it is answered as the same error from the rename would be.
+/// those bytes. The answers above come first; after them, if it holds
+/// other bytes, is missing, has become a symlink, or opens as something
+/// other than a regular file, the temporary is removed and the outcome
+/// is `changed`; any other error opening or reading it is answered as
+/// the same error from the rename would be.
 /// The look is after the approval, so a change made while the operator
 /// decided is caught; one landing between the look and the rename is
 /// not. It cannot be combined with `create_dirs`.
