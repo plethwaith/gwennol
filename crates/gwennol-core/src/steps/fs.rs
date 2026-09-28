@@ -144,8 +144,9 @@ impl Outcome {
 /// from its start: lines before `offset` are read and dropped, the scan
 /// stops once more than `READ_BYTES_CEILING` bytes have been read, and the
 /// output (line numbers included) is cut at `max_bytes`; `truncated` says
-/// either cut happened. With none of them, or `offset: 1` alone, this is
-/// byte-for-byte the plain read above.
+/// either cut happened. The scan's cut is reported only when the file goes
+/// on past what it read: one more byte is read to tell. With none of
+/// them, or `offset: 1` alone, this is byte-for-byte the plain read above.
 pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -293,9 +294,11 @@ pub fn fs_read<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) 
 /// number (right-aligned in six columns, then a tab) when `numbered`,
 /// keeping its own line ending (`\n` stays; `\r` before it is kept too).
 /// Reading stops when the range is complete, at end of file, once the
-/// output exceeds `max`, or once more than
-/// [`READ_BYTES_CEILING`] bytes of the file have been consumed — the
-/// second element of the result says whether that ceiling stopped it.
+/// output exceeds `max`, or once more than [`READ_BYTES_CEILING`] bytes
+/// of the file have been consumed; the second element of the result says
+/// whether that ceiling stopped it with the file going on. One byte past
+/// the scanned ones is read to tell, and a read error there counts as
+/// going on.
 async fn read_lines(
     file: tokio::fs::File,
     offset: u64,
@@ -310,11 +313,8 @@ async fn read_lines(
     let mut kept: u64 = 0;
     let mut consumed: u64 = 0;
     let mut at_line_start = true;
-    let mut scan_cut = false;
+    let mut at_ceiling = false;
     loop {
-        if line_no >= offset && limit.is_some_and(|l| kept >= l) {
-            break;
-        }
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
             break;
@@ -345,13 +345,21 @@ async fn read_lines(
             break;
         }
         if consumed > READ_BYTES_CEILING {
-            scan_cut = true;
+            at_ceiling = true;
             break;
         }
         if in_range && out.len() > max {
             break;
         }
     }
+    // The ceiling stopped the scan with every byte `take` allows
+    // consumed, so nothing is buffered: one byte more from the file
+    // itself says whether it went on. A read that cannot say counts as
+    // going on.
+    let scan_cut = at_ceiling && {
+        let mut rest = reader.into_inner().into_inner();
+        !matches!(rest.read(&mut [0u8; 1]).await, Ok(0))
+    };
     Ok((out, scan_cut))
 }
 
@@ -866,10 +874,10 @@ async fn fill_temp(
 /// With `expect_content`, the write goes ahead only if the destination,
 /// looked at just before the rename, is a regular file holding exactly
 /// those bytes. The answers above come first; after them, if it holds
-/// other bytes, is missing, has become a symlink, or opens as something
-/// other than a regular file, the temporary is removed and the outcome
-/// is `changed`; any other error opening or reading it is answered as
-/// the same error from the rename would be.
+/// other bytes, is missing, has become a symlink, or is not a regular
+/// file (a FIFO or a socket, say), the temporary is removed and the
+/// outcome is `changed`; any other error opening or reading it is
+/// answered as the same error from the rename would be.
 /// The look is after the approval, so a change made while the operator
 /// decided is caught; one landing between the look and the rename is
 /// not. It cannot be combined with `create_dirs`.
@@ -980,10 +988,10 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         // With `expect_content`, the destination is looked at — through
         // the held anchor, without following a link — in the same
         // blocking call as the rename: a mismatch, a missing file, a
-        // symlink, or one that opens as something other than a regular
-        // file discards the temporary and answers `changed` instead of
-        // renaming; any other error opening or reading it discards the
-        // temporary and is returned.
+        // symlink, or anything that is not a regular file discards the
+        // temporary and answers `changed` instead of renaming; any other
+        // error opening or reading it discards the temporary and is
+        // returned.
         let renamed = blocking(move || -> std::io::Result<bool> {
             if let Some(expected) = &expect_content {
                 match dir.holds(&name, expected.as_bytes()) {

@@ -561,6 +561,30 @@ async fn fs_read_cuts_a_numbered_range_at_max_bytes() {
     assert_eq!(out["r"]["truncated"], true);
 }
 
+/// D1: a file exactly `READ_BYTES_CEILING + 1` bytes long, whose range
+/// (no `limit`, or one it never reaches) is not complete when the scan
+/// stops at the ceiling, is not truncated: the scan consumed the whole
+/// file, and the one-byte probe reads end of file. Mutation: replace the
+/// probe with `let scan_cut = at_ceiling;` (M1) → `truncated: true`.
+#[tokio::test]
+async fn fs_read_is_not_truncated_when_the_file_ends_where_the_scan_stops() {
+    let f = fixture();
+    let path = f.workspace.join("ceiling-end.bin");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 1)
+            .unwrap();
+    }
+    // One line of NUL bytes with no newline: the fixture's default
+    // `limit` (67108864 lines) cannot be reached, so the scan runs to
+    // the ceiling.
+    let out = run("lines", json!({"path": "ceiling-end.bin", "offset": 2}))
+        .await
+        .unwrap();
+    assert_eq!(out["r"]["content"], "");
+    assert_eq!(out["r"]["truncated"], false);
+}
+
 #[tokio::test]
 async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
     let f = fixture();
@@ -594,6 +618,14 @@ async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
     );
 }
 
+/// D1/D2: the range may complete on the very chunk that also crosses the
+/// ceiling; checking completion first keeps it from being reported
+/// truncated, and the probe never runs. One byte follows the completed
+/// range (`READ_BYTES_CEILING + 1`), so a scan that reached the ceiling
+/// before seeing the range complete would find the file going on and
+/// report it truncated. Mutations: M3, move the ceiling check above the
+/// completion check; M4, delete the completion check; M5, run the probe
+/// unconditionally after the loop. Each → `truncated: true`.
 #[tokio::test]
 async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_crosses_the_ceiling() {
     let f = fixture();
@@ -602,7 +634,9 @@ async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_cross
         // A skipped first line of NUL bytes, `READ_BYTES_CEILING - 1`
         // bytes long including its own newline, so the wanted second
         // line ends exactly on the last byte `read_lines`'s `take`
-        // allows (`READ_BYTES_CEILING + 1`).
+        // allows (`READ_BYTES_CEILING + 1`); one byte follows, so a scan
+        // that reached the ceiling before seeing the range complete
+        // would find the file going on and report it truncated.
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING - 2)
             .unwrap();
@@ -613,7 +647,7 @@ async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_cross
             .append(true)
             .open(&path)
             .unwrap();
-        file.write_all(b"\nz\n").unwrap();
+        file.write_all(b"\nz\nx").unwrap();
     }
     let out = run(
         "lines",
@@ -1134,6 +1168,58 @@ async fn fs_write_with_expected_content_refuses_a_fifo() {
             .file_type()
             .is_fifo(),
         "the FIFO was replaced"
+    );
+}
+
+/// D3: a Unix socket at the destination refuses the write as `changed`
+/// without blocking on it, and the socket stays. Opening a socket for
+/// reading fails outright (`EOPNOTSUPP` on macOS, `ENXIO` on Linux); the
+/// step still maps that to `changed`, as it does for a FIFO. Mutation:
+/// M6, drop `EOPNOTSUPP` from `is_special_file_refusal` (this Mac); M7,
+/// the same under `GWENNOL_NO_DIR_HANDLES=1`. Each fails at `.expect`
+/// with the step error.
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_with_expected_content_refuses_a_socket() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("expect-socket")).unwrap();
+    let path = f.workspace.join("expect-socket/s.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let out = run(
+        "expect_writer",
+        json!({"path": "expect-socket/s.sock", "content": "two\n", "expect": ""}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "changed");
+    assert_eq!(
+        out["w"]["message"],
+        format!(
+            "no longer holds the content this write expected, so nothing was written: {}",
+            path.display()
+        )
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket(),
+        "the socket was replaced"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("expect-socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+    assert_eq!(
+        f.requests_for("expect_writer")
+            .into_iter()
+            .filter(|a| *a == Access::WriteFile(path.clone()))
+            .count(),
+        1,
+        "the write's one approval was not asked"
     );
 }
 

@@ -55,6 +55,12 @@ use serde_json::{Map, Value, json};
 /// The model used when `$config.model` is absent.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
+/// The Messages API version this module's request shaping and stream
+/// translation are written against. The guest sends no headers: the
+/// manifest's `host_http.post` steps send it as `anthropic-version`,
+/// and a test here pins both to this value.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// `max_tokens` for a buffered turn when neither the input nor
 /// `$config.max_tokens` says: high enough not to cut an answer
 /// mid-thought, low enough that the buffered request finishes inside
@@ -1552,5 +1558,25 @@ mod tests {
             vec!["skipped a content block of kind server_tool_use"],
             "the skipped block is noted once; the unknown event and delta are not"
         );
+    }
+
+    // --------------------------------------------------------- manifest
+
+    #[test]
+    fn the_manifest_sends_the_api_version_this_module_is_written_against() {
+        let manifest: Value =
+            serde_json::from_str(include_str!("../../../plugins/providers/anthropic.json"))
+                .unwrap();
+        for action in [crate::FETCH_ACTION, crate::STREAM_ACTION] {
+            let steps = manifest["actions"][action]["steps"].as_array().unwrap();
+            let step = steps
+                .iter()
+                .find(|s| s["id"] == crate::FETCH_STEP)
+                .unwrap_or_else(|| panic!("{action} has no step '{}'", crate::FETCH_STEP));
+            assert_eq!(
+                step["params"]["headers"]["anthropic-version"], ANTHROPIC_VERSION,
+                "{action}"
+            );
+        }
     }
 }
