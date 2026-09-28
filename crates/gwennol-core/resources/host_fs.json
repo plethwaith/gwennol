@@ -53,7 +53,7 @@
           "path": { "type": "string" },
           "content": { "type": "string" },
           "create_dirs": { "type": "boolean", "default": false, "description": "Create missing parent directories." },
-          "expect_content": { "type": "string", "description": "Write only if the destination, just before it is replaced, is a regular file holding exactly this text; otherwise nothing is written and the outcome is changed (permission_denied when the destination cannot be read). Cannot be combined with create_dirs." }
+          "expect_content": { "type": "string", "description": "Write only if the destination, just before it is replaced, is a regular file holding exactly this text; otherwise nothing is written and the outcome is changed (permission_denied when the agent's user may not read it). Cannot be combined with create_dirs." }
         }
       },
       "outputSchema": {

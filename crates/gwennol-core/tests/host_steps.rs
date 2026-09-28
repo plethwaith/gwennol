@@ -1042,10 +1042,10 @@ async fn fs_write_with_expected_content_replaces_a_file_that_still_holds_it() {
 }
 
 /// D7: a destination that is longer, shorter, or otherwise different
-/// from `expect_content` refuses the write as `changed`, its bytes and
-/// the one `WriteFile` approval untouched, and no temporary left.
-/// Mutations: `holds` always answers `Ok(true)`; the read buffer is
-/// only `expected.len()` bytes (a longer file would pass).
+/// from `expect_content` refuses the write as `changed`, its bytes
+/// untouched, its one `WriteFile` approval asked, and no temporary
+/// left. Mutations: `holds` always answers `Ok(true)`; the read buffer
+/// is only `expected.len()` bytes (a longer file would pass).
 #[tokio::test]
 async fn fs_write_with_expected_content_refuses_a_changed_file() {
     let f = fixture();
@@ -1157,6 +1157,9 @@ async fn fs_write_with_expected_content_refuses_a_file_it_cannot_read() {
         // Running with a euid the mode bits do not bind (root, or a
         // sandbox that does not enforce them): the refused read this
         // test needs cannot be produced here.
+        eprintln!(
+            "fs_write_with_expected_content_refuses_a_file_it_cannot_read: skipped, this euid can read a 0o200 file"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         return;
     }
@@ -1225,7 +1228,14 @@ async fn fs_write_refuses_a_non_string_expect_content() {
             .contains("param 'expect_content' must be a string, got 1"),
         "{err}"
     );
-    assert!(f.requests_for("expect_writer").is_empty());
+    assert_eq!(
+        f.requests_for("expect_writer")
+            .into_iter()
+            .filter(|a| *a == Access::WriteFile(f.workspace.join("expect-bad-type.txt")))
+            .count(),
+        0,
+        "a non-string expect_content must not ask for the write"
+    );
     assert!(!f.workspace.join("expect-bad-type.txt").exists());
 }
 

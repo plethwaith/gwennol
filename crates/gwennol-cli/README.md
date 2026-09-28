@@ -188,7 +188,7 @@ in a print run, and the trace says `denied: no rule matched`; a
 session asks at a prompt instead. In a session an `a`/`d` answer adds
 an exact-text rule tried after all of these, so it can never pre-empt
 a flag's or a file's rule; if prompts for the same request were
-already queued, the last answer is the rule that stands. So a narrow
+already queued, the last `a`/`d` answer is the rule that stands. So a narrow
 deny goes before the broad allow it carves out of:
 
 ```sh

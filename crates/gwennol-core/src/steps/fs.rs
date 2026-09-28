@@ -71,9 +71,8 @@ pub enum Outcome {
     /// the bytes land, and the rename would destroy the link).
     IsSymlink,
     /// `host_fs.write` with `expect_content`: the destination does not
-    /// hold that content when the write would replace it — changed,
-    /// removed, or opened and found not to be a regular file. Nothing
-    /// was written.
+    /// hold that content when the write would replace it. Nothing was
+    /// written.
     Changed,
 }
 
@@ -866,12 +865,13 @@ async fn fill_temp(
 ///
 /// With `expect_content`, the write goes ahead only if the destination,
 /// looked at just before the rename, is a regular file holding exactly
-/// those bytes; otherwise the temporary is removed and the outcome is
-/// `changed`. A destination that cannot be opened or read for that look
-/// is answered as any other I/O error on it is. The look is after the
-/// approval, so a change made while the operator decided is caught; one
-/// landing between the look and the rename is not. It cannot be combined
-/// with `create_dirs`.
+/// those bytes. If it holds other bytes, is missing, is a symlink, or
+/// opens as something other than a regular file, the temporary is
+/// removed and the outcome is `changed`; any other error opening or
+/// reading it is answered as the same error from the rename would be.
+/// The look is after the approval, so a change made while the operator
+/// decided is caught; one landing between the look and the rename is
+/// not. It cannot be combined with `create_dirs`.
 pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value) -> StepFuture<'a> {
     Box::pin(async move {
         let p = resolve(ex, params);
@@ -978,9 +978,11 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
         let leftover = in_dir.join(&tmp);
         // With `expect_content`, the destination is looked at — through
         // the held anchor, without following a link — in the same
-        // blocking call as the rename: a mismatch, a missing file, or
-        // one that is no longer a regular file discards the temporary
-        // and answers `changed` instead of renaming.
+        // blocking call as the rename: a mismatch, a missing file, a
+        // symlink, or one that opens as something other than a regular
+        // file discards the temporary and answers `changed` instead of
+        // renaming; any other error opening or reading it discards the
+        // temporary and is returned.
         let renamed = blocking(move || -> std::io::Result<bool> {
             if let Some(expected) = &expect_content {
                 match dir.holds(&name, expected.as_bytes()) {
@@ -1020,9 +1022,9 @@ pub fn fs_write<'a>(ex: &'a mut (dyn PluginExecution + Send), params: &'a Value)
                 // moving out from under its spelled path, the filled
                 // temporary with it. Either way the bytes are not where
                 // they were made, and that is not the destination's answer.
-                // (`holds` maps its own "missing" and "not a regular file"
-                // cases to `Ok(false)` above, so a `NotFound` reaching
-                // here can only be the rename's.)
+                // (`holds` maps a missing destination to `Ok(false)`
+                // above, so a `NotFound` reaching here can only be the
+                // rename's.)
                 if e.kind() == std::io::ErrorKind::NotFound {
                     tracing::warn!(
                         path = %leftover.display(),
