@@ -1296,9 +1296,7 @@ mod tests {
     /// Guards D5: a later answer for the same plugin, kind and subject
     /// replaces the earlier one, so at most one session rule ever
     /// matches a request; rules for a different plugin, kind or
-    /// subject stand side by side. Mutations, named in the PR body:
-    /// `answer_prompt` pushes instead of calling `remember` (two rules
-    /// would match, and `judge_with`'s first-match order would decide);
+    /// subject stand side by side. Mutation, named in the PR body:
     /// `remember` keys on subject alone (a rule for another plugin
     /// would be replaced).
     #[test]
@@ -1349,9 +1347,18 @@ mod tests {
                 subject: "/ws/a".to_string(),
             },
         );
+        remember(
+            &mut rules,
+            SessionRule {
+                decision: Decision::Allow,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Read,
+                subject: "/ws/a".to_string(),
+            },
+        );
         assert_eq!(
             rules.len(),
-            3,
+            4,
             "different subjects, plugins and kinds all stand side by side"
         );
 

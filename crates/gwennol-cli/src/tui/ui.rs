@@ -165,7 +165,7 @@ pub struct Ui {
     /// The earliest instant `y`, `n`, `a` or `d` may answer the first
     /// prompt: [`crate::tui::prompt::ARM_DELAY`] after it became the
     /// first, pushed later by every key or paste that reaches it without
-    /// answering. Written by `PromptGuard` and `prompt::key` only.
+    /// answering.
     pub prompt_armed_at: Instant,
     /// Rules made at prompts, at most one per plugin, kind and subject
     /// ([`crate::policy::remember`]): tried after every compiled rule

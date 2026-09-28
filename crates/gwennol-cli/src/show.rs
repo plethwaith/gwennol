@@ -100,9 +100,8 @@ fn http_subject(method: &str, url: &str) -> Option<String> {
 /// a new request — for a kind this frontend does not know, for an
 /// `http` URL that fails to parse, whose placeholder text is the same
 /// for every such request — and for a path, or a shown spawn `cwd`,
-/// that is not UTF-8 — its text is lossy, so two such paths could
-/// share it —. Built
-/// through the same helpers [`ShowAccess`] renders with, so the two
+/// that is not UTF-8, whose lossy text two such paths could share.
+/// Built through the same helpers [`ShowAccess`] renders with, so the two
 /// cannot drift: a session rule matches exactly the text the prompt
 /// showed — for `http` that text is the *scrubbed* URL with a marker
 /// for what was cut, so one answer covers every URL with the same

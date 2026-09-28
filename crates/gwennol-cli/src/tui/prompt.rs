@@ -154,7 +154,7 @@ enum Answer {
 }
 
 /// Route one key to the first open prompt. `true` when the key was
-/// the prompt's — every key is, while a prompt is open (D4). `Esc`
+/// the prompt's — every key is, while a prompt is open. `Esc`
 /// denies once at any time. `y`/`n`/`a`/`d` (unmodified only) answer
 /// once `now` has reached `ui.prompt_armed_at`; before then each is
 /// swallowed and sets [`EARLY`]. The scroll keys move `scroll`
@@ -782,6 +782,76 @@ pub(crate) mod tests {
         assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
     }
 
+    /// Guards D5: a second answer for a request queued behind another
+    /// takes over the rule the first made, so the pair leaves exactly
+    /// one session rule and the third identical request is decided by
+    /// it, with no prompt. Mutation: `answer_prompt` pushes instead of
+    /// calling `remember` (both rules would stand, and the third
+    /// request would be decided by the first, `Allow`, not the second,
+    /// `Deny`).
+    #[test]
+    fn a_second_answer_for_a_queued_request_takes_over() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut first = interactive.approve(write_req());
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+        let mut second = interactive.approve(write_req());
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let armed_at = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                armed_at,
+            )
+        });
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+
+        let armed_at = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &workspace,
+                armed_at,
+            )
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+
+        assert_eq!(
+            shared.lock().session_rules,
+            vec![SessionRule {
+                decision: Decision::Deny,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/out.txt".to_string(),
+            }]
+        );
+
+        let mut third = interactive.approve(write_req());
+        assert!(matches!(
+            third.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+        match shared.lock().entries.last() {
+            Some(Entry::Trace(t)) => assert_eq!(
+                t,
+                "gwennol: write /ws/out.txt from tool-write (call write t1): \
+                 denied by session rule write:/ws/out.txt for plugin tool-write"
+            ),
+            other => panic!("expected a Trace entry, got {other:?}"),
+        }
+    }
+
     /// Guards D6: a path that is not valid UTF-8 has no subject
     /// ([`crate::show::subject`]), so a seeded rule for the lossy
     /// rendering of another path cannot decide it — it prompts,
@@ -911,12 +981,13 @@ pub(crate) mod tests {
     }
 
     /// Guards D2: every key that reaches an open prompt without
-    /// answering it — a swallowed early letter, a scroll key — pushes
+    /// answering it — a scroll key, a swallowed early letter — pushes
     /// the gate back, so continuous typing never answers even once the
-    /// original delay has passed; a scroll key still scrolls while
+    /// original delay has passed; the scroll key still scrolls while
     /// doing so. Mutations, named in the PR body: push the gate back
-    /// only on letters (the later `a` would answer); return before the
-    /// scroll match when early (`scroll` stays 0).
+    /// only on letters (the later `a` would answer, since only the
+    /// scroll key's push covers it here); return before the scroll
+    /// match when early (`scroll` stays 0).
     #[test]
     fn typing_keeps_a_prompt_from_answering() {
         let (interactive, shared) = op(empty_policy());
@@ -932,17 +1003,9 @@ pub(crate) mod tests {
         shared.update(|ui| {
             key(
                 ui,
-                &KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
-                &workspace,
-                t - Duration::from_millis(1),
-            )
-        });
-        shared.update(|ui| {
-            key(
-                ui,
                 &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                 &workspace,
-                t + Duration::from_millis(300),
+                t - Duration::from_millis(1),
             )
         });
         assert_eq!(shared.lock().prompts[0].scroll, 1, "Down did not scroll");
@@ -981,8 +1044,8 @@ pub(crate) mod tests {
     /// way still gets its own second before a letter can answer it.
     /// Mutations, named in the PR body: gate `Esc` too (the first
     /// prompt would stay open at `armed - 1ms`); drop the reset in
-    /// `answer_prompt` (the second prompt's `y` at the same instant
-    /// would answer it).
+    /// `answer_prompt` (the gate would stay where the first prompt
+    /// left it).
     #[test]
     fn esc_denies_at_once_and_a_new_first_prompt_waits_its_own_second() {
         let (interactive, shared) = op(empty_policy());
@@ -1029,7 +1092,7 @@ pub(crate) mod tests {
         });
         assert!(
             matches!(second.as_mut().poll(&mut cx), Poll::Pending),
-            "the second prompt answered at the first prompt's armed instant"
+            "the second prompt answered at the instant Esc denied the first"
         );
 
         let pushed = shared.lock().prompt_armed_at;
@@ -1047,13 +1110,46 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Guards D2: the gate moves when the first prompt does (a new one
-    /// opening onto an empty queue, or the first being withdrawn with
-    /// another behind it) and only then — a second prompt opening
-    /// behind the first does not move it. Mutations, named in the PR
-    /// body: reset `prompt_armed_at` on every `open` (the seeded
-    /// instant would change when the second opens); drop the reset in
-    /// `Drop` (the third prompt would not get its own second).
+    /// Guards D2: a prompt opening onto an empty queue arms its own
+    /// gate — `PromptGuard::open`'s reset, not a value left over from
+    /// `Ui::default()` or an earlier prompt. Mutation: drop the
+    /// `ui.prompts.is_empty()` reset in `open`.
+    #[test]
+    fn a_prompt_opening_onto_an_empty_queue_arms_its_own_gate() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let before = Instant::now();
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(
+            armed(&shared) >= before + ARM_DELAY,
+            "the gate was not armed by this prompt's own open"
+        );
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let early = before + ARM_DELAY - Duration::from_millis(1);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                early,
+            )
+        });
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "the first letter typed as the prompt opened answered it"
+        );
+        assert!(shared.lock().session_rules.is_empty());
+    }
+
+    /// Guards D2: the gate does not move when a second prompt opens
+    /// behind the first, and moves — to its own new instant — when the
+    /// first is withdrawn with the second behind it. Mutations, named
+    /// in the PR body: reset `prompt_armed_at` on every `open` (the
+    /// seeded instant would change when the second opens); drop the
+    /// reset in `Drop` (the second prompt would not get its own
+    /// second).
     #[test]
     fn the_gate_moves_when_the_first_prompt_does_and_only_then() {
         let (interactive, shared) = op(empty_policy());

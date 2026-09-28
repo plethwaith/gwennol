@@ -187,9 +187,9 @@ and the first match decides. A request no rule matches is **denied**
 in a print run, and the trace says `denied: no rule matched`; a
 session asks at a prompt instead. In a session an `a`/`d` answer adds
 an exact-text rule tried after all of these, so it can never pre-empt
-a flag's or a file's rule; answering again for the same request
-replaces it. So a narrow deny goes
-before the broad allow it carves out of:
+a flag's or a file's rule; if prompts for the same request were
+already queued, the last answer is the rule that stands. So a narrow
+deny goes before the broad allow it carves out of:
 
 ```sh
 gwennol --deny 'write:.git/**' --allow 'write:**' …

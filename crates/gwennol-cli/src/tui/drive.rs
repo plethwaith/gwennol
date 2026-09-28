@@ -7,10 +7,10 @@
 //! before anything else typed reaches the editor or the token (a
 //! Ctrl-C notice is still retired first; a resize or a read error
 //! never reaches the prompt at all, and a paste is dropped rather
-//! than routed to it), and a letter there answers only once the
-//! keyboard has been quiet for [`prompt::ARM_DELAY`], so `Esc` there
-//! denies rather than cancels; the pane's own keys (paging, focus,
-//! expand: [`pane`]) come next, and the editor last.
+//! than routed to it), so `Esc` there denies rather than cancels, and a
+//! letter there answers only once the keyboard has been quiet for
+//! [`prompt::ARM_DELAY`]; the pane's own keys (paging, focus, expand:
+//! [`pane`]) come next, and the editor last.
 
 use std::process::ExitCode;
 use std::sync::Arc;

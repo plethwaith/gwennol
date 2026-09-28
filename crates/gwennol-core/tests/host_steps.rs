@@ -1011,6 +1011,9 @@ async fn fs_write_replaces_the_file_and_leaves_no_temporary_behind() {
     assert_eq!(leftovers, Vec::<String>::new());
 }
 
+/// D7: `expect_content` equal to the file lets the write replace it, as
+/// without it, and keeps the destination's permissions. Mutation:
+/// `holds` always answers `Ok(false)`.
 #[cfg(unix)]
 #[tokio::test]
 async fn fs_write_with_expected_content_replaces_a_file_that_still_holds_it() {
@@ -1038,6 +1041,11 @@ async fn fs_write_with_expected_content_replaces_a_file_that_still_holds_it() {
     assert_eq!(leftovers, Vec::<String>::new());
 }
 
+/// D7: a destination that is longer, shorter, or otherwise different
+/// from `expect_content` refuses the write as `changed`, its bytes and
+/// the one `WriteFile` approval untouched, and no temporary left.
+/// Mutations: `holds` always answers `Ok(true)`; the read buffer is
+/// only `expected.len()` bytes (a longer file would pass).
 #[tokio::test]
 async fn fs_write_with_expected_content_refuses_a_changed_file() {
     let f = fixture();
@@ -1085,6 +1093,9 @@ async fn fs_write_with_expected_content_refuses_a_changed_file() {
     }
 }
 
+/// D8: a missing destination with `expect_content` refuses the write as
+/// `changed` and creates nothing. Mutation: `NotFound` answers
+/// `Ok(true)`.
 #[tokio::test]
 async fn fs_write_with_expected_content_refuses_a_missing_file() {
     let f = fixture();
@@ -1099,6 +1110,10 @@ async fn fs_write_with_expected_content_refuses_a_missing_file() {
     assert!(!path.exists());
 }
 
+/// D8: a FIFO at the destination refuses the write as `changed` without
+/// blocking on it (the open uses `O_NONBLOCK`), and the FIFO stays.
+/// Mutation: drop the regular-file check (an empty expectation would
+/// match and the FIFO would be replaced).
 #[cfg(unix)]
 #[tokio::test]
 async fn fs_write_with_expected_content_refuses_a_fifo() {
@@ -1122,6 +1137,58 @@ async fn fs_write_with_expected_content_refuses_a_fifo() {
     );
 }
 
+/// D8: a destination `holds` cannot open for reading — permission
+/// denied, not the missing-file or not-a-regular-file cases `holds`
+/// answers `Ok(false)` for — is the destination's answer
+/// (`permission_denied`), not `changed`; the temporary is discarded and
+/// the file untouched. Mutation: the `Err(e)` arm of the rename
+/// closure's `dir.holds` match turned into `Ok(false)` (the error would
+/// answer `changed` instead of being returned).
+#[cfg(unix)]
+#[tokio::test]
+async fn fs_write_with_expected_content_refuses_a_file_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    std::fs::create_dir_all(f.workspace.join("expect-unreadable")).unwrap();
+    let path = f.workspace.join("expect-unreadable/x.txt");
+    std::fs::write(&path, "one\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        // Running with a euid the mode bits do not bind (root, or a
+        // sandbox that does not enforce them): the refused read this
+        // test needs cannot be produced here.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+    let out = run(
+        "expect_writer",
+        json!({"path": "expect-unreadable/x.txt", "content": "two\n", "expect": "one\n"}),
+    )
+    .await
+    .expect("not a step error");
+    assert_eq!(out["w"]["outcome"], "permission_denied");
+    assert_eq!(
+        out["w"]["message"],
+        format!("permission denied: {}", path.display())
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\n",
+        "the refused write touched the file"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(f.workspace.join("expect-unreadable"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("gwennol-tmp"))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+}
+
+/// D8: `expect_content` with `create_dirs: true` fails the step before
+/// the approval, so a missing parent is neither created nor asked
+/// about. Mutation: drop the check (a missing parent would be created
+/// and the result `changed`).
 #[tokio::test]
 async fn fs_write_refuses_expected_content_with_create_dirs() {
     let f = fixture();
@@ -1139,6 +1206,27 @@ async fn fs_write_refuses_expected_content_with_create_dirs() {
     );
     assert!(f.requests_for("expect_writer_dirs").is_empty());
     assert!(!f.workspace.join("expect-dirs").exists());
+}
+
+/// `expect_content` that is neither absent, `null`, nor a string fails
+/// the step before the approval, naming the value it got. Mutation:
+/// treat a non-string `expect_content` as absent (`None`).
+#[tokio::test]
+async fn fs_write_refuses_a_non_string_expect_content() {
+    let f = fixture();
+    let err = run(
+        "expect_writer",
+        json!({"path": "expect-bad-type.txt", "content": "two\n", "expect": 1}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("param 'expect_content' must be a string, got 1"),
+        "{err}"
+    );
+    assert!(f.requests_for("expect_writer").is_empty());
+    assert!(!f.workspace.join("expect-bad-type.txt").exists());
 }
 
 #[tokio::test]
