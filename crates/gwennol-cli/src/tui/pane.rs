@@ -154,6 +154,7 @@ fn normalise(top: usize, max_top: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use gwennol_core::ToolCall;
     use gwennol_core::gwead::tokio_util::sync::CancellationToken;
@@ -181,6 +182,7 @@ mod tests {
             &CancellationToken::new(),
             false,
             Input::Key(KeyEvent::new(code, modifiers)),
+            Instant::now(),
         )
     }
 
@@ -413,6 +415,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(
             shared.lock().scroll.is_some(),

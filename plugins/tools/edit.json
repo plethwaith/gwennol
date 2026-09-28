@@ -1,8 +1,8 @@
 {
   "formatVersion": 1,
   "name": "tool-edit",
-  "version": "0.1.0",
-  "description": "The `edit` tool: a host_fs.read of the whole file, guest code that replaces one exact string (crates/tool-edit, filled in by `cargo xtask bundle`), and a host_fs.write when the guest says to write, each outcome branched on as data. Reaches nothing else; the guest reaches nothing at all.",
+  "version": "0.2.0",
+  "description": "The `edit` tool: a host_fs.read of the whole file, guest code that replaces one exact string (crates/tool-edit, filled in by `cargo xtask bundle`), and a host_fs.write when the guest says to write, which goes ahead only if the file still holds what was read, each outcome branched on as data. Reaches nothing else; the guest reaches nothing at all.",
   "roles": ["TOOL"],
   "permissions": ["provide:step_type:script:tool-edit", "step_type:host_fs.read", "step_type:host_fs.write"],
   "wasmModules": {
@@ -15,7 +15,7 @@
     "call": {
       "tool": {
         "name": "edit",
-        "description": "Replace one exact string in a file with another. old_string must occur exactly once, unless replace_all is set, which replaces every occurrence. Copy old_string from the file itself, whitespace included and without the line numbers read adds. The whole file is read (at most 4194304 bytes) and written back atomically, keeping its permissions; a file that is larger, or not UTF-8 text, is refused unchanged.",
+        "description": "Replace one exact string in a file with another. old_string must occur exactly once, unless replace_all is set, which replaces every occurrence. Copy old_string from the file itself, whitespace included and without the line numbers read adds. The whole file is read (at most 4194304 bytes) and written back atomically, keeping its permissions; a file that is larger, or not UTF-8 text, is refused unchanged, and so is one that no longer holds what was read when the write is about to replace it.",
         "parameters": {
           "type": "object",
           "required": ["path", "old_string", "new_string"],
@@ -49,7 +49,7 @@
                 {
                   "id": "write",
                   "type": "host_fs.write",
-                  "params": { "path": "{{$input.path}}", "content": "{{$steps.decide.result.content}}" }
+                  "params": { "path": "{{$input.path}}", "content": "{{$steps.decide.result.content}}", "expect_content": "{{$steps.read.result.content}}" }
                 },
                 {
                   "id": "written",

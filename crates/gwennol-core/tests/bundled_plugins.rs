@@ -1533,10 +1533,11 @@ async fn a_denied_edit_write_changes_nothing() {
     );
 }
 
-/// Accepted gap: `edit` reads, decides, then writes, so another writer
-/// landing in between is a plain lost update, not detected.
+/// `edit` passes the content it read as the write's `expect_content`, so
+/// a save landing while the write is being approved is kept and the
+/// edit refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_edit_racing_another_writer_keeps_its_own_read() {
+async fn an_edit_refuses_a_file_changed_while_its_write_was_asked() {
     let f = fixture();
     std::fs::write(f.workspace.join("racing.txt"), "one\n").unwrap();
     let out = f
@@ -1545,11 +1546,27 @@ async fn an_edit_racing_another_writer_keeps_its_own_read() {
             json!({"path": "racing.txt", "old_string": "one", "new_string": "two"}),
         )
         .await;
-    assert_eq!(out["is_error"], false, "{out}");
+    assert_eq!(out["is_error"], true, "{out}");
+    let canonical = f.workspace.join("racing.txt").canonicalize().unwrap();
+    assert_eq!(
+        out["content"],
+        format!(
+            "no longer holds the content this write expected, so nothing was written: {}",
+            canonical.display()
+        ),
+        "{out}"
+    );
     assert_eq!(
         std::fs::read_to_string(f.workspace.join("racing.txt")).unwrap(),
-        "two\n",
-        "the edit's own read-modify-write overwrote the racing write"
+        "changed meanwhile\n",
+        "the edit overwrote the other writer's save"
+    );
+    assert_eq!(
+        f.asked("racing.txt"),
+        vec![
+            Access::ReadFile(canonical.clone()),
+            Access::WriteFile(canonical)
+        ]
     );
 }
 

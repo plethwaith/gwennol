@@ -7,9 +7,10 @@
 //! before anything else typed reaches the editor or the token (a
 //! Ctrl-C notice is still retired first; a resize or a read error
 //! never reaches the prompt at all, and a paste is dropped rather
-//! than routed to it), so `Esc` there denies rather than cancels; the
-//! pane's own keys (paging, focus, expand: [`pane`]) come next, and
-//! the editor last.
+//! than routed to it), so `Esc` there denies rather than cancels, and a
+//! letter there answers only once the keyboard has been quiet for
+//! [`prompt::ARM_DELAY`]; the pane's own keys (paging, focus, expand:
+//! [`pane`]) come next, and the editor last.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -51,12 +52,15 @@ pub(crate) enum Action {
 /// editor's, so `Home` on an empty editor scrolls rather than moving a
 /// cursor that has nowhere to go. `pub(crate)` so `tui::prompt`'s own
 /// tests can drive a key through the same entry point `drive` uses,
-/// rather than a copy of its prompt-routing branch.
+/// rather than a copy of its prompt-routing branch. `now` is when the
+/// input is handled (`drive` passes `Instant::now()` at the call): the
+/// prompt's gate compares against it.
 pub(crate) fn handle_key(
     shared: &Shared,
     cancel: &CancellationToken,
     running: bool,
     input: Input,
+    now: Instant,
 ) -> Option<Action> {
     let mut action = None;
     shared.update(|ui| {
@@ -74,9 +78,13 @@ pub(crate) fn handle_key(
                 // routed to it (never reaching `prompt::key`, unlike
                 // a key, so it can never answer or scroll a prompt):
                 // pasted text must not accumulate behind an open
-                // prompt, silently, for the editor to submit later.
+                // prompt, silently, for the editor to submit later. It
+                // still pushes the prompt's gate back — typing has
+                // not stopped.
                 if ui.prompts.is_empty() {
                     ui.editor.paste(&text);
+                } else {
+                    ui.prompt_armed_at = now + prompt::ARM_DELAY;
                 }
                 return;
             }
@@ -94,7 +102,7 @@ pub(crate) fn handle_key(
         ui.notice = None;
         if !ui.prompts.is_empty() {
             let workspace = ui.workspace.clone();
-            prompt::key(ui, &key, &workspace);
+            prompt::key(ui, &key, &workspace, now);
             return;
         }
         if key.modifiers.is_empty() && key.code == KeyCode::Esc {
@@ -177,7 +185,7 @@ async fn idle_step<B: Backend, K: KeySource>(
     let action = tokio::select! {
         biased;
         key = keys.next() => match key {
-            Some(input) => handle_key(shared, &scratch, false, input),
+            Some(input) => handle_key(shared, &scratch, false, input, Instant::now()),
             None => Some(Action::ExitIdle),
         },
         // `Err` only once every sender has dropped, permanently; `Ok`
@@ -244,7 +252,9 @@ pub async fn drive<B: Backend, K: KeySource>(
                 key = keys.next() => {
                     match key {
                         Some(input) => {
-                            if handle_key(shared, &cancel, true, input) == Some(Action::ForceExit) {
+                            if handle_key(shared, &cancel, true, input, Instant::now())
+                                == Some(Action::ForceExit)
+                            {
                                 return Ok(ExitCode::from(EXIT_CANCELLED));
                             }
                             draw(shared, terminal)?;
@@ -313,6 +323,7 @@ mod tests {
             &cancel,
             false,
             Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(!cancel.is_cancelled());
         assert_eq!(shared.lock().editor.text(), "hello");
@@ -323,6 +334,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(cancel.is_cancelled());
         assert_eq!(shared.lock().editor.text(), "hello");
@@ -334,6 +346,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)),
+            Instant::now(),
         );
         assert!(shared.lock().editor.cursor() < before);
 
@@ -344,6 +357,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Instant::now(),
         );
         assert_eq!(
             shared.lock().notice.as_deref(),
@@ -353,18 +367,25 @@ mod tests {
         // A resize or a paste must not clear a standing notice; only
         // a key input does. Mutation: clear `ui.notice` before
         // discriminating `input` — both assertions below fail.
-        handle_key(&shared, &cancel, true, Input::Resize);
+        handle_key(&shared, &cancel, true, Input::Resize, Instant::now());
         assert!(
             shared.lock().notice.is_some(),
             "a resize cleared the notice"
         );
-        handle_key(&shared, &cancel, true, Input::Paste("x".to_string()));
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Paste("x".to_string()),
+            Instant::now(),
+        );
         assert!(shared.lock().notice.is_some(), "a paste cleared the notice");
         handle_key(
             &shared,
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(
             shared.lock().notice.is_none(),
@@ -382,7 +403,8 @@ mod tests {
     /// them does, and each block's own comment says what it is for.
     /// Mutations: drop the prompt-routing arm in `handle_key` (the key
     /// case); drop the `ui.prompts.is_empty()` guard around
-    /// `ui.editor.paste` (the paste case).
+    /// `ui.editor.paste` (the paste case). An answer letter is passed
+    /// an armed instant, read fresh each time (D4).
     #[test]
     fn keys_go_to_an_open_prompt_never_to_the_editor_or_the_token() {
         use std::path::Path;
@@ -405,6 +427,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(
             !cancel.is_cancelled(),
@@ -434,7 +457,13 @@ mod tests {
         // not reach the editor while a prompt is open, and it must
         // not answer or scroll the prompt either (the `Paste` arm
         // returns before the key-routing branch is ever reached).
-        handle_key(&shared, &cancel, true, Input::Paste("rm -rf /".to_string()));
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Paste("rm -rf /".to_string()),
+            Instant::now(),
+        );
         assert_eq!(
             shared.lock().editor.text(),
             "",
@@ -452,6 +481,7 @@ mod tests {
                 &cancel,
                 true,
                 Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                Instant::now(),
             );
         }
         let action = handle_key(
@@ -459,6 +489,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert_eq!(
             action, None,
@@ -497,6 +528,7 @@ mod tests {
                 &cancel,
                 true,
                 Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                Instant::now(),
             );
         }
         handle_key(
@@ -504,6 +536,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert!(
             !shared.lock().exiting,
@@ -520,6 +553,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Instant::now(),
         );
         assert!(
             shared.lock().notice.is_none(),
@@ -563,6 +597,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert_eq!(
             shared.lock().scroll,
@@ -574,6 +609,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert_eq!(
             shared.lock().focus,
@@ -581,16 +617,61 @@ mod tests {
             "Tab reached the pane while a prompt was open"
         );
 
+        let armed = shared.lock().prompt_armed_at;
         handle_key(
             &shared,
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            armed,
         );
         assert!(matches!(
             fut2.as_mut().poll(&mut cx),
             Poll::Ready(Decision::Deny)
         ));
+    }
+
+    /// Guards D2: a paste at an open prompt is still dropped (never
+    /// reaching the editor), but it pushes the prompt's gate back the
+    /// same as a swallowed key — typing has not stopped just because
+    /// the terminal delivered it as one bracketed paste. Mutation:
+    /// drop the `else` arm's push in `handle_key`'s `Input::Paste` case.
+    #[test]
+    fn a_paste_at_an_open_prompt_pushes_its_gate_back() {
+        use std::path::Path;
+        use std::task::{Context, Poll, Waker};
+
+        use gwennol_core::Operator;
+
+        use crate::tui::prompt::tests::{op, write_req};
+
+        let (interactive, shared) =
+            op(crate::policy::Policy::compile(Vec::new(), Path::new("/ws")).unwrap());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let cancel = CancellationToken::new();
+        let t = shared.lock().prompt_armed_at;
+        handle_key(&shared, &cancel, true, Input::Paste("also".to_string()), t);
+        assert_eq!(
+            shared.lock().editor.text(),
+            "",
+            "a paste reached the editor while a prompt was open"
+        );
+        assert_eq!(shared.lock().prompt_armed_at, t + prompt::ARM_DELAY);
+
+        // The pushed-back gate holds: an answer at the paste's own
+        // instant is still too early.
+        handle_key(
+            &shared,
+            &cancel,
+            true,
+            Input::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            t,
+        );
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
     }
 
     /// Guards the forced-exit path directly and deterministically. The
@@ -615,6 +696,7 @@ mod tests {
                     cancel,
                     true,
                     Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                    Instant::now(),
                 );
             }
             handle_key(
@@ -622,6 +704,7 @@ mod tests {
                 cancel,
                 true,
                 Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Instant::now(),
             )
         };
 
@@ -652,6 +735,7 @@ mod tests {
             &cancel,
             false,
             Input::Errored("the terminal went away".to_string()),
+            Instant::now(),
         );
         assert!(
             shared
@@ -684,6 +768,7 @@ mod tests {
                 &cancel,
                 true,
                 Input::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                Instant::now(),
             );
         }
         let action = handle_key(
@@ -691,6 +776,7 @@ mod tests {
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Instant::now(),
         );
         assert_eq!(action, None, "a turn was submitted while one was running");
         assert_eq!(

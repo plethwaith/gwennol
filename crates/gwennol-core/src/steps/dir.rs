@@ -150,7 +150,7 @@ pub fn verify_named(canonical: &Path, held: (u64, u64)) -> io::Result<()> {
 }
 
 /// A symlink reached with `O_NOFOLLOW`, as each platform reports it.
-#[cfg(dir_handles)]
+#[cfg(unix)]
 fn is_nofollow_refusal(e: nix::errno::Errno) -> bool {
     use nix::errno::Errno;
     #[cfg(any(
@@ -324,6 +324,79 @@ impl Dir {
                 identity: None,
             })
         }
+    }
+
+    /// Whether `name` in this directory is a regular file whose bytes
+    /// are exactly `expected`, looked at (on unix) without following a
+    /// link and without blocking: missing, a symlink (on unix), or a
+    /// file that opens but is not a regular file is `false`; any other
+    /// error opening or reading it is returned. Reads at most one byte
+    /// past `expected`.
+    pub fn holds(&self, name: &OsStr, expected: &[u8]) -> io::Result<bool> {
+        use std::io::Read as _;
+        #[cfg(dir_handles)]
+        let mut file: std::fs::File = {
+            use nix::fcntl::OFlag;
+            match nix::fcntl::openat(
+                &self.fd,
+                name,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            ) {
+                Ok(fd) => std::fs::File::from(fd),
+                Err(nix::errno::Errno::ENOENT) => return Ok(false),
+                Err(e) if is_nofollow_refusal(e) => return Ok(false),
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        };
+        #[cfg(not(dir_handles))]
+        let mut file: std::fs::File = {
+            let path = self.path.join(name);
+            #[cfg(unix)]
+            let opened = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
+                    )
+                    .open(&path)
+            };
+            #[cfg(not(unix))]
+            let opened = std::fs::OpenOptions::new().read(true).open(&path);
+            match opened {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                #[cfg(unix)]
+                Err(e)
+                    if e.raw_os_error().is_some_and(|code| {
+                        is_nofollow_refusal(nix::errno::Errno::from_raw(code))
+                    }) =>
+                {
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        if !file.metadata()?.is_file() {
+            return Ok(false);
+        }
+        let mut buf = vec![0u8; expected.len() + 1];
+        let mut total = 0usize;
+        loop {
+            match file.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(buf[..total] == *expected)
     }
 
     /// Create the file `name` inside this directory, exclusively — it

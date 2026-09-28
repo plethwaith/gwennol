@@ -5,10 +5,15 @@
 //! [`PromptGuard`] removes the prompt by id when dropped — which is what
 //! happens when the turn is cancelled while a prompt is open — and an
 //! answer whose receiver is already gone is simply ignored.
+//!
+//! A prompt takes a letter only after [`ARM_DELAY`] with no key pressed
+//! since it became the first, so a person typing when it opens does
+//! not answer it.
 
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gwennol_core::{Access, ApprovalRequest, Decision};
@@ -29,6 +34,13 @@ pub const KEYS: &str =
 pub const KEYS_ONCE: &str = "y allow once · n deny once · Esc deny once · a and d act once here: this request cannot be remembered";
 /// The box's title.
 pub const TITLE: &str = "approval";
+
+/// How long the keyboard must be quiet, with the same prompt first,
+/// before `y`, `n`, `a` or `d` answers it: a person typing when a
+/// prompt opens has not read it.
+pub const ARM_DELAY: Duration = Duration::from_secs(1);
+/// The notice when a letter arrived before [`ARM_DELAY`] had passed.
+pub const EARLY: &str = "not answered: y, n, a and d count only after a second with no key pressed or text pasted; Esc denies now";
 
 /// One open approval, shown until answered or withdrawn.
 #[derive(Debug)]
@@ -103,6 +115,9 @@ impl PromptGuard {
     /// id, and returns a guard that removes it again when dropped.
     pub fn open(shared: &Arc<Shared>, mut prompt: Prompt) -> Self {
         let id = shared.update(|ui| {
+            if ui.prompts.is_empty() {
+                ui.prompt_armed_at = Instant::now() + ARM_DELAY;
+            }
             ui.prompt_seq += 1;
             let id = ui.prompt_seq;
             prompt.id = id;
@@ -118,8 +133,13 @@ impl PromptGuard {
 
 impl Drop for PromptGuard {
     fn drop(&mut self) {
-        self.shared
-            .update(|ui| ui.prompts.retain(|p| p.id != self.id));
+        self.shared.update(|ui| {
+            let was_first = ui.prompts.first().is_some_and(|p| p.id == self.id);
+            ui.prompts.retain(|p| p.id != self.id);
+            if was_first && !ui.prompts.is_empty() {
+                ui.prompt_armed_at = Instant::now() + ARM_DELAY;
+            }
+        });
     }
 }
 
@@ -133,29 +153,37 @@ enum Answer {
 }
 
 /// Route one key to the first open prompt. `true` when the key was
-/// the prompt's — every key is, while a prompt is open (D4): the
-/// answer keys (unmodified only — `Ctrl-y` is swallowed, not
-/// answered) act, the scroll keys move `scroll` regardless of
-/// modifiers, and anything else is swallowed rather than reaching the
-/// editor or the token.
-pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path) -> bool {
+/// the prompt's — every key is, while a prompt is open. Unmodified,
+/// `Esc` denies once at any time and `y`/`n`/`a`/`d` answer
+/// once `now` has reached `ui.prompt_armed_at`; before then each is
+/// swallowed and sets [`EARLY`]. The scroll keys move `scroll`
+/// regardless of modifiers. Every key that does not answer pushes
+/// `prompt_armed_at` to `now + ARM_DELAY`.
+pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path, now: Instant) -> bool {
     if ui.prompts.is_empty() {
         return false;
     }
     if event.modifiers == KeyModifiers::NONE {
+        if event.code == KeyCode::Esc {
+            answer_prompt(ui, Answer::Once(Decision::Deny), workspace, now);
+            return true;
+        }
         let answer = match event.code {
             KeyCode::Char('y') => Some(Answer::Once(Decision::Allow)),
             KeyCode::Char('n') => Some(Answer::Once(Decision::Deny)),
             KeyCode::Char('a') => Some(Answer::Session(Decision::Allow)),
             KeyCode::Char('d') => Some(Answer::Session(Decision::Deny)),
-            KeyCode::Esc => Some(Answer::Once(Decision::Deny)),
             _ => None,
         };
         if let Some(answer) = answer {
-            answer_prompt(ui, answer, workspace);
-            return true;
+            if now >= ui.prompt_armed_at {
+                answer_prompt(ui, answer, workspace, now);
+                return true;
+            }
+            ui.notice = Some(EARLY.to_string());
         }
     }
+    ui.prompt_armed_at = now + ARM_DELAY;
     let (rows, visible) = ui.prompts[0].view.get();
     let max_scroll = rows.saturating_sub(visible);
     let page = visible.max(1);
@@ -180,8 +208,11 @@ pub fn key(ui: &mut Ui, event: &KeyEvent, workspace: &Path) -> bool {
 /// Remove the first prompt and send the decision; only when the send
 /// lands do the rule the answer asked for (if the subject allows one)
 /// and the trace get recorded — so a failed send leaves neither behind.
-fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
+fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path, now: Instant) {
     let mut prompt = ui.prompts.remove(0);
+    if !ui.prompts.is_empty() {
+        ui.prompt_armed_at = now + ARM_DELAY;
+    }
     let (decision, suffix, rule) = match answer {
         Answer::Once(d) => (d, "", None),
         Answer::Session(d) => match (prompt.subject.clone(), Kind::of(&prompt.request.access)) {
@@ -208,7 +239,7 @@ fn answer_prompt(ui: &mut Ui, answer: Answer, workspace: &Path) {
         .is_some_and(|tx| tx.send(decision).is_ok());
     if sent {
         if let Some(rule) = rule {
-            ui.session_rules.push(rule);
+            crate::policy::remember(&mut ui.session_rules, rule);
         }
         let line = format!(
             "gwennol: {}",
@@ -411,6 +442,13 @@ pub(crate) mod tests {
         Policy::compile(Vec::new(), Path::new("/ws")).unwrap()
     }
 
+    /// The instant `shared`'s first prompt is armed at: what a test
+    /// passes as `now` to answer it, instead of sleeping on the wall
+    /// clock.
+    fn armed(shared: &Arc<Shared>) -> Instant {
+        shared.lock().prompt_armed_at
+    }
+
     /// `Context::from_waker(Waker::noop())`, one line at every call
     /// site below instead of three.
     fn noop_context() -> Context<'static> {
@@ -525,11 +563,13 @@ pub(crate) mod tests {
             tx,
         );
         let _guard = PromptGuard::open(&shared, prompt);
+        let armed = shared.lock().prompt_armed_at;
         let handled = shared.update(|ui| {
             key(
                 ui,
                 &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
                 &workspace,
+                armed,
             )
         });
         assert!(handled);
@@ -561,11 +601,13 @@ pub(crate) mod tests {
             assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
 
             let cancel = CancellationToken::new();
+            let armed = shared.lock().prompt_armed_at;
             let _ = crate::tui::drive::handle_key(
                 &shared,
                 &cancel,
                 true,
                 Input::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                armed,
             );
             assert!(!cancel.is_cancelled(), "{code:?} reached the token");
 
@@ -618,11 +660,13 @@ pub(crate) mod tests {
             let mut fut = interactive.approve(write_req());
             assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
             let cancel = CancellationToken::new();
+            let armed = shared.lock().prompt_armed_at;
             let _ = crate::tui::drive::handle_key(
                 &shared,
                 &cancel,
                 true,
                 Input::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                armed,
             );
             drop(fut);
             let ui = shared.lock();
@@ -711,11 +755,13 @@ pub(crate) mod tests {
         );
 
         let cancel = CancellationToken::new();
+        let armed = shared.lock().prompt_armed_at;
         let _ = crate::tui::drive::handle_key(
             &shared,
             &cancel,
             true,
             Input::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            armed,
         );
         assert!(matches!(
             fut.as_mut().poll(&mut cx),
@@ -733,6 +779,406 @@ pub(crate) mod tests {
         // The same request again: it prompts once more.
         let mut fut2 = interactive.approve(request());
         assert!(matches!(fut2.as_mut().poll(&mut cx), Poll::Pending));
+    }
+
+    /// Guards D5: a second answer for a request queued behind another
+    /// takes over the rule the first made, so the pair leaves exactly
+    /// one session rule and the third identical request is decided by
+    /// it, with no prompt. Mutation: `answer_prompt` pushes instead of
+    /// calling `remember` (both rules would stand, and the third
+    /// request would be decided by the first, `Allow`, not the second,
+    /// `Deny`).
+    #[test]
+    fn a_second_answer_for_a_queued_request_takes_over() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut first = interactive.approve(write_req());
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+        let mut second = interactive.approve(write_req());
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let armed_at = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                armed_at,
+            )
+        });
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+
+        let armed_at = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &workspace,
+                armed_at,
+            )
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+
+        assert_eq!(
+            shared.lock().session_rules,
+            vec![SessionRule {
+                decision: Decision::Deny,
+                plugin: "tool-write".to_string(),
+                kind: Kind::Write,
+                subject: "/ws/out.txt".to_string(),
+            }]
+        );
+
+        let mut third = interactive.approve(write_req());
+        assert!(matches!(
+            third.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+        match shared.lock().entries.last() {
+            Some(Entry::Trace(t)) => assert_eq!(
+                t,
+                "gwennol: write /ws/out.txt from tool-write (call write t1): \
+                 denied by session rule write:/ws/out.txt for plugin tool-write"
+            ),
+            other => panic!("expected a Trace entry, got {other:?}"),
+        }
+    }
+
+    /// Guards D6: a path that is not valid UTF-8 has no subject
+    /// ([`crate::show::subject`]), so a seeded rule for the lossy
+    /// rendering of another path cannot decide it — it prompts,
+    /// `KEYS_ONCE` legend and all — and answering it records nothing.
+    /// Mutation: revert `show::subject`'s path arm (the request would
+    /// be decided by the seeded rule, `Ready` at the first poll, no
+    /// prompt at all).
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_decided_once() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let (interactive, shared) = op(empty_policy());
+        let seeded = SessionRule {
+            decision: Decision::Allow,
+            plugin: "tool-write".to_string(),
+            kind: Kind::Write,
+            subject: "/ws/a\u{FFFD}.txt".to_string(),
+        };
+        shared.update(|ui| ui.session_rules.push(seeded.clone()));
+
+        let lossy_path = std::path::PathBuf::from(OsString::from_vec(b"/ws/a\xff.txt".to_vec()));
+        let request = ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: Access::WriteFile(lossy_path),
+        };
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(request);
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(shared.lock().session_rules, vec![seeded]);
+
+        let frame = render_frame(&shared);
+        for row in ui::wrap(KEYS_ONCE, INNER_W) {
+            assert!(
+                frame.iter().any(|r| r.contains(&row)),
+                "missing KEYS_ONCE row {row:?} in {frame:?}"
+            );
+        }
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let armed_at = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                armed_at,
+            )
+        });
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert_eq!(
+            shared.lock().session_rules.len(),
+            1,
+            "nothing new was remembered"
+        );
+    }
+
+    /// A request whose box has enough rows to scroll: 40 named fields.
+    fn long_request() -> ApprovalRequest {
+        let mut fields = serde_json::Map::new();
+        for i in 0..40 {
+            fields.insert(format!("k{i:02}"), serde_json::json!(i));
+        }
+        ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: Some(ToolCall {
+                id: Some("t1".to_string()),
+                name: "write".to_string(),
+                arguments: serde_json::Value::Object(fields).to_string(),
+            }),
+            access: Access::WriteFile(std::path::PathBuf::from("/ws/out.txt")),
+        }
+    }
+
+    /// Guards D1: an unmodified `y`/`n`/`a`/`d` before [`ARM_DELAY`] has
+    /// passed since the prompt became the first is swallowed — no
+    /// answer, no rule — and sets [`EARLY`], pushing the gate to
+    /// `now + ARM_DELAY`; the same letter once `now` has reached the
+    /// (new) armed instant answers. Mutation: drop the `now <
+    /// ui.prompt_armed_at` check in `key` — the first `a` answers and
+    /// records a rule.
+    #[test]
+    fn an_answer_letter_waits_for_the_keyboard_to_go_quiet() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let t = armed(&shared);
+        let early = t - Duration::from_millis(1);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                early,
+            )
+        });
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "an early letter answered the prompt"
+        );
+        assert!(shared.lock().session_rules.is_empty());
+        assert_eq!(shared.lock().notice.as_deref(), Some(EARLY));
+        let pushed = shared.lock().prompt_armed_at;
+        assert_eq!(pushed, early + ARM_DELAY);
+
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                pushed,
+            )
+        });
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert_eq!(shared.lock().session_rules.len(), 1);
+    }
+
+    /// Guards D2: every key that reaches an open prompt without
+    /// answering it — a scroll key, a swallowed early letter — pushes
+    /// the gate back, so continuous typing never answers even once the
+    /// original delay has passed; the scroll key still scrolls while
+    /// doing so. Mutations, named in the PR body: push the gate back
+    /// only on letters (the later `a` would answer, since only the
+    /// scroll key's push covers it here); return before the scroll
+    /// match when early (`scroll` stays 0).
+    #[test]
+    fn typing_keeps_a_prompt_from_answering() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let mut fut = interactive.approve(long_request());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        // `view` (rows, visible) is measured at render; the box's
+        // scroll match reads it to bound the key.
+        render_frame(&shared);
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let t = armed(&shared);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &workspace,
+                t - Duration::from_millis(1),
+            )
+        });
+        assert_eq!(shared.lock().prompts[0].scroll, 1, "Down did not scroll");
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                t + Duration::from_millis(600),
+            )
+        });
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "an `a` after the original delay, but before the pushed-back gate, answered"
+        );
+        assert!(shared.lock().session_rules.is_empty());
+
+        let pushed = shared.lock().prompt_armed_at;
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &workspace,
+                pushed,
+            )
+        });
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+        assert!(shared.lock().session_rules.is_empty());
+    }
+
+    /// Guards D2, D3: `Esc` denies at once, never gated, even before
+    /// the delay has passed; a second prompt that becomes first this
+    /// way still gets its own second before a letter can answer it.
+    /// Mutations, named in the PR body: gate `Esc` too (the first
+    /// prompt would stay open at `armed - 1ms`); drop the reset in
+    /// `answer_prompt` (the gate would stay where the first prompt
+    /// left it).
+    #[test]
+    fn esc_denies_at_once_and_a_new_first_prompt_waits_its_own_second() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let req = |name: &str| ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: Access::WriteFile(std::path::PathBuf::from(format!("/ws/{name}"))),
+        };
+        let mut first = interactive.approve(req("a.txt"));
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+        let mut second = interactive.approve(req("b.txt"));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let early = armed(&shared) - Duration::from_millis(1);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &workspace,
+                early,
+            )
+        });
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Deny)
+        ));
+        assert_eq!(
+            shared.lock().prompt_armed_at,
+            early + ARM_DELAY,
+            "the new first prompt did not get its own second"
+        );
+
+        // The second prompt is now first, and gets its own second: the
+        // same early instant does not answer it.
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &workspace,
+                early,
+            )
+        });
+        assert!(
+            matches!(second.as_mut().poll(&mut cx), Poll::Pending),
+            "the second prompt answered at the instant Esc denied the first"
+        );
+
+        let pushed = shared.lock().prompt_armed_at;
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &workspace,
+                pushed,
+            )
+        });
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Decision::Allow)
+        ));
+    }
+
+    /// Guards D2: a prompt opening onto an empty queue arms its own
+    /// gate — `PromptGuard::open`'s reset, not a value left over from
+    /// `Ui::default()` or an earlier prompt. Mutation: drop the
+    /// `ui.prompts.is_empty()` reset in `open`.
+    #[test]
+    fn a_prompt_opening_onto_an_empty_queue_arms_its_own_gate() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let before = Instant::now();
+        let mut fut = interactive.approve(write_req());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(
+            armed(&shared) >= before + ARM_DELAY,
+            "the gate was not armed by this prompt's own open"
+        );
+
+        let workspace = std::path::PathBuf::from("/ws");
+        let early = before + ARM_DELAY - Duration::from_millis(1);
+        shared.update(|ui| {
+            key(
+                ui,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                &workspace,
+                early,
+            )
+        });
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "the first letter typed as the prompt opened answered it"
+        );
+        assert!(shared.lock().session_rules.is_empty());
+    }
+
+    /// Guards D2: the gate does not move when a second prompt opens
+    /// behind the first, and moves — to its own new instant — when the
+    /// first is withdrawn with the second behind it. Mutations, named
+    /// in the PR body: reset `prompt_armed_at` on every `open` (the
+    /// seeded instant would change when the second opens); drop the
+    /// reset in `Drop` (the second prompt would not get its own
+    /// second).
+    #[test]
+    fn the_gate_moves_when_the_first_prompt_does_and_only_then() {
+        let (interactive, shared) = op(empty_policy());
+        let mut cx = noop_context();
+        let req = |name: &str| ApprovalRequest {
+            plugin: "tool-write".to_string(),
+            cause: None,
+            access: Access::WriteFile(std::path::PathBuf::from(format!("/ws/{name}"))),
+        };
+        let mut first = interactive.approve(req("a.txt"));
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+
+        let seeded = Instant::now() - Duration::from_secs(60);
+        shared.update(|ui| ui.prompt_armed_at = seeded);
+
+        // A second prompt opening behind the first does not move it.
+        let mut second = interactive.approve(req("b.txt"));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(shared.lock().prompt_armed_at, seeded);
+
+        // Withdrawing the first (something other than an answer) with
+        // the second behind it hands the second its own second.
+        let before = Instant::now();
+        drop(first);
+        let after = shared.lock().prompt_armed_at;
+        assert!(
+            after >= before + ARM_DELAY,
+            "the gate did not move when the first prompt was withdrawn: {after:?} vs {before:?}"
+        );
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
     }
 
     /// Guards D5: the box shows the whole arguments (not a preview)
@@ -811,6 +1257,7 @@ pub(crate) mod tests {
                     ui,
                     &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                     &workspace,
+                    Instant::now(),
                 )
             });
             presses += 1;
@@ -834,6 +1281,7 @@ pub(crate) mod tests {
                     ui,
                     &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                     &workspace,
+                    Instant::now(),
                 )
             });
         }
@@ -846,6 +1294,7 @@ pub(crate) mod tests {
                     ui,
                     &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
                     &workspace,
+                    Instant::now(),
                 )
             });
         }
@@ -934,11 +1383,13 @@ pub(crate) mod tests {
         assert!(!frame.iter().any(|r| r.contains("two.txt")), "{frame:?}");
 
         let workspace = std::path::PathBuf::from("/ws");
+        let armed = shared.lock().prompt_armed_at;
         shared.update(|ui| {
             key(
                 ui,
                 &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
                 &workspace,
+                armed,
             )
         });
         assert!(matches!(
@@ -949,11 +1400,13 @@ pub(crate) mod tests {
         let frame = render_frame(&shared);
         assert!(frame.iter().any(|r| r.contains("two.txt")), "{frame:?}");
 
+        let armed = shared.lock().prompt_armed_at;
         shared.update(|ui| {
             key(
                 ui,
                 &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
                 &workspace,
+                armed,
             )
         });
         assert!(matches!(

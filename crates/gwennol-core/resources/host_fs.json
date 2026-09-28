@@ -1,7 +1,7 @@
 {
   "formatVersion": 1,
   "name": "host_fs",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Gwennol filesystem step types. Native code; every step asks the operator before acting. Nothing here is freelyUsable: a plugin must hold the matching step_type:host_fs.* grant. Answers the model can act on — no such file, that is a directory, permission denied — are results with an `outcome` naming them, not step errors; step errors are reserved for the operator's denial, the kernel's refusal, cancellation, and I/O failures nobody can act on.",
   "stepTypeDefs": [
     {
@@ -52,7 +52,8 @@
         "properties": {
           "path": { "type": "string" },
           "content": { "type": "string" },
-          "create_dirs": { "type": "boolean", "default": false, "description": "Create missing parent directories." }
+          "create_dirs": { "type": "boolean", "default": false, "description": "Create missing parent directories." },
+          "expect_content": { "type": "string", "description": "Write only if the destination, just before it is replaced, is a regular file holding exactly this text. The outcomes a write gives without it come first (a symlink is is_symlink, a directory is_directory, a missing parent not_found); after those checks, if it holds other text, is missing, has become a symlink, or opens as something other than a regular file, nothing is written and the outcome is changed; any other error opening or reading it is answered as the same error from the write would be (permission_denied when the agent's user may not read it). Cannot be combined with create_dirs." }
         }
       },
       "outputSchema": {
@@ -68,9 +69,9 @@
           {
             "type": "object",
             "required": ["outcome", "message"],
-            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, permission denied, or a symlink (never written through; refused rather than replaced). Nothing was written. Approved first like every probe — a symlink under the link's own name with its parent canonical, the rest under the path canonical to its deepest canonicalisable ancestor.",
+            "description": "The destination cannot take the file: a missing parent without create_dirs, a directory in the way, a component that is not a directory, permission denied, or a symlink (never written through; refused rather than replaced), or, with expect_content, a destination that no longer holds it. Nothing was written. Approved first like every probe — a symlink under the link's own name with its parent canonical, the rest under the path canonical to its deepest canonicalisable ancestor.",
             "properties": {
-              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied", "is_symlink"] },
+              "outcome": { "enum": ["not_found", "is_directory", "not_a_directory", "permission_denied", "is_symlink", "changed"] },
               "message": { "type": "string" }
             }
           }

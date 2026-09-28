@@ -102,10 +102,13 @@ editor.
 An open approval prompt takes every key itself instead: `y`/`n` allow
 or deny once, `a`/`d` for the rest of the session (see "Rules" for
 what that can and cannot cover), `Esc` denies once, and `Up`/`Down`/
-`PageUp`/`PageDown` scroll its own box. Ctrl-C is bound to nothing but
-a hint (`Esc` cancels the turn, `/exit` ends the session): raw mode
-makes it an ordinary key whose meaning differs by platform, so it is
-never wired to cancel.
+`PageUp`/`PageDown` scroll its own box. A letter answers only once no
+key has been pressed for a second since the prompt appeared, so
+typing when one opens does not answer it; the status line says so
+when a letter comes too soon. `Esc` denies at once. Ctrl-C is bound
+to nothing but a hint (`Esc` cancels the turn, `/exit` ends the
+session): raw mode makes it an ordinary key whose meaning differs by
+platform, so it is never wired to cancel.
 
 Slash commands: `/exit` cancels a running turn first and ends the
 session once it has unwound; a second `/exit` sent while the first is
@@ -184,8 +187,9 @@ and the first match decides. A request no rule matches is **denied**
 in a print run, and the trace says `denied: no rule matched`; a
 session asks at a prompt instead. In a session an `a`/`d` answer adds
 an exact-text rule tried after all of these, so it can never pre-empt
-a flag's or a file's rule. So a narrow deny goes
-before the broad allow it carves out of:
+a flag's or a file's rule; if prompts for the same request were
+already queued, the last `a`/`d` answer is the rule that stands. So a narrow
+deny goes before the broad allow it carves out of:
 
 ```sh
 gwennol --deny 'write:.git/**' --allow 'write:**' …
@@ -319,5 +323,6 @@ showed it — for an `http` URL that text is the scrubbed one with a
 marker for what was cut, so an answer given for a URL that carried a
 query or fragment covers any query string at that path, one given for
 a URL that carried credentials covers any credentials at it, and one
-given for a clean URL covers only itself; a pattern is written in the
+given for a clean URL covers only itself; a path that is not valid
+UTF-8 is decided once and never remembered; a pattern is written in the
 config file between sessions.
