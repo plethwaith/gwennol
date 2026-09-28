@@ -53,7 +53,8 @@ pub(crate) enum Action {
 /// cursor that has nowhere to go. `pub(crate)` so `tui::prompt`'s own
 /// tests can drive a key through the same entry point `drive` uses,
 /// rather than a copy of its prompt-routing branch. `now` is when the
-/// input arrived: the prompt's gate compares against it.
+/// input is handled (`drive` passes `Instant::now()` at the call): the
+/// prompt's gate compares against it.
 pub(crate) fn handle_key(
     shared: &Shared,
     cancel: &CancellationToken,

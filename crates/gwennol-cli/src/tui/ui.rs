@@ -452,7 +452,7 @@ pub const HELP: &[&str] = &[
     "/exit ends the session (twice while a turn is unwinding: exit at once, status 130)",
     "/help lists the commands",
     "Esc cancels the running turn (denies once instead, at an open approval prompt)",
-    "y n a d answer an open approval prompt once no key has been pressed for a second: once, or for the rest of the session; Esc denies once at any time",
+    "y n a d answer an open approval prompt only after a second with no key pressed or text pasted: once, or for the rest of the session; Esc denies once at any time",
     "PageUp PageDown scroll the pane; Home End too while the editor is empty; End follows the tail again",
     "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it",
 ];

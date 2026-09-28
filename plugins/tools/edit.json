@@ -15,7 +15,7 @@
     "call": {
       "tool": {
         "name": "edit",
-        "description": "Replace one exact string in a file with another. old_string must occur exactly once, unless replace_all is set, which replaces every occurrence. Copy old_string from the file itself, whitespace included and without the line numbers read adds. The whole file is read (at most 4194304 bytes) and written back atomically, keeping its permissions; a file that is larger, or not UTF-8 text, is refused unchanged, and so is one that changed after it was read.",
+        "description": "Replace one exact string in a file with another. old_string must occur exactly once, unless replace_all is set, which replaces every occurrence. Copy old_string from the file itself, whitespace included and without the line numbers read adds. The whole file is read (at most 4194304 bytes) and written back atomically, keeping its permissions; a file that is larger, or not UTF-8 text, is refused unchanged, and so is one that no longer holds what was read when the write is about to replace it.",
         "parameters": {
           "type": "object",
           "required": ["path", "old_string", "new_string"],

@@ -40,8 +40,7 @@ pub const TITLE: &str = "approval";
 /// prompt opens has not read it.
 pub const ARM_DELAY: Duration = Duration::from_secs(1);
 /// The notice when a letter arrived before [`ARM_DELAY`] had passed.
-pub const EARLY: &str =
-    "not answered: y, n, a and d count once no key has been pressed for a second; Esc denies now";
+pub const EARLY: &str = "not answered: y, n, a and d count only after a second with no key pressed or text pasted; Esc denies now";
 
 /// One open approval, shown until answered or withdrawn.
 #[derive(Debug)]
