@@ -126,8 +126,13 @@ session without `--log` collects none, so nothing competes with the
 pane); `-v`/`-vv` raise its level the same way they do in a print run,
 and `RUST_LOG` overrides the level either sets. `-v` also starts every
 tool result's pane entry expanded, matching a print run's `-v`.
-`--transcript` is print mode only; a session refuses it at startup
-rather than silently writing nothing.
+`--transcript FILE` is written when the session starts and rewritten
+after every turn, whatever its outcome; `--trace FILE` receives each
+trace line (decisions, tool calls and results, outcomes, not `/help`)
+as it enters the pane. Both are created owner-only before anything
+boots, so an unwritable path is a startup error; a write that fails
+later is shown in the pane, printed again after the session ends, and
+turns a 0 exit status into 2.
 
 ## Rules
 
@@ -300,16 +305,20 @@ provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at
 once. In a session Ctrl-C only shows a hint: `Esc` cancels the turn,
 and `/exit` ends the session.
 
-Print mode only: `--transcript FILE` writes the conversation as the
+`--transcript FILE` writes the conversation as the
 provider saw it — the whole chat input: the system prompt, the tools
 as harvested from the manifests, every message with thinking carried
 as `opaque` blocks, and the generation settings — at the end, after a
-failure too. It is what the provider was handed on the last round plus
+failure too (a session rewrites it after every turn). It is what the provider was handed on the last round plus
 that round's answer, so the file can be read or replayed as a request.
 The outcome line comes first; a transcript that cannot be written is
 reported after it and makes a completed turn exit 2, while a failed or
-cancelled turn keeps its own status. A session refuses `--transcript`
-outright at startup rather than silently writing nothing.
+cancelled turn keeps its own status. `--trace FILE` writes the same
+lines stderr carries as the trace, one at a time as they happen (not
+the host's log, the no-terminal notice, or the Ctrl-C lines); a trace
+that cannot be written is said once on stderr and fails a completed
+turn like the transcript. Both files are created readable by their
+owner alone; an existing file keeps its permissions.
 
 ## What it does not do
 

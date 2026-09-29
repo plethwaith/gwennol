@@ -11,7 +11,8 @@
 //! transcript. Everything else — each tool call and its result, and
 //! every approval decision with the rule behind it — goes to stderr,
 //! one line each, prefixed `gwennol:` so it is told apart from
-//! whatever a spawned command prints. The URL in an HTTP decision is
+//! whatever a spawned command prints; with `--trace`, the same lines
+//! are also written to that file. The URL in an HTTP decision is
 //! scrubbed the way the host scrubs its own logs: the rule judged the
 //! full URL, but a query string can carry a key and a trace is a
 //! record.
@@ -24,6 +25,7 @@ use std::sync::Mutex;
 use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn};
 
 use crate::policy::Policy;
+use crate::record::{self, SharedTrace};
 use crate::secrets::Secrets;
 use crate::show;
 
@@ -40,6 +42,9 @@ pub struct Headless {
     /// Whether the last byte written to stdout was not a newline, so a
     /// completed turn can end its line.
     line_open: Mutex<bool>,
+    /// The `--trace` file, when one is given: every line `note` writes
+    /// to stderr is written here too.
+    trace: Option<SharedTrace>,
 }
 
 impl Headless {
@@ -53,11 +58,19 @@ impl Headless {
             verbosity,
             pending: Mutex::new(String::new()),
             line_open: Mutex::new(false),
+            trace: None,
         }
     }
 
+    /// The same frontend, also writing every trace line to `trace`.
+    #[must_use]
+    pub fn with_trace(mut self, trace: Option<SharedTrace>) -> Self {
+        self.trace = trace;
+        self
+    }
+
     fn note(&self, line: impl fmt::Display) {
-        eprintln!("gwennol: {line}");
+        record::say(self.trace.as_ref(), &format!("gwennol: {line}"));
     }
 
     /// Write the round's text, now that the loop has accepted it.

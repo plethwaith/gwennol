@@ -232,6 +232,10 @@ fn session() -> &'static tokio::sync::Mutex<(Session, std::sync::Arc<Shared>)> {
             "spawn:bash *".to_string(),
             "-C".to_string(),
             f.workspace.display().to_string(),
+            "--transcript".to_string(),
+            f.root.join("session.transcript.json").display().to_string(),
+            "--trace".to_string(),
+            f.root.join("session.trace").display().to_string(),
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
         let flag_rules = ordered_rule_flags(&matches);
@@ -242,6 +246,22 @@ fn session() -> &'static tokio::sync::Mutex<(Session, std::sync::Arc<Shared>)> {
 }
 
 // -------------------------------------------------------------- helpers
+
+/// The session's `--transcript` file, as it is on disk now.
+fn transcript_file() -> String {
+    std::fs::read_to_string(fixture().root.join("session.transcript.json")).unwrap()
+}
+
+/// The session's `--trace` file, as it is on disk now.
+fn trace_file() -> String {
+    std::fs::read_to_string(fixture().root.join("session.trace")).unwrap()
+}
+
+/// What the transcript file must hold between turns: the session's
+/// chat input, pretty-printed as a print run writes it.
+fn chat_input_text(session: &Session) -> String {
+    serde_json::to_string_pretty(&session.chat_input()).unwrap()
+}
 
 fn type_line(tx: &UnboundedSender<Input>, text: &str) {
     for c in text.chars() {
@@ -572,6 +592,29 @@ async fn scenario() {
     let (session, shared) = &mut *locked;
     let shared = shared.clone();
 
+    // ---- before any turn: the transcript file already holds the
+    // startup chat input (system prompt and tools, no messages), and
+    // both record files were created owner-only.
+    assert_eq!(
+        transcript_file(),
+        chat_input_text(session),
+        "the transcript file at startup"
+    );
+    let startup: Value = serde_json::from_str(&transcript_file()).unwrap();
+    assert_eq!(startup["messages"], serde_json::json!([]), "no turn yet");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["session.transcript.json", "session.trace"] {
+            let mode = std::fs::metadata(fixture().root.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name} is owner-only");
+        }
+    }
+
     // ---- run A: two turns, then an idle /exit. Each run below gets
     // its own fresh channel, moved whole (never cloned) into its
     // driver: if a driver panics (an `await_ui` timeout, a failed
@@ -612,6 +655,17 @@ async fn scenario() {
     .await;
     driver.await.unwrap();
     assert_eq!(code, ExitCode::SUCCESS, "run A");
+    // Both turns are rewritten by now; the file is the session's chat
+    // input and holds the first turn's own text.
+    assert_eq!(
+        transcript_file(),
+        chat_input_text(session),
+        "run A: the transcript file after two turns"
+    );
+    assert!(
+        transcript_file().contains("What does hello.txt say?"),
+        "run A: the transcript file lacks the first turn"
+    );
     assert!(
         matches!(shared.lock().turn, TurnState::Idle),
         "run A: the status stayed on the second turn's state after drive returned"
@@ -844,6 +898,11 @@ async fn scenario() {
     let code = run_drive(session, &shared, &mut rx, None).await;
     driver.await.unwrap();
     assert_eq!(code, ExitCode::SUCCESS, "run C");
+    assert_eq!(
+        transcript_file(),
+        chat_input_text(session),
+        "run C: a cancelled turn is rewritten too"
+    );
     assert!(
         editor_had_draft.load(std::sync::atomic::Ordering::SeqCst),
         "run C: the editor did not keep the cancelled turn's draft text"
@@ -975,6 +1034,11 @@ async fn scenario() {
         code,
         ExitCode::from(1),
         "run E: /exit after a failed turn is status 1"
+    );
+    assert_eq!(
+        transcript_file(),
+        chat_input_text(session),
+        "run E: a failed turn is rewritten too"
     );
     assert!(
         matches!(shared.lock().turn, TurnState::Idle),
@@ -1780,6 +1844,25 @@ async fn scenario() {
         !f.workspace.join("cancel.txt").exists(),
         "run O: cancel.txt was written"
     );
+
+    // ---- the trace file, before the first run that toggles an entry
+    // (run Q): every trace entry the pane holds, in pane order and as
+    // drawn, and none of `/help`'s lines, the user's text or the
+    // model's.
+    {
+        let ui = shared.lock();
+        let expected: String = ui
+            .entries
+            .iter()
+            .filter(|e| match e {
+                Entry::Trace(text) => !gwennol::tui::ui::HELP.contains(&text.as_str()),
+                Entry::ToolCall { .. } | Entry::ToolResult { .. } | Entry::Outcome(_) => true,
+                Entry::User(_) | Entry::Assistant(_) => false,
+            })
+            .map(|e| format!("{}\n", e.text()))
+            .collect();
+        assert_eq!(trace_file(), expected, "the trace file before run Q");
+    }
 
     reset_editor(&shared);
     // ---- run Q: a tool result expands in place, its head row focuses

@@ -33,6 +33,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::policy::RuleSpec;
+use crate::record::{self, TraceFile};
 use crate::{Cli, Fatal, Mode, frontend};
 use drive::drive;
 use keys::TerminalKeys;
@@ -42,21 +43,25 @@ use ui::{Entry, Shared};
 
 /// Boot for a session: `frontend::start` with the interactive operator,
 /// the startup warnings as the pane's first entries. No terminal state
-/// is touched: a startup error prints to a normal terminal. `--transcript`
-/// is print mode only (`lib.rs`'s help says so): a session rejects it
-/// here rather than silently writing nothing.
+/// is touched: a startup error prints to a normal terminal. Both record
+/// files (`--transcript`, `--trace`) are created before anything boots,
+/// so a path that cannot be written is a startup error; the transcript
+/// then holds the conversation as the provider sees it, from the start.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
 ) -> Result<(Session, Arc<Shared>), Fatal> {
-    if cli.transcript.is_some() {
-        return Err(Fatal(
-            "--transcript is print-mode only (-p); a session does not write one".to_string(),
-        ));
+    let trace = cli.trace.as_deref().map(TraceFile::create).transpose()?;
+    if let Some(path) = &cli.transcript {
+        record::create(path).map_err(|e| Fatal(format!("transcript {}: {e}", path.display())))?;
     }
     let shared = Shared::new();
-    shared.update(|ui| ui.workspace = workspace.clone());
+    shared.update(|ui| {
+        ui.workspace = workspace.clone();
+        ui.trace = trace;
+        ui.transcript = cli.transcript.clone();
+    });
     let mut warnings = Vec::new();
     let session = frontend::start(
         cli,
@@ -74,6 +79,9 @@ pub fn start(
         },
         &mut warnings,
     )?;
+    if let Some(path) = &cli.transcript {
+        record::write_transcript(path, &session.chat_input())?;
+    }
     shared.update(|ui| {
         for w in warnings {
             ui.push(Entry::Trace(format!("gwennol: {w}")));
@@ -105,7 +113,13 @@ pub async fn run(
     .await;
     drop(terminal);
     drop(screen);
-    code
+    // The terminal is back: what could not be written is said where it
+    // outlives the alternate screen.
+    let failures = shared.lock().record_failures.clone();
+    for message in &failures {
+        eprintln!("gwennol: {message}");
+    }
+    code.map(|code| record::settle(code, !failures.is_empty()))
 }
 
 #[cfg(test)]
@@ -187,23 +201,40 @@ mod tests {
         }
     }
 
-    /// `tui::start` rejects `--transcript` outright rather than
-    /// accepting it and silently writing nothing, as a session did
-    /// before this round (`lib.rs`'s help now says print-mode only).
-    /// The check runs before the plugin bundle would be needed, so
-    /// this needs none. Mutation: drop the `cli.transcript.is_some()`
-    /// check — `start` then fails on the missing bundle instead, with
-    /// no mention of `--transcript`.
+    /// `tui::start` creates both record files before it boots anything,
+    /// so a path that cannot be written is a startup error naming it.
+    /// `--plugins` points at a directory that does not exist, so a
+    /// missing pre-boot check falls through to the plugins error and
+    /// never reaches a boot. Mutations: remove the pre-boot `create` of
+    /// either file: the message is then the plugins one.
     #[test]
-    fn a_session_rejects_transcript() {
-        let matches = Cli::command().get_matches_from(["gwennol", "--transcript", "/tmp/x"]);
-        let cli = Cli::from_arg_matches(&matches).unwrap();
-        match start(&cli, PathBuf::from("."), Vec::new()) {
-            Err(Fatal(message)) => assert!(
-                message.contains("--transcript"),
-                "wrong rejection reason: {message}"
+    fn a_session_reports_an_unwritable_record_before_it_boots() {
+        for (flag, path, prefix) in [
+            (
+                "--transcript",
+                "/nonexistent/dir/t.json",
+                "transcript /nonexistent/dir/t.json: ",
             ),
-            Ok(_) => panic!("expected --transcript to be rejected"),
+            (
+                "--trace",
+                "/nonexistent/dir/t.log",
+                "trace /nonexistent/dir/t.log: ",
+            ),
+        ] {
+            let matches = Cli::command().get_matches_from([
+                "gwennol",
+                "--plugins",
+                "/nonexistent/plugins",
+                flag,
+                path,
+            ]);
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            match start(&cli, PathBuf::from("."), Vec::new()) {
+                Err(Fatal(message)) => {
+                    assert!(message.starts_with(prefix), "{flag}: {message}")
+                }
+                Ok(_) => panic!("{flag}: expected a startup error"),
+            }
         }
     }
 }

@@ -11,6 +11,7 @@
 //! every decision — a session into its transcript pane, a print run to
 //! stderr — and both go through [`frontend::start`] and share
 //! [`show`]'s words, so a session reads like a print run's stderr.
+//! Either can also write the trace to a file (`--trace`).
 //! `-p`, or a run with no terminal on stdin or stdout, is print mode;
 //! otherwise a session opens.
 //!
@@ -27,6 +28,7 @@ pub mod operator;
 pub mod plugins;
 pub mod policy;
 pub mod print;
+pub mod record;
 pub mod secrets;
 pub mod show;
 pub mod tui;
@@ -134,11 +136,19 @@ pub struct Cli {
     #[arg(long)]
     pub no_stream: bool,
 
-    /// Print mode only: write the conversation as the provider saw
-    /// it — system prompt, tools, messages and settings, the whole
-    /// chat input — to FILE at the end, after a failure too.
+    /// Write the conversation as the provider saw it — system prompt,
+    /// tools, messages and settings, the whole chat input — to FILE: in
+    /// print mode at the end, after a failure too; in a session when it
+    /// starts and again after every turn.
     #[arg(long, value_name = "FILE")]
     pub transcript: Option<PathBuf>,
+
+    /// Write the trace — every decision, tool call, tool result and
+    /// outcome line, in the words a print run writes to stderr — to
+    /// FILE, one line at a time as it happens. Not the host's log
+    /// (--log).
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<PathBuf>,
 
     /// Print mode: one turn, model text on stdout, the trace on stderr,
     /// no terminal needed. Implied when stdin or stdout is not a terminal.

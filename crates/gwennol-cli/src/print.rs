@@ -1,17 +1,18 @@
 //! Print mode: one task, one turn, the model's text on stdout, the
 //! trace on stderr, no terminal needed. Every approval is decided by a
 //! rule, as a session decides it; Ctrl-C cancels the turn, once, and a
-//! second Ctrl-C exits at once.
+//! second Ctrl-C exits at once. With `--trace` the trace is also written
+//! to a file.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use gwennol_core::gwead::tokio_util::sync::CancellationToken;
-use serde_json::Value;
 
 use crate::operator::Headless;
 use crate::policy::RuleSpec;
+use crate::record::{self, TraceFile};
 use crate::show::outcome_line;
 use crate::{Cli, EXIT_CANCELLED, Fatal, Mode, frontend};
 
@@ -36,18 +37,30 @@ pub async fn run(
         return Err(Fatal("the task is empty".into()));
     }
 
+    // ---- the trace file, before anything boots: a path that cannot be
+    // written is a startup error, not a run that traces nothing.
+    let trace = cli
+        .trace
+        .as_deref()
+        .map(TraceFile::create)
+        .transpose()?
+        .map(|trace| Arc::new(Mutex::new(trace)));
+
     let mut session = frontend::start(
         &cli,
         workspace,
         flag_rules,
         Mode::Print,
         |policy, secrets, workspace| {
-            Arc::new(Headless::new(
-                policy,
-                secrets.clone(),
-                workspace.to_path_buf(),
-                cli.verbose,
-            ))
+            Arc::new(
+                Headless::new(
+                    policy,
+                    secrets.clone(),
+                    workspace.to_path_buf(),
+                    cli.verbose,
+                )
+                .with_trace(trace.clone()),
+            )
         },
         &mut Vec::new(),
     )?;
@@ -69,27 +82,24 @@ pub async fn run(
     }
     let outcome = session.turn(&task, &cancel).await;
     let (line, code) = outcome_line(&outcome);
-    eprintln!("{line}");
+    record::say(trace.as_ref(), &line);
     // After the outcome is reported, so a transcript that cannot be
     // written never hides how the turn went. It is still a failure of
-    // what was asked for — but the turn's own failure or cancellation
+    // what was asked for, but the turn's own failure or cancellation
     // is the more important fact, and a wrapper keying on that status
-    // must keep seeing it.
+    // must keep seeing it: `settle` keeps a 1 or a 130.
+    let mut transcript_failed = false;
     if let Some(path) = &cli.transcript
-        && let Err(Fatal(message)) = write_transcript(path, &session.chat_input())
+        && let Err(Fatal(message)) = record::write_transcript(path, &session.chat_input())
     {
-        eprintln!("gwennol: {message}");
-        if code == ExitCode::SUCCESS {
-            return Ok(ExitCode::from(crate::EXIT_USAGE));
-        }
+        transcript_failed = true;
+        record::say(trace.as_ref(), &format!("gwennol: {message}"));
     }
-    Ok(code)
-}
-
-/// The whole chat input, pretty-printed: what the provider was handed
-/// on the last round plus its answer, so the file is a request someone
-/// can read or replay, not just the messages.
-fn write_transcript(path: &Path, chat_input: &Value) -> Result<(), Fatal> {
-    let text = serde_json::to_string_pretty(chat_input).expect("a Value serialises");
-    std::fs::write(path, text).map_err(|e| Fatal(format!("transcript {}: {e}", path.display())))
+    let trace_failed = trace.as_ref().is_some_and(|trace| {
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .failed()
+    });
+    Ok(record::settle(code, transcript_failed || trace_failed))
 }

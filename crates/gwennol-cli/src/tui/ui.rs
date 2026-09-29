@@ -24,6 +24,7 @@ use ratatui::widgets::Widget;
 use tokio::sync::watch;
 
 use crate::policy::SessionRule;
+use crate::record::TraceFile;
 use crate::show;
 use crate::tui::editor::Editor;
 use crate::tui::prompt::{self, Prompt};
@@ -61,7 +62,9 @@ pub enum Entry {
     /// A trace line: a decision, a tool call's failure, a retry, a
     /// startup warning, an input-read error, or an event this
     /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s
-    /// lines ([`HELP`]) are pushed as written.
+    /// lines ([`HELP`]) are pushed as written, through
+    /// [`Ui::push_help`], and are the one kind of trace entry the
+    /// `--trace` file never gets.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -122,8 +125,8 @@ pub enum TurnState {
 pub struct Ui {
     /// Every line the pane holds, oldest first. Callers outside `Ui`
     /// must only read this, never mutate it: `revision` below is kept
-    /// in step with it by `Ui::push` and `Ui::apply` alone, and the
-    /// type cannot enforce that — a direct `ui.entries.push(...)` would
+    /// in step with it by `Ui::push`, `Ui::push_help` and `Ui::apply`
+    /// alone, and the type cannot enforce that — a direct `ui.entries.push(...)` would
     /// compile and leave `render_pane`'s cache silently stale.
     pub entries: Vec<Entry>,
     /// The index of the open `Assistant` entry, if any: where the next
@@ -145,8 +148,8 @@ pub struct Ui {
     pub tick: usize,
     /// Bumped whenever `entries` or `open` changes in a way that could
     /// change what `render_pane` draws (every [`Ui::push`], every call
-    /// to [`Ui::apply`], and every [`Ui::toggle`]). `render_pane`
-    /// rewraps the whole transcript only when this, or the pane's
+    /// to [`Ui::push_help`] or [`Ui::apply`], and every [`Ui::toggle`]).
+    /// `render_pane` rewraps the whole transcript only when this, or the pane's
     /// width, differs from the cached frame: the 100ms tick and a
     /// redraw it triggers otherwise rewrap on every frame for a
     /// spinner character alone.
@@ -194,6 +197,18 @@ pub struct Ui {
     /// paging and `Home` arms compute against it; `reveal` takes only
     /// its width and height; `render_status` reads `following`.
     pub pane_view: Cell<PaneView>,
+    /// The `--trace` file, set by `tui::start` before the startup
+    /// warnings are pushed: every trace entry ([`Entry::Trace`],
+    /// [`Entry::ToolCall`], [`Entry::ToolResult`], [`Entry::Outcome`])
+    /// is written to it as it enters the pane, by `push` and `apply`.
+    pub trace: Option<TraceFile>,
+    /// The `--transcript` file, set by `tui::start`: `drive` rewrites
+    /// it after every turn.
+    pub transcript: Option<PathBuf>,
+    /// The messages of the record files that could not be written, in
+    /// the order they failed: `tui::run` prints them on stderr once the
+    /// terminal is restored.
+    pub record_failures: Vec<String>,
 }
 
 /// What the last `render_pane` drew: its area's width and height, the
@@ -253,6 +268,9 @@ impl Default for Ui {
             scroll: None,
             focus: None,
             pane_view: Cell::new(PaneView::default()),
+            trace: None,
+            transcript: None,
+            record_failures: Vec::new(),
         }
     }
 }
@@ -270,6 +288,37 @@ impl Ui {
             None
         };
         self.revision = self.revision.wrapping_add(1);
+        self.record(self.entries.len() - 1);
+    }
+
+    /// Push one of `/help`'s lines: shown in the pane like any trace
+    /// entry, but not written to the `--trace` file, since it is not a
+    /// record of the run.
+    pub fn push_help(&mut self, line: &str) {
+        self.entries.push(Entry::Trace(line.to_string()));
+        self.open = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Write `entries[index]` to the `--trace` file, as the pane draws
+    /// it now, when it is a trace entry and a trace is open. A failed
+    /// write closes the trace: it is shown once, as a pane entry (which
+    /// is not written), and kept in `record_failures`.
+    fn record(&mut self, index: usize) {
+        let entry = &self.entries[index];
+        if !matches!(
+            entry,
+            Entry::Trace(_) | Entry::ToolCall { .. } | Entry::ToolResult { .. } | Entry::Outcome(_)
+        ) {
+            return;
+        }
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if let Some(message) = trace.line(&entry.text()) {
+            self.push(Entry::Trace(format!("gwennol: {message}")));
+            self.record_failures.push(message);
+        }
     }
 
     /// Map one loop event onto the pane and the turn state (D6): a
@@ -344,8 +393,12 @@ impl Ui {
                     Some(idx) => {
                         self.entries[idx] = Entry::Trace(line);
                         self.open = None;
+                        self.record(idx);
                     }
-                    None => self.entries.push(Entry::Trace(line)),
+                    None => {
+                        self.entries.push(Entry::Trace(line));
+                        self.record(self.entries.len() - 1);
+                    }
                 }
             }
             Event::TurnComplete => {
@@ -1501,5 +1554,122 @@ mod tests {
             "the retracted partial text is still on screen: {:?}",
             row(terminal.backend().buffer(), 0, 20)
         );
+    }
+
+    /// A `Ui` whose trace is a capture.
+    fn traced_ui() -> (Ui, crate::record::testing::Capture) {
+        let capture = crate::record::testing::Capture::default();
+        let ui = Ui {
+            trace: Some(TraceFile::from_writer(
+                std::path::Path::new("t.log"),
+                Box::new(capture.clone()),
+            )),
+            ..Ui::default()
+        };
+        (ui, capture)
+    }
+
+    fn captured(capture: &crate::record::testing::Capture) -> String {
+        String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// The `--trace` file gets the trace entries, in print mode's words
+    /// as the pane draws them at that moment, and nothing else: not the
+    /// user's text, not the model's, in a retry's replacing branch and
+    /// its pushing branch alike, and a result whole at `-v`.
+    /// Mutations: remove `record` from `push` (empty); remove it from
+    /// the `Retry` arm (both retry lines missing); record every entry
+    /// kind (`hi` and `u` appear); record results with verbosity 0
+    /// always (the `-v` half fails).
+    #[test]
+    fn trace_entries_are_recorded_in_print_words_and_nothing_else() {
+        let (mut ui, capture) = traced_ui();
+        let c = call("toolu_1", "read");
+        let retry = |ui: &mut Ui| {
+            ui.apply(
+                Event::Retry {
+                    attempt: 2,
+                    max_attempts: 3,
+                    failure: failure("overloaded"),
+                },
+                0,
+            );
+        };
+        ui.apply(Event::Text("hi".to_string()), 0);
+        ui.apply(Event::ToolCall(c.clone()), 0);
+        ui.apply(
+            Event::ToolResult {
+                call: c.clone(),
+                content: "one\ntwo".to_string(),
+                is_error: false,
+            },
+            0,
+        );
+        ui.apply(Event::Text("partial".to_string()), 0);
+        retry(&mut ui); // replaces the open entry
+        retry(&mut ui); // nothing open: pushes
+        ui.apply(
+            Event::ToolFailed {
+                call: c.clone(),
+                error: "boom".to_string(),
+            },
+            0,
+        );
+        ui.push(Entry::User("u".to_string()));
+        ui.push(Entry::Outcome("gwennol: done (x)".to_string()));
+
+        let retry_line = show::retry(2, 3, &failure("overloaded"));
+        let expected = format!(
+            "gwennol: {}\ngwennol: {}\ngwennol: {retry_line}\ngwennol: {retry_line}\n\
+             gwennol: {}\ngwennol: done (x)\n",
+            show::tool_call(&c),
+            show::tool_result(&c, "one\ntwo", false, 0),
+            show::tool_failed(&c, "boom"),
+        );
+        assert_eq!(captured(&capture), expected);
+
+        let (mut verbose, capture) = traced_ui();
+        verbose.apply(
+            Event::ToolResult {
+                call: c.clone(),
+                content: "one\ntwo".to_string(),
+                is_error: false,
+            },
+            1,
+        );
+        assert_eq!(
+            captured(&capture),
+            format!("gwennol: {}\n", show::tool_result(&c, "one\ntwo", false, 1))
+        );
+    }
+
+    /// A failed write is shown once in the pane, right after the entry
+    /// that met it, and kept for `tui::run` to print. Mutations: drop
+    /// the pane push (no such entry); drop the `record_failures` push
+    /// (empty).
+    #[test]
+    fn a_failed_trace_write_shows_once_in_the_pane_and_is_kept() {
+        let failing = crate::record::testing::Failing::default();
+        let mut ui = Ui {
+            trace: Some(TraceFile::from_writer(
+                std::path::Path::new("t.log"),
+                Box::new(failing),
+            )),
+            ..Ui::default()
+        };
+        ui.push(Entry::Trace("gwennol: one".to_string()));
+        ui.push(Entry::Trace("gwennol: two".to_string()));
+
+        assert_eq!(ui.entries.len(), 3, "{:?}", ui.entries);
+        assert_eq!(ui.entries[0], Entry::Trace("gwennol: one".to_string()));
+        match &ui.entries[1] {
+            Entry::Trace(text) => {
+                assert!(text.starts_with("gwennol: trace t.log: "), "{text}")
+            }
+            other => panic!("expected the failure entry, got {other:?}"),
+        }
+        assert_eq!(ui.entries[2], Entry::Trace("gwennol: two".to_string()));
+        assert_eq!(ui.record_failures.len(), 1, "{:?}", ui.record_failures);
+        assert!(ui.record_failures[0].starts_with("trace t.log: "));
     }
 }
