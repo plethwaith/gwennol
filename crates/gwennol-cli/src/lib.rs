@@ -11,13 +11,16 @@
 //! every decision — a session into its transcript pane, a print run to
 //! stderr — and both go through [`frontend::start`] and share
 //! [`show`]'s words, so a session reads like a print run's stderr.
+//! Either can also write the trace to a file (`--trace`).
 //! `-p`, or a run with no terminal on stdin or stdout, is print mode;
 //! otherwise a session opens.
 //!
 //! Exit status: 0 when the turn completed or the user ended the
 //! session; 1 when the turn failed, or the session ended right after a
-//! failed turn; 2 for a usage, configuration or startup error; 130 when
-//! cancelled by Ctrl-C in print mode, or forced by a second `/exit`.
+//! failed turn; 2 for a usage, configuration or startup error, or when a
+//! run that would exit 0 could not write a `--transcript` or `--trace`
+//! file; 130 when cancelled by Ctrl-C in print mode, or forced by a
+//! second `/exit`.
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +30,7 @@ pub mod operator;
 pub mod plugins;
 pub mod policy;
 pub mod print;
+pub mod record;
 pub mod secrets;
 pub mod show;
 pub mod tui;
@@ -134,11 +138,19 @@ pub struct Cli {
     #[arg(long)]
     pub no_stream: bool,
 
-    /// Print mode only: write the conversation as the provider saw
-    /// it — system prompt, tools, messages and settings, the whole
-    /// chat input — to FILE at the end, after a failure too.
+    /// Write the conversation as the provider saw it — system prompt,
+    /// tools, messages and settings, the whole chat input — to FILE: in
+    /// print mode at the end, after a failure too; in a session when it
+    /// starts and again after every turn.
     #[arg(long, value_name = "FILE")]
     pub transcript: Option<PathBuf>,
+
+    /// Write the trace — every decision, tool call, tool result and
+    /// outcome line, in the words a print run writes to stderr — to
+    /// FILE, one line at a time as it happens. Not the host's log
+    /// (--log).
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<PathBuf>,
 
     /// Print mode: one turn, model text on stdout, the trace on stderr,
     /// no terminal needed. Implied when stdin or stdout is not a terminal.
@@ -183,7 +195,8 @@ impl<E: std::fmt::Display> From<E> for Fatal {
 
 /// The turn failed, or the session ended right after a failed turn.
 pub const EXIT_TURN_FAILED: u8 = 1;
-/// A usage, configuration or startup error.
+/// A usage, configuration or startup error, or a run that would exit 0
+/// when a record file could not be written ([`record::settle`]).
 pub const EXIT_USAGE: u8 = 2;
 /// Cancelled by Ctrl-C in print mode, or forced by a second `/exit`.
 pub const EXIT_CANCELLED: u8 = 130;

@@ -126,8 +126,14 @@ session without `--log` collects none, so nothing competes with the
 pane); `-v`/`-vv` raise its level the same way they do in a print run,
 and `RUST_LOG` overrides the level either sets. `-v` also starts every
 tool result's pane entry expanded, matching a print run's `-v`.
-`--transcript` is print mode only; a session refuses it at startup
-rather than silently writing nothing.
+`--transcript FILE` is written when the session starts and rewritten
+after every turn, whatever its outcome; `--trace FILE` receives each
+trace line (decisions, tool calls and results, outcomes, not `/help`)
+as it enters the pane. Both are created owner-only (on Unix) before
+anything boots, so an unwritable path is a startup error, as is a failed
+first write of the transcript; a write that fails later is shown in the
+pane, printed again after the session ends, and turns a 0 exit status
+into 2.
 
 ## Rules
 
@@ -286,7 +292,7 @@ never invented, so the vendor's refusal is what ends that turn.
 |--------|---------------------------------------------------------------|
 | 0      | the turn completed (`done (…)` names the stop reason), or the user ended the session |
 | 1      | the turn failed: the provider refused, a contract was broken; or the session ended right after a failed turn |
-| 2      | usage, configuration or startup error                         |
+| 2      | usage, configuration or startup error; or a run that would exit 0 when a `--transcript` or `--trace` file could not be written |
 | 130    | print run: cancelled by Ctrl-C; session: a second `/exit` while the first is still unwinding |
 
 In a print run, Ctrl-C cancels the turn through the loop's token: a
@@ -300,16 +306,22 @@ provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at
 once. In a session Ctrl-C only shows a hint: `Esc` cancels the turn,
 and `/exit` ends the session.
 
-Print mode only: `--transcript FILE` writes the conversation as the
+In a print run, `--transcript FILE` writes the conversation as the
 provider saw it — the whole chat input: the system prompt, the tools
 as harvested from the manifests, every message with thinking carried
 as `opaque` blocks, and the generation settings — at the end, after a
-failure too. It is what the provider was handed on the last round plus
+failure too (a session rewrites it after every turn). It is what the provider was handed on the last round plus
 that round's answer, so the file can be read or replayed as a request.
 The outcome line comes first; a transcript that cannot be written is
 reported after it and makes a completed turn exit 2, while a failed or
-cancelled turn keeps its own status. A session refuses `--transcript`
-outright at startup rather than silently writing nothing.
+cancelled turn keeps its own status. `--trace FILE` writes the same
+lines stderr carries as the trace, one at a time as they happen (not
+the host's log, the no-terminal notice, or the Ctrl-C lines); a trace
+path that cannot be created is a startup error, and a trace write that
+fails later is said once on stderr and fails a completed turn like the
+transcript. Both files are created readable by their owner alone (on
+Unix; elsewhere the platform's default); an existing file keeps its
+permissions.
 
 ## What it does not do
 
