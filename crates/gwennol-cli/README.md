@@ -130,9 +130,9 @@ tool result's pane entry expanded, matching a print run's `-v`.
 after every turn, whatever its outcome; `--trace FILE` receives each
 trace line (decisions, tool calls and results, outcomes, not `/help`)
 as it enters the pane. Both are created owner-only before anything
-boots, so an unwritable path is a startup error; a write that fails
-later is shown in the pane, printed again after the session ends, and
-turns a 0 exit status into 2.
+boots, so an unwritable path is a startup error, as is a failed first
+write of the transcript; a write that fails later is shown in the pane,
+printed again after the session ends, and turns a 0 exit status into 2.
 
 ## Rules
 
@@ -305,7 +305,7 @@ provider-anthropic.stream_turn failed: …`. A second Ctrl-C exits at
 once. In a session Ctrl-C only shows a hint: `Esc` cancels the turn,
 and `/exit` ends the session.
 
-`--transcript FILE` writes the conversation as the
+In a print run, `--transcript FILE` writes the conversation as the
 provider saw it — the whole chat input: the system prompt, the tools
 as harvested from the manifests, every message with thinking carried
 as `opaque` blocks, and the generation settings — at the end, after a

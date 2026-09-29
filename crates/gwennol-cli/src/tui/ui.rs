@@ -60,11 +60,11 @@ pub enum Entry {
         expanded: bool,
     },
     /// A trace line: a decision, a tool call's failure, a retry, a
-    /// startup warning, an input-read error, or an event this
-    /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s
-    /// lines ([`HELP`]) are pushed as written, through
-    /// [`Ui::push_help`], which does not write them to the `--trace`
-    /// file.
+    /// startup warning, an input-read error, a record file's failed
+    /// write, or an event this frontend cannot show, each
+    /// `gwennol: `-prefixed; `/help`'s lines ([`HELP`]) are pushed as
+    /// written, through [`Ui::push_help`], which does not write them
+    /// to the `--trace` file.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -297,7 +297,13 @@ impl Ui {
     /// entry, but not written to the `--trace` file, since it is not a
     /// record of the run.
     pub fn push_help(&mut self, line: &str) {
-        self.entries.push(Entry::Trace(line.to_string()));
+        self.push_unrecorded(line.to_string());
+    }
+
+    /// Show `text` as a trace entry without writing it to the
+    /// `--trace` file.
+    fn push_unrecorded(&mut self, text: String) {
+        self.entries.push(Entry::Trace(text));
         self.open = None;
         self.revision = self.revision.wrapping_add(1);
     }
@@ -318,7 +324,7 @@ impl Ui {
             return;
         };
         if let Some(message) = trace.line(&entry.text()) {
-            self.push(Entry::Trace(format!("gwennol: {message}")));
+            self.push_unrecorded(format!("gwennol: {message}"));
             self.record_failures.push(message);
         }
     }

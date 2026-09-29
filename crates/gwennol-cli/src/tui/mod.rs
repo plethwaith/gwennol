@@ -168,6 +168,10 @@ mod tests {
     /// environment regardless. Guards the no-rules warning going only
     /// to the log in a session, not the pane. Mutation: restore the
     /// `warnings.push` in `frontend.rs` — two entries instead of one.
+    /// With `--trace`, the warning is also the trace file's first
+    /// line, because `start` gives the pane its trace before it pushes
+    /// the warnings. Mutation: move `ui.trace = trace;` after the
+    /// warnings loop — the file is empty.
     #[test]
     fn startup_warnings_are_the_first_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -196,6 +200,8 @@ mod tests {
             config_path.to_str().unwrap(),
             "--secret",
             &format!("{PROVIDER}:api_key=env:GWENNOL_TEST_STARTUP_WARNING_38_UNSET"),
+            "--trace",
+            root.path().join("t.log").to_str().unwrap(),
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
         // No --allow/--deny rule at all: the empty-policy warning
@@ -214,6 +220,11 @@ mod tests {
             ),
             other => panic!("expected a Trace entry, got {other:?}"),
         }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("t.log")).unwrap(),
+            format!("{}\n", guard.entries[0].text()),
+            "the startup warning is in the trace file"
+        );
     }
 
     /// `tui::start` creates both record files before it boots anything,

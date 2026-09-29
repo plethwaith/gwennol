@@ -1,6 +1,5 @@
 //! The record files a run can keep: the transcript (the conversation as
-//! the provider saw it) and the trace (the lines a print run writes to
-//! stderr, or a session shows in its pane). This module is the one place
+//! the provider saw it) and the trace. This module is the one place
 //! either is opened, so print mode and a session agree on how a file is
 //! created, what a failed write says, and what it does to the exit
 //! status: a file this module creates is readable and writable by its

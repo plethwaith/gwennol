@@ -901,6 +901,12 @@ async fn scenario() {
                 "run C: draft cleared",
             )
             .await;
+            // The Backspaces above were read by `idle_step`, after
+            // `drive` had rewritten the file for the cancelled turn.
+            assert!(
+                transcript_file().contains("stream-stall"),
+                "run C: the cancelled turn was not rewritten before the idle key read"
+            );
             type_line(&tx, "/exit");
         })
     };
@@ -961,7 +967,12 @@ async fn scenario() {
     );
 
     reset_editor(&shared);
-    // ---- run D: cancel during a tool call.
+    // ---- run D: cancel during a tool call. Its rewrite of the
+    // transcript file fails, and so does run E's first turn: the path
+    // is left unwritable for those two turns, then restored.
+    let good_path = shared.lock().transcript.clone();
+    let bad_path = fixture().root.join("missing-dir").join("t.json");
+    shared.update(|ui| ui.transcript = Some(bad_path.clone()));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
@@ -1019,21 +1030,86 @@ async fn scenario() {
             .is_some_and(|c| c.starts_with("interrupted: the turn was cancelled"))),
         "run D: the transcript's tool_result does not carry the interruption: {last:?}"
     );
+    // The failed rewrite is shown right after the outcome, and kept.
+    let failed_rewrite = format!("gwennol: transcript {}: ", bad_path.display());
+    {
+        let ui = shared.lock();
+        let entries = &ui.entries[start..];
+        let at = entries
+            .iter()
+            .position(|e| matches!(e, Entry::Outcome(_)))
+            .expect("run D: no outcome entry");
+        assert!(
+            matches!(entries.get(at + 1), Some(Entry::Trace(t)) if t.starts_with(&failed_rewrite)),
+            "run D: no failed-rewrite entry right after the outcome: {entries:?}"
+        );
+        assert_eq!(
+            ui.record_failures.len(),
+            1,
+            "run D: the failed rewrite is kept once: {:?}",
+            ui.record_failures
+        );
+    }
 
     reset_editor(&shared);
-    // ---- run E: a failed turn.
+    // ---- run E: two failed turns. The path is still unwritable for
+    // the first, so its rewrite fails again (the turn after a failed
+    // rewrite tries again); the path is restored for the second.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
     let start = shared.lock().entries.len();
     let driver = {
         let shared = shared.clone();
+        let failed_rewrite = failed_rewrite.clone();
         tokio::spawn(async move {
             type_line(&tx, "fail");
             await_ui(
                 &shared,
                 |ui| outcomes_since(ui, start) >= 1,
-                "run E: outcome",
+                "run E: first outcome",
             )
             .await;
+            // `drive` pushes the failed rewrite after the outcome and
+            // before it reads a key, so once this key has landed the
+            // rewrite has been tried, and the path can be restored.
+            typed(&tx, &shared, 'x').await;
+            {
+                let ui = shared.lock();
+                let entries = &ui.entries[start..];
+                let at = entries
+                    .iter()
+                    .position(|e| matches!(e, Entry::Outcome(_)))
+                    .expect("run E: no outcome entry");
+                assert!(
+                    matches!(entries.get(at + 1), Some(Entry::Trace(t)) if t.starts_with(&failed_rewrite)),
+                    "run E: no failed-rewrite entry right after the first outcome: {entries:?}"
+                );
+                assert_eq!(
+                    ui.record_failures.len(),
+                    2,
+                    "run E: the first turn's failed rewrite is kept: {:?}",
+                    ui.record_failures
+                );
+            }
+            shared.update(|ui| ui.transcript = good_path);
+            type_line(&tx, "fail");
+            await_ui(
+                &shared,
+                |ui| outcomes_since(ui, start) >= 2,
+                "run E: second outcome",
+            )
+            .await;
+            // `drive` rewrote the file before the idle key read, as
+            // in runs A and C.
+            typed(&tx, &shared, 'x').await;
+            let file: Value = serde_json::from_str(&transcript_file()).unwrap();
+            assert!(
+                file["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "user" && m.to_string().contains("\"fail\"")),
+                "run E: the failed turn was not rewritten before the idle key read"
+            );
             type_line(&tx, "/exit");
         })
     };
@@ -1056,6 +1132,20 @@ async fn scenario() {
     {
         let ui = shared.lock();
         let entries = &ui.entries[start..];
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(e, Entry::Trace(t) if t.starts_with(&failed_rewrite)))
+                .count(),
+            1,
+            "run E: only the first turn's rewrite failed: {entries:?}"
+        );
+        assert_eq!(
+            ui.record_failures.len(),
+            2,
+            "run E: the kept failures are run D's and run E's first turn's: {:?}",
+            ui.record_failures
+        );
         assert!(
             entries.iter().any(|e| matches!(e, Entry::Outcome(t) if t.starts_with("gwennol: turn failed: provider refused the turn"))),
             "run E outcome: {entries:?}"

@@ -439,6 +439,38 @@ fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
     assert!(failed_turn < failed_write, "{}", r.stderr);
 }
 
+/// The line that reports a transcript that cannot be written is a
+/// trace line like the rest: with `--trace` it is in the file as well
+/// as on stderr, so with the log elsewhere the file is stderr exactly.
+/// Mutation: write the transcript-failure line to stderr alone
+/// (`eprintln!` in place of `record::say` in `print::run`).
+#[test]
+fn a_transcript_failure_is_in_the_trace_file_too() {
+    let f = fixture();
+    let config = f.config("transcript-traced", "", "");
+    let trace = f.scratch.join("tf.trace");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .args(["--transcript", "/nonexistent/dir/t.json"])
+        .arg("--log")
+        .arg(f.scratch.join("tf.log"))
+        .arg("--trace")
+        .arg(&trace)
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    assert!(
+        r.stderr
+            .contains("gwennol: transcript /nonexistent/dir/t.json: "),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), r.stderr);
+}
+
 #[test]
 fn a_round_the_model_ends_in_a_refusal_still_reaches_stdout_first() {
     let f = fixture();
