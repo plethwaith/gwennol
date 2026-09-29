@@ -53,6 +53,11 @@ fn transcript_failed(path: &Path, error: &std::io::Error) -> Fatal {
     Fatal(format!("transcript {}: {error}", path.display()))
 }
 
+/// What a failed open or write of the trace says.
+fn trace_failed(path: &Path, error: &std::io::Error) -> String {
+    format!("trace {}: {error}", path.display())
+}
+
 /// A trace file: one line per [`TraceFile::line`], each written with a
 /// single unbuffered `write_all`, so nothing a crash would lose is held
 /// in a buffer. The first failed write closes it.
@@ -65,7 +70,7 @@ pub struct TraceFile {
 impl TraceFile {
     /// Create (or truncate) the file at `path`.
     pub fn create(path: &Path) -> Result<TraceFile, Fatal> {
-        let file = create(path).map_err(|e| Fatal(format!("trace {}: {e}", path.display())))?;
+        let file = create(path).map_err(|e| Fatal(trace_failed(path, &e)))?;
         Ok(TraceFile {
             path: path.to_path_buf(),
             out: Some(Box::new(file)),
@@ -96,7 +101,7 @@ impl TraceFile {
             Err(e) => {
                 self.out = None;
                 self.failed = true;
-                Some(format!("trace {}: {e}", self.path.display()))
+                Some(trace_failed(&self.path, &e))
             }
         }
     }

@@ -125,8 +125,8 @@ pub enum TurnState {
 pub struct Ui {
     /// Every line the pane holds, oldest first. Callers outside `Ui`
     /// must only read this, never mutate it: `revision` below is kept
-    /// in step with it by `Ui::push`, `Ui::push_help` and `Ui::apply`
-    /// alone, and the type cannot enforce that — a direct
+    /// in step with it by `Ui::push`, `Ui::push_help`, `Ui::apply` and
+    /// `Ui::toggle` alone, and the type cannot enforce that — a direct
     /// `ui.entries.push(...)` would compile and leave `render_pane`'s
     /// cache silently stale.
     pub entries: Vec<Entry>,

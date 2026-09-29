@@ -334,8 +334,9 @@ fn a_print_run_writes_its_trace_to_a_file_as_it_writes_stderr() {
 }
 
 /// A trace that cannot be created is a startup error: exit 2 before
-/// the run's first request. Mutation: create the trace on its first
-/// line instead of at startup.
+/// the run's first request. Mutation: ignore the failure to create the
+/// trace at startup (`.transpose().ok().flatten()` in `print::run`), so
+/// the run proceeds and exits 0.
 #[test]
 fn an_unwritable_trace_fails_a_print_run_before_any_request() {
     let f = fixture();
