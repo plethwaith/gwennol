@@ -4,8 +4,8 @@
 //! either is opened, so print mode and a session agree on how a file is
 //! created, what a failed write says, and what it does to the exit
 //! status: a file this module creates is readable and writable by its
-//! owner alone; a write that fails is said once; and a run that would
-//! exit 0 exits 2 instead ([`settle`]).
+//! owner alone, and a run that would exit 0 exits 2 instead when a
+//! record could not be written ([`settle`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -31,9 +31,8 @@ pub fn create(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// The whole chat input, pretty-printed: what the provider was handed
-/// on the last round plus its answer, so the file is a request someone
-/// can read or replay, not just the messages.
+/// The whole chat input, pretty-printed, so the file is a request
+/// someone can read or replay, not just the messages.
 pub fn write_transcript(path: &Path, chat_input: &Value) -> Result<(), Fatal> {
     let text = serde_json::to_string_pretty(chat_input).expect("a Value serialises");
     let fail = |e: std::io::Error| Fatal(format!("transcript {}: {e}", path.display()));

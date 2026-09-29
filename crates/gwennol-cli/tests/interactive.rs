@@ -636,6 +636,15 @@ async fn scenario() {
                 "run A: first turn outcome",
             )
             .await;
+            // `drive` pushes the outcome and rewrites the file before
+            // it loops back to `idle_step`, the next place a key is
+            // read, so once this key has landed the first turn is on
+            // disk and no second turn has been submitted.
+            typed(&tx, &shared, 'x').await;
+            assert!(
+                transcript_file().contains("What does hello.txt say?"),
+                "run A: turn 1 not rewritten before the idle key read"
+            );
             type_line(&tx, "again please");
             await_ui(
                 &shared,

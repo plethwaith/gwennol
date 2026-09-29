@@ -63,8 +63,8 @@ pub enum Entry {
     /// startup warning, an input-read error, or an event this
     /// frontend cannot show, each `gwennol: `-prefixed; `/help`'s
     /// lines ([`HELP`]) are pushed as written, through
-    /// [`Ui::push_help`], and are the one kind of trace entry the
-    /// `--trace` file never gets.
+    /// [`Ui::push_help`], which does not write them to the `--trace`
+    /// file.
     Trace(String),
     /// The turn's outcome line.
     Outcome(String),
@@ -126,8 +126,9 @@ pub struct Ui {
     /// Every line the pane holds, oldest first. Callers outside `Ui`
     /// must only read this, never mutate it: `revision` below is kept
     /// in step with it by `Ui::push`, `Ui::push_help` and `Ui::apply`
-    /// alone, and the type cannot enforce that — a direct `ui.entries.push(...)` would
-    /// compile and leave `render_pane`'s cache silently stale.
+    /// alone, and the type cannot enforce that — a direct
+    /// `ui.entries.push(...)` would compile and leave `render_pane`'s
+    /// cache silently stale.
     pub entries: Vec<Entry>,
     /// The index of the open `Assistant` entry, if any: where the next
     /// `Text` event appends.
@@ -149,9 +150,9 @@ pub struct Ui {
     /// Bumped whenever `entries` or `open` changes in a way that could
     /// change what `render_pane` draws (every [`Ui::push`], every call
     /// to [`Ui::push_help`] or [`Ui::apply`], and every [`Ui::toggle`]).
-    /// `render_pane` rewraps the whole transcript only when this, or the pane's
-    /// width, differs from the cached frame: the 100ms tick and a
-    /// redraw it triggers otherwise rewrap on every frame for a
+    /// `render_pane` rewraps the whole transcript only when this, or
+    /// the pane's width, differs from the cached frame: the 100ms tick
+    /// and a redraw it triggers otherwise rewrap on every frame for a
     /// spinner character alone.
     revision: u64,
     /// `render_pane`'s last computed rows, and the `(revision, width)`
@@ -198,9 +199,10 @@ pub struct Ui {
     /// its width and height; `render_status` reads `following`.
     pub pane_view: Cell<PaneView>,
     /// The `--trace` file, set by `tui::start` before the startup
-    /// warnings are pushed: every trace entry ([`Entry::Trace`],
-    /// [`Entry::ToolCall`], [`Entry::ToolResult`], [`Entry::Outcome`])
-    /// is written to it as it enters the pane, by `push` and `apply`.
+    /// warnings are pushed: `push` and `apply` write each
+    /// [`Entry::Trace`], [`Entry::ToolCall`], [`Entry::ToolResult`] and
+    /// [`Entry::Outcome`] they add, as it enters the pane, until a write
+    /// fails.
     pub trace: Option<TraceFile>,
     /// The `--transcript` file, set by `tui::start`: `drive` rewrites
     /// it after every turn.
@@ -1577,10 +1579,10 @@ mod tests {
     /// as the pane draws them at that moment, and nothing else: not the
     /// user's text, not the model's, in a retry's replacing branch and
     /// its pushing branch alike, and a result whole at `-v`.
-    /// Mutations: remove `record` from `push` (empty); remove it from
-    /// the `Retry` arm (both retry lines missing); record every entry
-    /// kind (`hi` and `u` appear); record results with verbosity 0
-    /// always (the `-v` half fails).
+    /// Mutations: remove `record` from `push` (only the two retry lines
+    /// remain); remove it from the `Retry` arm (both retry lines
+    /// missing); record every entry kind (`hi` and `u` appear); record
+    /// results with verbosity 0 always (the `-v` half fails).
     #[test]
     fn trace_entries_are_recorded_in_print_words_and_nothing_else() {
         let (mut ui, capture) = traced_ui();

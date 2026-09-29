@@ -90,34 +90,49 @@ pub fn start(
     Ok((session, shared))
 }
 
-/// The session: start, then the terminal, the loop, and the restore.
+/// The session: start, then the terminal and the loop, then the record
+/// failures once the terminal is back.
 pub async fn run(
     cli: Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
 ) -> Result<ExitCode, Fatal> {
     let (mut session, shared) = start(&cli, workspace, flag_rules)?;
+    let code = on_terminal(&mut session, &shared, cli.first_turn()).await;
+    finish(code, &shared, &mut std::io::stderr())
+}
+
+/// The loop on the terminal: raw mode and the alternate screen are
+/// entered here and restored when this returns, whichever way it does.
+async fn on_terminal(
+    session: &mut Session,
+    shared: &Arc<Shared>,
+    first: Option<String>,
+) -> Result<ExitCode, Fatal> {
     screen::install_panic_hook();
     let screen = Screen::enter(std::io::stdout(), true, Kitty::Probe)
         .map_err(|e| Fatal(format!("terminal setup: {e}")))?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))
         .map_err(|e| Fatal(format!("terminal: {e}")))?;
     let mut keys = TerminalKeys::new();
-    let code = drive(
-        &mut session,
-        &shared,
-        &mut terminal,
-        &mut keys,
-        cli.first_turn(),
-    )
-    .await;
+    let code = drive(session, shared, &mut terminal, &mut keys, first).await;
     drop(terminal);
     drop(screen);
-    // The terminal is back: what could not be written is said where it
-    // outlives the alternate screen.
+    code
+}
+
+/// What is left to say once the terminal is back: each record failure
+/// the session kept is written to `err`, where it outlives the
+/// alternate screen, before an error `code` is returned as it is; a
+/// `code` of success becomes exit 2 when any failed ([`record::settle`]).
+fn finish(
+    code: Result<ExitCode, Fatal>,
+    shared: &Shared,
+    err: &mut impl std::io::Write,
+) -> Result<ExitCode, Fatal> {
     let failures = shared.lock().record_failures.clone();
     for message in &failures {
-        eprintln!("gwennol: {message}");
+        let _ = writeln!(err, "gwennol: {message}");
     }
     code.map(|code| record::settle(code, !failures.is_empty()))
 }
@@ -236,5 +251,37 @@ mod tests {
                 Ok(_) => panic!("{flag}: expected a startup error"),
             }
         }
+    }
+
+    /// A record failure kept before the terminal could be entered is
+    /// still said, ahead of the terminal error that ends the run, and a
+    /// clean run becomes exit 2. Mutation: return an error `code`
+    /// before reading `record_failures` (nothing is said).
+    #[test]
+    fn kept_record_failures_are_said_even_when_the_terminal_fails() {
+        let shared = Shared::new();
+        shared.update(|ui| ui.record_failures.push("trace t.log: boom".to_string()));
+        let mut said = Vec::new();
+        let code = finish(
+            Err(Fatal("terminal setup: no tty".to_string())),
+            &shared,
+            &mut said,
+        );
+        assert_eq!(
+            String::from_utf8(said).unwrap(),
+            "gwennol: trace t.log: boom\n"
+        );
+        assert!(
+            matches!(&code, Err(Fatal(m)) if m == "terminal setup: no tty"),
+            "{code:?}"
+        );
+
+        let mut said = Vec::new();
+        let code = finish(Ok(ExitCode::SUCCESS), &shared, &mut said);
+        assert_eq!(code.unwrap(), ExitCode::from(crate::EXIT_USAGE));
+        assert_eq!(
+            String::from_utf8(said).unwrap(),
+            "gwennol: trace t.log: boom\n"
+        );
     }
 }
