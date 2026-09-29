@@ -30,14 +30,27 @@ pub fn create(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+/// Create the transcript file at `path`, empty, so a path that cannot
+/// be written is found before anything boots. The message on failure is
+/// `transcript <path>: <error>`, as for [`write_transcript`].
+pub fn create_transcript(path: &Path) -> Result<(), Fatal> {
+    create(path)
+        .map(drop)
+        .map_err(|e| transcript_failed(path, &e))
+}
+
 /// The whole chat input, pretty-printed, so the file is a request
 /// someone can read or replay, not just the messages.
 pub fn write_transcript(path: &Path, chat_input: &Value) -> Result<(), Fatal> {
     let text = serde_json::to_string_pretty(chat_input).expect("a Value serialises");
-    let fail = |e: std::io::Error| Fatal(format!("transcript {}: {e}", path.display()));
     create(path)
         .and_then(|mut file| file.write_all(text.as_bytes()))
-        .map_err(fail)
+        .map_err(|e| transcript_failed(path, &e))
+}
+
+/// What a failed open or write of the transcript says.
+fn transcript_failed(path: &Path, error: &std::io::Error) -> Fatal {
+    Fatal(format!("transcript {}: {error}", path.display()))
 }
 
 /// A trace file: one line per [`TraceFile::line`], each written with a

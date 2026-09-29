@@ -54,7 +54,7 @@ pub fn start(
 ) -> Result<(Session, Arc<Shared>), Fatal> {
     let trace = cli.trace.as_deref().map(TraceFile::create).transpose()?;
     if let Some(path) = &cli.transcript {
-        record::create(path).map_err(|e| Fatal(format!("transcript {}: {e}", path.display())))?;
+        record::create_transcript(path)?;
     }
     let shared = Shared::new();
     shared.update(|ui| {

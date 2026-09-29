@@ -1564,6 +1564,51 @@ mod tests {
         );
     }
 
+    /// A `/help` line pushed with `push_help` is drawn on the next
+    /// frame: the pane cache is keyed on `revision`, and `/help` reaches
+    /// the `Ui` through `push_help` alone, not `apply`.
+    /// Mutation: delete `self.revision = self.revision.wrapping_add(1);`
+    /// from `push_unrecorded` — the second draw below shows no help line.
+    #[test]
+    fn a_help_line_is_drawn_on_the_next_frame() {
+        let mut ui = Ui::default();
+        ui.push(Entry::Trace("gwennol: before".to_string()));
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&ui, f)).unwrap();
+
+        ui.push_help("helpline");
+        terminal.draw(|f| render(&ui, f)).unwrap();
+        assert_eq!(
+            row(terminal.backend().buffer(), 1, 20).trim_end(),
+            "helpline",
+            "the pane showed a stale frame after a help line: {:?}",
+            row(terminal.backend().buffer(), 1, 20)
+        );
+    }
+
+    /// A `/help` line closes the open assistant entry, as any other
+    /// pushed entry does: text that streams afterwards starts a new
+    /// entry below the help lines instead of extending the one above.
+    /// Mutation: delete `self.open = None;` from `push_unrecorded` — the
+    /// later text is appended to the first entry and there are two
+    /// entries, not three.
+    #[test]
+    fn a_help_line_closes_the_open_assistant_entry() {
+        let mut ui = Ui::default();
+        ui.apply(Event::Text("aaa".to_string()), 0);
+        ui.push_help("helpline");
+        ui.apply(Event::Text("bbb".to_string()), 0);
+        assert_eq!(
+            ui.entries,
+            [
+                Entry::Assistant("aaa".to_string()),
+                Entry::Trace("helpline".to_string()),
+                Entry::Assistant("bbb".to_string()),
+            ]
+        );
+    }
+
     /// A `Ui` whose trace is a capture.
     fn traced_ui() -> (Ui, crate::record::testing::Capture) {
         let capture = crate::record::testing::Capture::default();

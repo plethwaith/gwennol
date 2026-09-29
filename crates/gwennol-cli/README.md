@@ -316,9 +316,10 @@ reported after it and makes a completed turn exit 2, while a failed or
 cancelled turn keeps its own status. `--trace FILE` writes the same
 lines stderr carries as the trace, one at a time as they happen (not
 the host's log, the no-terminal notice, or the Ctrl-C lines); a trace
-that cannot be written is said once on stderr and fails a completed
-turn like the transcript. Both files are created readable by their
-owner alone; an existing file keeps its permissions.
+path that cannot be created is a startup error, and a trace write that
+fails later is said once on stderr and fails a completed turn like the
+transcript. Both files are created readable by their owner alone; an
+existing file keeps its permissions.
 
 ## What it does not do
 
