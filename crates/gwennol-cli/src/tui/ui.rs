@@ -201,8 +201,8 @@ pub struct Ui {
     /// The `--trace` file, set by `tui::start` before the startup
     /// warnings are pushed: `push` and `apply` write each
     /// [`Entry::Trace`], [`Entry::ToolCall`], [`Entry::ToolResult`] and
-    /// [`Entry::Outcome`] they add, as it enters the pane, until a write
-    /// fails.
+    /// [`Entry::Outcome`] they add, or put in place of the open entry,
+    /// as it enters the pane, until a write fails.
     pub trace: Option<TraceFile>,
     /// The `--transcript` file, set by `tui::start`: `drive` rewrites
     /// it after every turn.

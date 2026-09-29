@@ -17,8 +17,10 @@
 //!
 //! Exit status: 0 when the turn completed or the user ended the
 //! session; 1 when the turn failed, or the session ended right after a
-//! failed turn; 2 for a usage, configuration or startup error; 130 when
-//! cancelled by Ctrl-C in print mode, or forced by a second `/exit`.
+//! failed turn; 2 for a usage, configuration or startup error, or when a
+//! run that would exit 0 could not write a `--transcript` or `--trace`
+//! file; 130 when cancelled by Ctrl-C in print mode, or forced by a
+//! second `/exit`.
 
 #![forbid(unsafe_code)]
 
@@ -193,7 +195,8 @@ impl<E: std::fmt::Display> From<E> for Fatal {
 
 /// The turn failed, or the session ended right after a failed turn.
 pub const EXIT_TURN_FAILED: u8 = 1;
-/// A usage, configuration or startup error.
+/// A usage, configuration or startup error, or a run that would exit 0
+/// when a record file could not be written ([`record::settle`]).
 pub const EXIT_USAGE: u8 = 2;
 /// Cancelled by Ctrl-C in print mode, or forced by a second `/exit`.
 pub const EXIT_CANCELLED: u8 = 130;

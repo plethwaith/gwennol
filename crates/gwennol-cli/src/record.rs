@@ -3,8 +3,9 @@
 //! either is opened, so print mode and a session agree on how a file is
 //! created, what a failed write says, and what it does to the exit
 //! status: a file this module creates is readable and writable by its
-//! owner alone, and a run that would exit 0 exits 2 instead when a
-//! record could not be written ([`settle`]).
+//! owner alone (on Unix; elsewhere the platform's default), and a run
+//! that would exit 0 exits 2 instead when a record could not be
+//! written ([`settle`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -58,9 +59,10 @@ fn trace_failed(path: &Path, error: &std::io::Error) -> String {
     format!("trace {}: {error}", path.display())
 }
 
-/// A trace file: one line per [`TraceFile::line`], each written with a
-/// single unbuffered `write_all`, so nothing a crash would lose is held
-/// in a buffer. The first failed write closes it.
+/// A trace file: one entry per [`TraceFile::line`] call, each ended by
+/// one newline and written with a single unbuffered `write_all`, so
+/// nothing a crash would lose is held in a buffer. The first failed
+/// write closes it.
 pub struct TraceFile {
     path: PathBuf,
     out: Option<Box<dyn Write + Send>>,
