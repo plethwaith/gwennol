@@ -2872,7 +2872,7 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 ///
 /// That shape rides the kernel's drop grace: the watchdog only fires
 /// the invocation's token at the deadline; a separate backstop drops a
-/// step still running one `WALLCLOCK_DROP_GRACE` later (gwead 0.2.0)
+/// step still running one `WALLCLOCK_DROP_GRACE` later (gwead 0.3.0)
 /// and reports the timeout, so the code arrives only when the step
 /// unwinds inside the grace. The figure, with the version it holds
 /// for, is in `reports_cancellation`'s doc in `src/agent/mod.rs`. A
