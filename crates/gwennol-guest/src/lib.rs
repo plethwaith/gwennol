@@ -3,7 +3,7 @@
 //! Gwead's `script` step hands a step's `source` string to whatever wasm
 //! module is registered for the step's `language` — and that module's
 //! contract (`alloc`/`execute`/`memory` exports, host imports from the
-//! `gwead1` module) nowhere requires that anything be *interpreted*. This
+//! `gwead@1` module) nowhere requires that anything be *interpreted*. This
 //! crate exploits exactly that: a plugin's guest logic is ordinary Rust,
 //! compiled to `wasm32-unknown-unknown`, occupying the interpreter's
 //! slot, with the step's `source` string serving as an entry-point
@@ -54,7 +54,7 @@
 //! # ABI coupling
 //!
 //! The raw imports live in [`sys`] and target Gwead's script-runtime ABI
-//! version 1 (import module `"gwead1"`). Gwead documents the ABI in its
+//! version 1 (import module `"gwead@1"`). Gwead documents the ABI in its
 //! `STREAMS_ABI.md`; until Gwead 1.0 the ABI may change between
 //! releases, and guest modules must be rebuilt against the kernel
 //! version that hosts them. This crate is where such a change lands.
