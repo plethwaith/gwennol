@@ -5,8 +5,8 @@
 //! workspace root are therefore per process, and a `OnceLock` matches their
 //! real lifetime: set once by [`crate::boot`], read by every step
 //! invocation afterwards. A session built with `Session::with_events` sends
-//! its events to its own sink, not to this operator; the `host_*` steps its
-//! tools reach still read this state.
+//! its events to its own sink, not to this operator; the `host_*` steps still
+//! read this state.
 //!
 //! Tests in one binary therefore share a single host. The integration tests
 //! install a recording operator once and inspect what it was asked.

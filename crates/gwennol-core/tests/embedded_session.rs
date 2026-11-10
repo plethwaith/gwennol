@@ -1,7 +1,7 @@
 //! A session on a kernel `boot` did not build, in a process where no
 //! host is installed: the embedder's path through the loop.
 //!
-//! This binary never calls `boot` or `boot_with`. Its kernels carry only
+//! This binary never calls `boot` or `boot_with`. Its kernels carry
 //! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools,
 //! each declaring a secret so the kernel consults the resolver on every
 //! invocation (`gwead::kernel::secrets`: a non-empty declaration is what

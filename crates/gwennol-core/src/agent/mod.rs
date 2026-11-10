@@ -544,10 +544,7 @@ impl Session {
     /// installed operator.
     ///
     /// Does not read the process-global host itself, so it never returns
-    /// [`SessionError::NotBooted`], and works on a kernel [`crate::boot`]
-    /// did not build as long as no tool it offers reaches a `host_*` step:
-    /// those steps read the installed host through [`crate::host::host`],
-    /// which panics when none is installed. Several such sessions can
+    /// [`SessionError::NotBooted`]. Several such sessions can
     /// share a kernel and keep their events apart. There is no input source:
     /// [`Self::run`] returns at once, and the session is driven with
     /// [`Self::turn`]. Refuses as [`Self::new`] does, except for
@@ -584,11 +581,7 @@ impl Session {
     /// Replace the conversation with `messages`, between turns.
     ///
     /// The whole list is checked first, against the rules the loop
-    /// keeps while it runs — roles alternate starting with the user, every
-    /// call is answered in the next message in order, results come before
-    /// text, nothing is left unanswered, and no message or block carries a
-    /// field the contract does not allow or a block type it does not define
-    /// — and on refusal the transcript is untouched
+    /// keeps while it runs, and on refusal the transcript is untouched
     /// ([`SessionError::Transcript`] gives the position). What
     /// [`Self::transcript`] returned, from this session or another, is
     /// accepted. The list may be empty, and may end in a user message
