@@ -2,7 +2,7 @@
 //! safe Rust.
 //!
 //! Every function here corresponds one-to-one to a host import from the
-//! wasm module `"gwead1"` — Gwead's script-runtime ABI, version 1, as
+//! wasm module `"gwead@1"` — Gwead's script-runtime ABI, version 1, as
 //! pinned by its `STREAMS_ABI.md`. The wrappers translate between Rust
 //! slices and the ABI's `(ptr, len)` pairs and nothing more: return
 //! codes come back verbatim, and the typed layers above
@@ -39,12 +39,14 @@ pub const MAX_LAST_ERROR_BYTES: usize = 4096;
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    // The module name is the ABI version handshake: `"gwead"` with the
-    // ABI version appended. A kernel speaking a different ABI registers
-    // a different module name and this module fails to instantiate,
-    // which is the intended diagnostic. Bumping this constant IS the
-    // ABI migration for every guest built on this crate.
-    #[link(wasm_import_module = "gwead1")]
+    // The module name, which Gwead exposes as
+    // `gwead::kernel::abi::ABI_MODULE`, is the ABI version handshake:
+    // `"gwead@"` followed by the ABI version. A kernel speaking a different ABI
+    // registers a different module name and this module fails to
+    // instantiate with an unknown-import error, which is the intended
+    // diagnostic. Changing this literal IS the ABI migration for every
+    // guest built on this crate.
+    #[link(wasm_import_module = "gwead@1")]
     unsafe extern "C" {
         fn host_set_result(ptr: i32, len: i32);
         fn host_set_error(ptr: i32, len: i32);
@@ -86,7 +88,7 @@ mod imp {
     // future import goes through.
     fn abi_len(len: usize) -> i32 {
         i32::try_from(len)
-            .expect("buffer length exceeds i32::MAX — not expressible in the gwead1 ABI")
+            .expect("buffer length exceeds i32::MAX — not expressible in the gwead@1 ABI")
     }
 
     fn ptr_len(buf: &[u8]) -> (i32, i32) {

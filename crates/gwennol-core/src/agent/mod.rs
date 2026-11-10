@@ -1102,7 +1102,7 @@ impl Cut {
 /// code has two sources: the kernel's action ceiling withdrawing a
 /// held approval, which arrives as the code when the step unwinds
 /// within the kernel's drop grace
-/// (100 ms past the deadline in gwead 0.2.0) and as
+/// (100 ms past the deadline in gwead 0.3.0) and as
 /// [`KernelError::ExecutionTimeout`] otherwise, and a plugin throwing
 /// the code itself. The ceiling never produces the typed shape — its
 /// watchdog reports a step it stopped as the timeout — so without
