@@ -39,9 +39,9 @@ pub const MAX_LAST_ERROR_BYTES: usize = 4096;
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    // The module name is the ABI version handshake: `"gwead@"` followed
-    // by the ABI version, which Gwead exposes as
-    // `gwead::kernel::abi::ABI_MODULE`. A kernel speaking a different ABI
+    // The module name, which Gwead exposes as
+    // `gwead::kernel::abi::ABI_MODULE`, is the ABI version handshake:
+    // `"gwead@"` followed by the ABI version. A kernel speaking a different ABI
     // registers a different module name and this module fails to
     // instantiate with an unknown-import error, which is the intended
     // diagnostic. Changing this literal IS the ABI migration for every
