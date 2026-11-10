@@ -30,6 +30,72 @@ impl Transcript {
         &self.messages
     }
 
+    /// A transcript holding `messages`, if they are exactly what the
+    /// loop could have stored: whatever [`Self::messages`] returned
+    /// passes. On refusal, the offending message's position (the list's
+    /// length for a trailing unanswered call) and the rule it breaks.
+    ///
+    /// Not checked, because the loop checks neither of what a provider
+    /// sends: that `tool_use` ids are unique across the conversation, and
+    /// that a tool name is one the session offers.
+    pub(crate) fn from_messages(messages: Vec<Value>) -> Result<Self, (usize, String)> {
+        // The calls the previous assistant message made, awaiting answers.
+        let mut owed: Vec<ToolUse> = Vec::new();
+        let mut previous: Option<&str> = None;
+        for (index, message) in messages.iter().enumerate() {
+            let fail = |error: String| (index, error);
+            let role = match message.get("role").and_then(Value::as_str) {
+                Some(role @ ("user" | "assistant")) => role,
+                _ => return Err(fail("message role is not `user` or `assistant`".into())),
+            };
+            if previous.is_none() && role != "user" {
+                return Err(fail("the first message is not a user message".into()));
+            }
+            if previous == Some(role) {
+                return Err(fail(format!("two {role} messages in a row")));
+            }
+            match role {
+                "assistant" => {
+                    let content_is_empty = message["content"].as_array().is_some_and(Vec::is_empty);
+                    if content_is_empty {
+                        return Err(fail("message has an empty `content` array".into()));
+                    }
+                    owed = check_assistant_message(message).map_err(fail)?;
+                }
+                _ => {
+                    let answered = check_user_message(message).map_err(fail)?;
+                    if answered.len() != owed.len() {
+                        return Err(fail(format!(
+                            "the message answers {} tool calls but the assistant message before it made {}",
+                            answered.len(),
+                            owed.len()
+                        )));
+                    }
+                    for (answer, call) in answered.iter().zip(&owed) {
+                        if *answer != call.id {
+                            return Err(fail(format!(
+                                "tool_result answers {answer:?} where the call made was {:?}",
+                                call.id
+                            )));
+                        }
+                    }
+                    owed.clear();
+                }
+            }
+            previous = Some(role);
+        }
+        if !owed.is_empty() {
+            return Err((
+                messages.len(),
+                format!(
+                    "the last assistant message's {} tool calls are unanswered",
+                    owed.len()
+                ),
+            ));
+        }
+        Ok(Self { messages })
+    }
+
     /// Add the user's text. When the transcript already ends in a user
     /// message — the previous turn did not complete — the text becomes
     /// another block of that message, after any tool results it holds:
@@ -168,6 +234,80 @@ pub(crate) fn check_block(block: &Value) -> Result<Option<ToolUse>, String> {
     }
 }
 
+/// Check a whole user message and return the `tool_use_id`s of its leading
+/// `tool_result` blocks, in order.
+///
+/// Fail-closed like [`check_block`]: only the two block types the loop
+/// stores, with exactly the fields it stores, and results before text.
+pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
+    let Some(fields) = message.as_object() else {
+        return Err(format!("user message is not an object: {message}"));
+    };
+    for key in fields.keys() {
+        if key != "role" && key != "content" {
+            return Err(format!(
+                "user message carries a field the contract does not allow: {key:?}"
+            ));
+        }
+    }
+    if fields.get("role").and_then(Value::as_str) != Some("user") {
+        return Err("message role is not `user`".into());
+    }
+    let Some(content) = fields.get("content").and_then(Value::as_array) else {
+        return Err("user message has no `content` array".into());
+    };
+    if content.is_empty() {
+        return Err("message has an empty `content` array".into());
+    }
+    let mut ids = Vec::new();
+    let mut seen_text = false;
+    for block in content {
+        let Some(block_fields) = block.as_object() else {
+            return Err(format!("content block is not an object: {block}"));
+        };
+        let allowed: &[&str] = match block_fields.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if !matches!(block_fields.get("text"), Some(Value::String(_))) {
+                    return Err("text block has no string `text`".into());
+                }
+                seen_text = true;
+                &["type", "text"]
+            }
+            Some("tool_result") => {
+                if seen_text {
+                    return Err("tool_result block comes after a text block".into());
+                }
+                let Some(Value::String(id)) = block_fields.get("tool_use_id") else {
+                    return Err("tool_result block has no string `tool_use_id`".into());
+                };
+                if !matches!(block_fields.get("content"), Some(Value::String(_))) {
+                    return Err(format!("tool_result block {id:?} has no string `content`"));
+                }
+                if block_fields
+                    .get("is_error")
+                    .is_some_and(|flag| !flag.is_boolean())
+                {
+                    return Err(format!(
+                        "tool_result block {id:?} has a non-boolean `is_error`"
+                    ));
+                }
+                ids.push(id.as_str());
+                &["type", "tool_use_id", "content", "is_error"]
+            }
+            Some(other) => return Err(format!("unknown user content block type {other:?}")),
+            None => return Err(format!("content block has no string `type`: {block}")),
+        };
+        for key in block_fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "user content block carries a field the contract does not allow: {key:?}"
+                ));
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// Check a whole assistant message and return its tool calls in order.
 pub(crate) fn check_assistant_message(message: &Value) -> Result<Vec<ToolUse>, String> {
     let Some(fields) = message.as_object() else {
@@ -300,6 +440,211 @@ mod tests {
             json!([]),
         ] {
             check_assistant_message(&bad).unwrap_err();
+        }
+    }
+
+    fn tr(id: &str, content: &str) -> Value {
+        json!({"type": "tool_result", "tool_use_id": id, "content": content, "is_error": false})
+    }
+    fn user(blocks: Vec<Value>) -> Value {
+        json!({"role": "user", "content": blocks})
+    }
+    fn txt(t: &str) -> Value {
+        json!({"type": "text", "text": t})
+    }
+    fn asst(blocks: Vec<Value>) -> Value {
+        json!({"role": "assistant", "content": blocks})
+    }
+    fn tool_use(id: &str, name: &str) -> Value {
+        json!({"type": "tool_use", "id": id, "name": name, "input": {}})
+    }
+
+    #[test]
+    fn restore_accepts_what_the_loop_stores_and_nothing_else() {
+        let exchange = || {
+            vec![
+                user(vec![txt("go")]),
+                asst(vec![txt("ok"), tool_use("c1", "a"), tool_use("c2", "b")]),
+                user(vec![tr("c1", "r1"), tr("c2", "r2")]),
+            ]
+        };
+        let with = |tail: Vec<Value>| {
+            let mut m = exchange();
+            m.extend(tail);
+            m
+        };
+        /// A case's name, its messages, and where and why it is refused.
+        type Case<'a> = (&'a str, Vec<Value>, Option<(usize, &'a str)>);
+        let table: Vec<Case> = vec![
+            ("empty", vec![], None),
+            ("one user text", vec![user(vec![txt("hi")])], None),
+            (
+                "user then assistant text",
+                vec![user(vec![txt("hi")]), asst(vec![txt("yo")])],
+                None,
+            ),
+            (
+                "a full tool exchange",
+                with(vec![asst(vec![txt("done")])]),
+                None,
+            ),
+            (
+                "text joined after results",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![tr("c1", "r1"), tr("c2", "r2"), txt("again")]);
+                    m
+                },
+                None,
+            ),
+            (
+                "an answered call to a tool nobody offers",
+                vec![
+                    user(vec![txt("go")]),
+                    asst(vec![tool_use("c1", "no-such-tool")]),
+                    user(vec![tr("c1", "x")]),
+                ],
+                None,
+            ),
+            (
+                "results without is_error",
+                vec![
+                    user(vec![txt("go")]),
+                    asst(vec![tool_use("c1", "a")]),
+                    user(vec![
+                        json!({"type": "tool_result", "tool_use_id": "c1", "content": "x"}),
+                    ]),
+                ],
+                None,
+            ),
+            // Rule 1.
+            (
+                "extra message field",
+                vec![json!({"role": "user", "content": [txt("hi")], "id": 1})],
+                Some((0, "does not allow")),
+            ),
+            (
+                "unknown role",
+                vec![json!({"role": "system", "content": [txt("hi")]})],
+                Some((0, "`user` or `assistant`")),
+            ),
+            (
+                "empty content",
+                vec![user(vec![])],
+                Some((0, "empty `content`")),
+            ),
+            (
+                "empty assistant content",
+                vec![user(vec![txt("a")]), asst(vec![])],
+                Some((1, "empty `content`")),
+            ),
+            // Rule 2.
+            (
+                "first message is the assistant's",
+                vec![asst(vec![txt("hi")])],
+                Some((0, "first message")),
+            ),
+            (
+                "two user messages in a row",
+                vec![user(vec![txt("a")]), user(vec![txt("b")])],
+                Some((1, "in a row")),
+            ),
+            // Rule 3.
+            (
+                "an off-contract assistant block",
+                vec![
+                    user(vec![txt("a")]),
+                    asst(vec![json!({"type": "thinking", "thinking": "x"})]),
+                ],
+                Some((1, "unknown assistant content block type")),
+            ),
+            // Rule 4.
+            (
+                "a user block of unknown type",
+                vec![user(vec![json!({"type": "image"})])],
+                Some((0, "unknown user content block type")),
+            ),
+            (
+                "a user block with an extra field",
+                vec![user(vec![json!({"type": "text", "text": "a", "x": 1})])],
+                Some((0, "does not allow")),
+            ),
+            (
+                "a tool_result with non-string content",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        json!({"type": "tool_result", "tool_use_id": "c1", "content": 5}),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((2, "no string `content`")),
+            ),
+            (
+                "text before a tool_result",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![txt("early"), tr("c1", "r1"), tr("c2", "r2")]);
+                    m
+                },
+                Some((2, "after a text block")),
+            ),
+            // Rule 5.
+            (
+                "a missing result",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![tr("c1", "r1")]);
+                    m
+                },
+                Some((2, "answers 1 tool calls")),
+            ),
+            (
+                "an extra result",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![tr("c1", "r1"), tr("c2", "r2"), tr("c3", "r3")]);
+                    m
+                },
+                Some((2, "answers 3 tool calls")),
+            ),
+            (
+                "results out of order",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![tr("c2", "r2"), tr("c1", "r1")]);
+                    m
+                },
+                Some((2, "answers \"c2\"")),
+            ),
+            (
+                "a result with nothing to answer",
+                vec![
+                    user(vec![txt("a")]),
+                    asst(vec![txt("b")]),
+                    user(vec![tr("c1", "r1")]),
+                ],
+                Some((2, "answers 1 tool calls")),
+            ),
+            // Rule 6.
+            (
+                "a trailing unanswered call",
+                vec![user(vec![txt("a")]), asst(vec![tool_use("c1", "a")])],
+                Some((2, "unanswered")),
+            ),
+        ];
+        for (name, messages, expect) in table {
+            let got = Transcript::from_messages(messages.clone());
+            match (expect, got) {
+                (None, Ok(t)) => assert_eq!(t.messages(), &messages[..], "{name}"),
+                (Some((index, why)), Err((at, error))) => {
+                    assert_eq!(at, index, "{name}: {error}");
+                    assert!(error.contains(why), "{name}: {error}");
+                }
+                (None, Err(e)) => panic!("{name}: refused: {e:?}"),
+                (Some(_), Ok(_)) => panic!("{name}: accepted"),
+            }
         }
     }
 }

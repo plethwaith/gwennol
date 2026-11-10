@@ -2,10 +2,11 @@
 //!
 //! Gwead threads an opaque [`ExecutionContext`] through every dispatch site
 //! and clones it into child invocations, never introspecting it: the
-//! embedder owns the schema. Gwennol uses it for one thing — naming the
-//! model's tool call an action serves — so that a `host_*` step reached
-//! through two `dispatch_role` hops can still tell the operator that the
-//! model asked `bash` to run something.
+//! embedder owns the schema. Gwennol writes one key, [`CONTEXT_KEY`], beside
+//! whatever entries the session's `SessionConfig::context` carries. Its key
+//! names the model's tool call an action serves, so that a `host_*` step
+//! reached through two `dispatch_role` hops can still tell the operator
+//! that the model asked `bash` to run something.
 //!
 //! Threading it this way rather than through a task-local is deliberate:
 //! the kernel may run step bodies on tasks the host never sees, and the
@@ -29,6 +30,17 @@ pub const CONTEXT_KEY: &str = "gwennol";
 /// `Kernel::execute(…).with_exec_ctx(…)`; every approval raised underneath
 /// then carries the call as [`ApprovalRequest::cause`](crate::ApprovalRequest).
 pub fn exec_context(call: &ToolCall) -> ExecutionContext {
+    exec_context_with(&Map::new(), call)
+}
+
+/// Build the execution context for an action run on behalf of `call`, for a
+/// session whose embedder supplied `base`: the context's top-level entries
+/// are `base`'s, plus [`CONTEXT_KEY`] naming the call.
+///
+/// `base` must not itself contain [`CONTEXT_KEY`]: that entry would replace
+/// the one naming the call. `Session` refuses such a map when it is built.
+/// With an empty `base` the result is [`exec_context`]'s.
+pub fn exec_context_with(base: &Map<String, Value>, call: &ToolCall) -> ExecutionContext {
     let mut tc = Map::new();
     if let Some(id) = &call.id {
         tc.insert("id".to_string(), Value::String(id.clone()));
@@ -38,7 +50,12 @@ pub fn exec_context(call: &ToolCall) -> ExecutionContext {
         "arguments".to_string(),
         Value::String(call.arguments.clone()),
     );
-    ExecutionContext::new(json!({CONTEXT_KEY: {"toolCall": Value::Object(tc)}}))
+    let mut entries = base.clone();
+    entries.insert(
+        CONTEXT_KEY.to_string(),
+        json!({"toolCall": Value::Object(tc)}),
+    );
+    ExecutionContext::new(Value::Object(entries))
 }
 
 /// Read back what [`exec_context`] wrote.
@@ -81,6 +98,19 @@ mod tests {
     fn round_trips_without_an_id() {
         let c = ToolCall { id: None, ..call() };
         assert_eq!(tool_call(&exec_context(&c)), Some(c));
+    }
+
+    #[test]
+    fn a_base_context_is_kept_beside_the_tool_call() {
+        let base = json!({"principal": "p1"}).as_object().unwrap().clone();
+        let ctx = exec_context_with(&base, &call());
+        assert_eq!(ctx.as_value()["principal"], "p1");
+        assert_eq!(tool_call(&ctx), Some(call()));
+
+        assert_eq!(
+            exec_context_with(&Map::new(), &call()).as_value(),
+            exec_context(&call()).as_value()
+        );
     }
 
     #[test]

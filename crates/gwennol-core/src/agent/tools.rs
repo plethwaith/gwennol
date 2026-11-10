@@ -1,6 +1,8 @@
 //! The tools a session offers the model: harvested once, their argument
 //! schemas compiled once, and the result shape they must answer with.
 
+use std::collections::BTreeSet;
+
 use boon::{Compiler, SchemaIndex, Schemas};
 use gwead::kernel::Kernel;
 use gwead::kernel::registry::ToolDescriptor;
@@ -24,13 +26,20 @@ pub(crate) struct ToolTable {
 }
 
 impl ToolTable {
-    /// Harvest the kernel's `TOOL` plugins through the one implementation
-    /// of the harvest rules, and compile each declared argument schema.
+    /// Harvest the kernel's `TOOL` plugins — all of them, or the plugins
+    /// `selection` names — through the one implementation of the harvest
+    /// rules, and compile each declared argument schema.
     /// A schema that does not compile refuses the session: a tool whose
     /// arguments cannot be checked would have to be dispatched
     /// unchecked, which the contract assigns to the caller not to do.
-    pub(crate) fn harvest(kernel: &Kernel) -> Result<Self, SessionError> {
-        let descriptors = spi::harvest_tools(kernel)?;
+    pub(crate) fn harvest(
+        kernel: &Kernel,
+        selection: Option<&BTreeSet<String>>,
+    ) -> Result<Self, SessionError> {
+        let descriptors = match selection {
+            Some(plugins) => spi::harvest_selected(kernel, plugins)?,
+            None => spi::harvest_tools(kernel)?,
+        };
         let mut compiler = Compiler::new();
         let mut schemas = Schemas::new();
         let mut tools = Vec::with_capacity(descriptors.len());

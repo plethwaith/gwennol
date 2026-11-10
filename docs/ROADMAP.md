@@ -419,7 +419,9 @@ approved.
 Not scheduled, but known, and listed so they are not mistaken for oversights:
 
 - Conversation persistence and resume, and context-window management — a
-  coding session outlives a single turn.
+  coding session outlives a single turn. The loop can restore a stored
+  transcript (`Session::restore`); a frontend that stores one, and
+  context-window management, are unscheduled.
 - Distribution: `cargo install gwennol` has to carry the bundled manifests
   and any guest modules inside the binary — `target/bundle/`, the output
   of `cargo xtask bundle`, is the input to that, and today only the

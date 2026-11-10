@@ -309,6 +309,14 @@ above admit nothing else. The grep is a property of the embedder holding
 that line, not of the engine: Gwead itself would happily harvest a
 `tool` block from a plugin that never claimed the role.
 
+A session can also offer a chosen subset: `SessionConfig::tool_plugins`
+names `TOOL` plugins (by plugin name, the unit a manifest grants authority
+to), and `spi::harvest_selected` harvests only those. The selection applies
+before the duplicate refusal above, so two plugins that advertise one tool
+name can share a kernel as long as no session selects both. A name that is
+not a registered `TOOL` fulfiller is refused
+(`HarvestError::NoSuchToolPlugin`).
+
 ## Evolving a contract
 
 The documents carry a `version` field the kernel does not parse — though

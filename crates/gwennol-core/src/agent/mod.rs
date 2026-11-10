@@ -2,11 +2,13 @@
 //! for, their results, and again — until the model stops asking.
 //!
 //! A [`Session`] holds one conversation against one `LLM_CHAT` provider
-//! and every `TOOL` plugin the kernel has. [`Session::turn`] runs one
+//! and the `TOOL` plugins it offers: every one the kernel has, or the
+//! ones [`SessionConfig::tool_plugins`] names. [`Session::turn`] runs one
 //! user turn to completion; [`Session::run`] drives turns from
 //! [`Operator::input`] until the operator ends the session. Everything
 //! the loop shows a frontend goes through [`Operator::emit`] as an
-//! [`Event`]; everything a plugin wants from outside the sandbox still
+//! [`Event`] — or, for a session built with [`Session::with_events`],
+//! through its [`EventSink`]; everything a plugin wants from outside the sandbox still
 //! goes through the two gates, with the tool call that caused it named
 //! in the approval (see [`crate::context`]).
 //!
@@ -100,19 +102,21 @@
 //!
 //! What the loop deliberately does not do: choose policy (every
 //! approval is the operator's), persist anything, or manage the
-//! context window — the roadmap's "Beyond the MVP".
+//! context window — the roadmap's "Beyond the MVP". A frontend that
+//! stores [`Session::transcript`] hands it back with
+//! [`Session::restore`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gwead::kernel::{Kernel, KernelError};
+use gwead::kernel::{ExecutionContext, Kernel, KernelError};
 use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
-use crate::context::exec_context;
-use crate::operator::{Event, Operator, ToolCall};
+use crate::context::{CONTEXT_KEY, exec_context_with};
+use crate::operator::{Event, EventSink, Operator, ToolCall};
 use crate::spi;
 use crate::spi::HarvestError;
 
@@ -333,6 +337,23 @@ pub enum SessionError {
     /// The tool inventory is unusable.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
+    /// [`SessionConfig::context`] carries the key the loop writes the tool
+    /// call under.
+    #[error(
+        "SessionConfig::context may not carry the key {:?}: it is where the loop names a tool call",
+        CONTEXT_KEY
+    )]
+    ReservedContextKey,
+    /// [`Session::restore`] was given a list the loop could not have
+    /// stored.
+    #[error("message {index} is not one the loop could have stored: {error}")]
+    Transcript {
+        /// The offending message's position; the list's length when the
+        /// list ends in an unanswered tool call.
+        index: usize,
+        /// The rule it breaks.
+        error: String,
+    },
     /// A tool's declared argument schema does not compile.
     #[error("tool {tool:?} declares a schema that does not compile: {error}")]
     ToolSchema {
@@ -394,6 +415,25 @@ pub struct SessionConfig {
     /// Most bytes one stream event may span. Events are unbounded by
     /// contract; this bounds what the loop will buffer for one.
     pub max_event_bytes: usize,
+    /// The embedder's own entries in the execution context of every
+    /// invocation the session makes, so that a secret resolver or a
+    /// native step can tell what the invocation is for.
+    ///
+    /// A tool call runs under these entries plus [`CONTEXT_KEY`] naming
+    /// the call; a provider round runs under these entries alone, or,
+    /// when the map is empty, under the empty context. A map carrying
+    /// [`CONTEXT_KEY`] refuses the session
+    /// ([`SessionError::ReservedContextKey`]).
+    pub context: Map<String, Value>,
+    /// The `TOOL` plugins the session offers, by plugin name. `None`
+    /// offers all the kernel's `TOOL` plugins.
+    ///
+    /// Selection applies before the duplicate tool-name refusal, so two
+    /// plugins that advertise one tool name can share a kernel as long as
+    /// no session selects both. A name that is not a `TOOL` fulfiller
+    /// refuses the session ([`SessionError::Harvest`]). `Some` of an empty
+    /// set offers no tools.
+    pub tool_plugins: Option<BTreeSet<String>>,
 }
 
 impl Default for SessionConfig {
@@ -407,6 +447,8 @@ impl Default for SessionConfig {
             max_rounds: 64,
             retry: RetryPolicy::default(),
             max_event_bytes: 16 << 20,
+            context: Map::new(),
+            tool_plugins: None,
         }
     }
 }
@@ -440,12 +482,21 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
 /// One conversation: a provider, the tools, and the transcript so far.
 pub struct Session {
     kernel: Arc<Kernel>,
-    operator: Arc<dyn Operator>,
+    frontend: Frontend,
     config: SessionConfig,
     provider: String,
     tools: ToolTable,
     transcript: Transcript,
     no_config: Value,
+}
+
+/// Where a session's events go, and whether it has an input source.
+enum Frontend {
+    /// The process's installed operator: events, and input for
+    /// [`Session::run`].
+    Operator(Arc<dyn Operator>),
+    /// The embedder's own sink: events only.
+    Events(Arc<dyn EventSink>),
 }
 
 impl std::fmt::Debug for Session {
@@ -482,17 +533,76 @@ impl Session {
             .ok_or(SessionError::NotBooted)?
             .operator
             .clone();
+        Self::build(kernel, config, Frontend::Operator(operator))
+    }
+
+    /// Start a session that sends its events to `events` instead of the
+    /// installed operator.
+    ///
+    /// Never reads the process-global host, so it works on a kernel
+    /// [`crate::boot`] did not build — one with the SPI contracts, the
+    /// provider and the tools registered — and never returns
+    /// [`SessionError::NotBooted`]; several such sessions can share a
+    /// kernel and keep their events apart. There is no input source:
+    /// [`Self::run`] returns at once, and the session is driven with
+    /// [`Self::turn`]. Refuses as [`Self::new`] does, except for
+    /// `NotBooted`.
+    pub fn with_events(
+        kernel: Arc<Kernel>,
+        config: SessionConfig,
+        events: Arc<dyn EventSink>,
+    ) -> Result<Self, SessionError> {
+        Self::build(kernel, config, Frontend::Events(events))
+    }
+
+    fn build(
+        kernel: Arc<Kernel>,
+        config: SessionConfig,
+        frontend: Frontend,
+    ) -> Result<Self, SessionError> {
+        if config.context.contains_key(CONTEXT_KEY) {
+            return Err(SessionError::ReservedContextKey);
+        }
         let provider = resolve_provider(&kernel, config.provider.as_deref())?;
-        let tools = ToolTable::harvest(&kernel)?;
+        let tools = ToolTable::harvest(&kernel, config.tool_plugins.as_ref())?;
         Ok(Self {
             kernel,
-            operator,
+            frontend,
             config,
             provider,
             tools,
             transcript: Transcript::default(),
             no_config: json!({}),
         })
+    }
+
+    /// Replace the conversation with `messages`, between turns.
+    ///
+    /// The whole list is checked first, against exactly the rules the loop
+    /// keeps while it runs — roles alternate starting with the user, every
+    /// call is answered in the next message in order, results come before
+    /// text, nothing is left unanswered — and on refusal the transcript is
+    /// untouched ([`SessionError::Transcript`] names the message). What
+    /// [`Self::transcript`] returned, from this session or another, is
+    /// accepted. The list may be empty, and may end in a user message
+    /// (the next turn's text joins it).
+    ///
+    /// Not checked: that `tool_use` ids are unique across the
+    /// conversation, and that a tool the list names is one this session
+    /// offers; the loop checks neither of what a provider sends. A call to
+    /// an unoffered tool is answered as an unavailable one.
+    pub fn restore(&mut self, messages: Vec<Value>) -> Result<(), SessionError> {
+        self.transcript = Transcript::from_messages(messages)
+            .map_err(|(index, error)| SessionError::Transcript { index, error })?;
+        Ok(())
+    }
+
+    /// Send one event to wherever this session's events go.
+    fn emit(&self, event: Event) {
+        match &self.frontend {
+            Frontend::Operator(operator) => operator.emit(event),
+            Frontend::Events(events) => events.emit(event),
+        }
     }
 
     /// The provider plugin this session talks to.
@@ -509,13 +619,20 @@ impl Session {
     /// Drive turns from [`Operator::input`] until it returns `None`,
     /// stopping at the first turn that does not complete. A frontend
     /// that wants to carry on past a failed turn drives [`Self::turn`]
-    /// itself.
+    /// itself. On a session built by [`Self::with_events`] there is no
+    /// input and this returns `Ok(())` without a turn.
     pub async fn run(&mut self, cancel: &CancellationToken) -> Result<(), TurnError> {
+        let Frontend::Operator(operator) = &self.frontend else {
+            // A session built by `with_events` has no input source: the
+            // same answer as an operator whose `input` returns `None`.
+            return Ok(());
+        };
+        let operator = operator.clone();
         loop {
             let turn = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(TurnError::Cancelled { detail: None }),
-                turn = self.operator.input() => turn,
+                turn = operator.input() => turn,
             };
             let Some(turn) = turn else {
                 return Ok(());
@@ -542,7 +659,7 @@ impl Session {
                 // Streamed text was shown as it arrived.
                 for block in round.message["content"].as_array().into_iter().flatten() {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        self.operator.emit(Event::Text(text.to_string()));
+                        self.emit(Event::Text(text.to_string()));
                     }
                 }
             }
@@ -610,7 +727,7 @@ impl Session {
         rounds: u32,
         usage: Usage,
     ) -> Result<TurnOutcome, TurnError> {
-        self.operator.emit(Event::TurnComplete);
+        self.emit(Event::TurnComplete);
         Ok(TurnOutcome {
             stop_reason,
             rounds,
@@ -665,7 +782,7 @@ impl Session {
                     if failure.retryable == Some(true) && attempt < max_attempts =>
                 {
                     tracing::warn!(attempt, max_attempts, failure = %failure, "provider failure marked retryable; retrying");
-                    self.operator.emit(Event::Retry {
+                    self.emit(Event::Retry {
                         attempt: attempt + 1,
                         max_attempts,
                         failure,
@@ -690,11 +807,16 @@ impl Session {
     /// One provider call, streamed or buffered per the config.
     async fn round(&self, cancel: &CancellationToken) -> Result<RoundResult, TurnError> {
         let input = self.chat_input();
-        let request = self
+        let mut request = self
             .kernel
             .execute(&self.provider, spi::llm_chat::CHAT, input)
             .with_config(self.config_for(&self.provider))
             .with_cancel(cancel.child_token());
+        if !self.config.context.is_empty() {
+            request = request.with_exec_ctx(ExecutionContext::new(Value::Object(
+                self.config.context.clone(),
+            )));
+        }
         // A provider step error is fatal — unless the turn's own token
         // fired, in which case the error is the cancellation arriving.
         let fatal = |e: KernelError| {
@@ -760,7 +882,7 @@ impl Session {
                         .get("text")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.operator.emit(Event::Text(text.to_string()));
+                    self.emit(Event::Text(text.to_string()));
                     builder.text(text);
                 }
                 Some("tool_use" | "opaque") => {
@@ -816,7 +938,7 @@ impl Session {
             name: call.name.clone(),
             arguments: call.input.to_string(),
         };
-        self.operator.emit(Event::ToolCall(tool_call.clone()));
+        self.emit(Event::ToolCall(tool_call.clone()));
 
         let answer: Result<tools::ToolOutput, String> = match self.tools.find(&call.name) {
             None => Err(format!("no tool named {:?} is available", call.name)),
@@ -834,7 +956,7 @@ impl Session {
                             call.input.clone(),
                         )
                         .with_config(self.config_for(&tool.descriptor.plugin_key))
-                        .with_exec_ctx(exec_context(&tool_call))
+                        .with_exec_ctx(exec_context_with(&self.config.context, &tool_call))
                         .with_cancel(cancel.child_token())
                         .run()
                         .await;
@@ -881,7 +1003,7 @@ impl Session {
         let (content, is_error) = match answer {
             Ok(output) => {
                 let content = spi::tool::render_content(&output.content, output.truncated);
-                self.operator.emit(Event::ToolResult {
+                self.emit(Event::ToolResult {
                     call: tool_call,
                     content: content.clone(),
                     is_error: output.is_error,
@@ -890,7 +1012,7 @@ impl Session {
             }
             Err(error) => {
                 tracing::warn!(tool = %call.name, id = %call.id, %error, "tool call could not be answered by the tool");
-                self.operator.emit(Event::ToolFailed {
+                self.emit(Event::ToolFailed {
                     call: tool_call,
                     error: error.clone(),
                 });
@@ -911,7 +1033,7 @@ impl Session {
     /// [`Event::ToolFailed`] per such call, with no [`Event::ToolCall`]
     /// before it since the loop never dispatched it.
     fn not_run(&self, call: &ToolUse, reason: &str) -> Value {
-        self.operator.emit(Event::ToolFailed {
+        self.emit(Event::ToolFailed {
             call: ToolCall {
                 id: Some(call.id.clone()),
                 name: call.name.clone(),
@@ -1122,6 +1244,19 @@ impl std::fmt::Debug for RoundResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session and the future of its turn can move to a spawned task:
+    /// nothing a seam added is `!Send`. A compile-time check; the
+    /// function is never called.
+    #[test]
+    fn a_session_and_its_turn_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        fn check(session: &mut Session, cancel: &CancellationToken) {
+            assert_send(session);
+            assert_send(&session.turn("x", cancel));
+        }
+        let _ = check;
+    }
 
     #[test]
     fn failures_and_stop_reasons_are_read_fail_closed() {

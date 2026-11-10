@@ -2,9 +2,10 @@
 //!
 //! Gwead native step implementations are bare `fn` pointers collected at
 //! link time, so they cannot capture an [`Operator`]. The operator and the
-//! workspace root are process-wide singletons anyway — one session, one
-//! frontend — so a `OnceLock` matches their real lifetime: set once by
-//! [`crate::boot`], read by every step invocation afterwards.
+//! workspace root are therefore per process, and a `OnceLock` matches their
+//! real lifetime: set once by [`crate::boot`], read by every step
+//! invocation afterwards. A session built with `Session::with_events`
+//! brings its own sink and does not read this state.
 //!
 //! Tests in one binary therefore share a single host. The integration tests
 //! install a recording operator once and inspect what it was asked.

@@ -5,6 +5,9 @@
 //! request — describes what it wants as an [`ApprovalRequest`] and asks the
 //! operator. Secrets are fetched the same way, so the host never holds a key
 //! it was not handed for a specific plugin.
+//!
+//! A frontend that only needs a session's events implements [`EventSink`]
+//! instead and starts its session with `Session::with_events`.
 
 use std::path::PathBuf;
 
@@ -159,6 +162,18 @@ pub enum Event {
     },
     /// The current turn is complete.
     TurnComplete,
+}
+
+/// Where a session's [`Event`]s go.
+///
+/// A session built with `Session::with_events` sends every event here and
+/// none to an [`Operator`]. `emit` is called synchronously from the task
+/// driving the session's turn, in the order the events occur, so it must
+/// not block: a sink that blocks stalls its own session, and one that
+/// panics unwinds the turn's task.
+pub trait EventSink: Send + Sync {
+    /// Take one event. Called from the task driving the session's turn.
+    fn emit(&self, event: Event);
 }
 
 /// One user turn handed to the loop.
