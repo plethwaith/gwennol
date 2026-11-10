@@ -191,6 +191,7 @@ async fn new_without_a_host_is_not_booted_before_any_other_refusal() {
     let config = SessionConfig {
         context: context(json!({"gwennol": {}})),
         tool_plugins: Some(names(&["nope"])),
+        provider: Some("nope".into()),
         ..config("alpha")
     };
     assert!(matches!(
@@ -266,7 +267,8 @@ async fn the_loops_own_context_key_is_refused() {
 #[tokio::test]
 async fn a_session_offers_the_tool_plugins_it_selected() {
     // Plugin names sort opposite to the tool names they carry, so an
-    // ordering by plugin name would show.
+    // ordering by plugin name would show. The sort itself is pinned by
+    // `a_selection_is_offered_sorted_by_tool_name`.
     let (kernel, _) = kernel(vec![
         tool("tool_x", "gamma"),
         tool("tool_z", "alpha"),
@@ -306,6 +308,37 @@ async fn a_session_offers_the_tool_plugins_it_selected() {
             other => panic!("{missing}: {other:?}"),
         }
     }
+}
+
+/// The kernel hands the harvest its tool descriptors in an order that varies
+/// from process to process, so one pair of tools sorts correctly by chance in
+/// about half the runs. Eight tools sort correctly by chance in one run in
+/// 40320; the plugin names run opposite to the tool names.
+#[tokio::test]
+async fn a_selection_is_offered_sorted_by_tool_name() {
+    let plugins: Vec<(String, String)> = (0..8)
+        .map(|i| (format!("plugin_{}", 7 - i), format!("tool_{i}")))
+        .collect();
+    let (kernel, _) = kernel(plugins.iter().map(|(p, t)| tool(p, t)).collect());
+    let selection: BTreeSet<String> = plugins.iter().map(|(p, _)| p.clone()).collect();
+    let session = Session::with_events(
+        kernel,
+        SessionConfig {
+            tool_plugins: Some(selection),
+            ..config("tool_0")
+        },
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    let input = session.chat_input();
+    let offered: Vec<&str> = input["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = (0..8).map(|i| format!("tool_{i}")).collect();
+    assert_eq!(offered, expected);
 }
 
 #[tokio::test]

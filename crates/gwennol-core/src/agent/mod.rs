@@ -348,7 +348,7 @@ pub enum SessionError {
     ReservedContextKey,
     /// [`Session::restore`] was given a list that breaks one of the rules
     /// it checks.
-    #[error("message {index} breaks a rule restore checks: {error}")]
+    #[error("restore refused the list at position {index}: {error}")]
     Transcript {
         /// The offending message's position; the list's length when the
         /// list ends in an unanswered tool call.
@@ -586,8 +586,10 @@ impl Session {
     /// The whole list is checked first, against the rules the loop
     /// keeps while it runs — roles alternate starting with the user, every
     /// call is answered in the next message in order, results come before
-    /// text, nothing is left unanswered — and on refusal the transcript is
-    /// untouched ([`SessionError::Transcript`] names the message). What
+    /// text, nothing is left unanswered, and no message or block carries a
+    /// field the contract does not allow or a block type it does not define
+    /// — and on refusal the transcript is untouched
+    /// ([`SessionError::Transcript`] gives the position). What
     /// [`Self::transcript`] returned, from this session or another, is
     /// accepted. The list may be empty, and may end in a user message
     /// (the next turn's text joins it).

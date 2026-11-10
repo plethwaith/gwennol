@@ -37,8 +37,8 @@ pub fn exec_context(call: &ToolCall) -> ExecutionContext {
 /// session whose embedder supplied `base`: the context's top-level entries
 /// are `base`'s, plus [`CONTEXT_KEY`] naming the call.
 ///
-/// `base` must not itself contain [`CONTEXT_KEY`]: that entry would replace
-/// the one naming the call. `Session` refuses such a map when it is built.
+/// `base` must not itself contain [`CONTEXT_KEY`]: the entry naming the call
+/// would replace it. `Session` refuses such a map when it is built.
 /// With an empty `base` the result is [`exec_context`]'s.
 pub fn exec_context_with(base: &Map<String, Value>, call: &ToolCall) -> ExecutionContext {
     let mut tc = Map::new();
