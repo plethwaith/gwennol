@@ -30,14 +30,15 @@ impl Transcript {
         &self.messages
     }
 
-    /// A transcript holding `messages`, if they are exactly what the
-    /// loop could have stored: whatever [`Self::messages`] returned
+    /// A transcript holding `messages`, if they keep the rules
+    /// `Session::restore` documents: whatever [`Self::messages`] returned
     /// passes. On refusal, the offending message's position (the list's
     /// length for a trailing unanswered call) and the rule it breaks.
     ///
     /// Not checked, because the loop checks neither of what a provider
     /// sends: that `tool_use` ids are unique across the conversation, and
-    /// that a tool name is one the session offers.
+    /// that a tool name is one the session offers. Nor that a `tool_result`
+    /// carries `is_error`, which the loop always writes.
     pub(crate) fn from_messages(messages: Vec<Value>) -> Result<Self, (usize, String)> {
         // The calls the previous assistant message made, awaiting answers.
         let mut owed: Vec<ToolUse> = Vec::new();
@@ -238,7 +239,7 @@ pub(crate) fn check_block(block: &Value) -> Result<Option<ToolUse>, String> {
 /// `tool_result` blocks, in order.
 ///
 /// Fail-closed like [`check_block`]: only the two block types the loop
-/// stores, with exactly the fields it stores, and results before text.
+/// stores, with no field it does not store, and results before text.
 pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
     let Some(fields) = message.as_object() else {
         return Err(format!("user message is not an object: {message}"));
@@ -460,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_accepts_what_the_loop_stores_and_nothing_else() {
+    fn restore_accepts_what_the_loop_stores_and_refuses_what_breaks_a_rule() {
         let exchange = || {
             vec![
                 user(vec![txt("go")]),
@@ -507,6 +508,17 @@ mod tests {
                 None,
             ),
             (
+                "ids repeat across exchanges",
+                vec![
+                    user(vec![txt("a")]),
+                    asst(vec![tool_use("c1", "a")]),
+                    user(vec![tr("c1", "x")]),
+                    asst(vec![tool_use("c1", "a")]),
+                    user(vec![tr("c1", "y")]),
+                ],
+                None,
+            ),
+            (
                 "results without is_error",
                 vec![
                     user(vec![txt("go")]),
@@ -517,7 +529,6 @@ mod tests {
                 ],
                 None,
             ),
-            // Rule 1.
             (
                 "extra message field",
                 vec![json!({"role": "user", "content": [txt("hi")], "id": 1})],
@@ -538,7 +549,6 @@ mod tests {
                 vec![user(vec![txt("a")]), asst(vec![])],
                 Some((1, "empty `content`")),
             ),
-            // Rule 2.
             (
                 "first message is the assistant's",
                 vec![asst(vec![txt("hi")])],
@@ -549,7 +559,6 @@ mod tests {
                 vec![user(vec![txt("a")]), user(vec![txt("b")])],
                 Some((1, "in a row")),
             ),
-            // Rule 3.
             (
                 "an off-contract assistant block",
                 vec![
@@ -558,11 +567,49 @@ mod tests {
                 ],
                 Some((1, "unknown assistant content block type")),
             ),
-            // Rule 4.
             (
                 "a user block of unknown type",
                 vec![user(vec![json!({"type": "image"})])],
                 Some((0, "unknown user content block type")),
+            ),
+            (
+                "a text block with non-string text",
+                vec![user(vec![json!({"type": "text", "text": 5})])],
+                Some((0, "no string `text`")),
+            ),
+            (
+                "a user block with no type",
+                vec![user(vec![json!({"text": "a"})])],
+                Some((0, "no string `type`")),
+            ),
+            (
+                "a user message with no content array",
+                vec![json!({"role": "user"})],
+                Some((0, "no `content` array")),
+            ),
+            (
+                "a tool_result with a non-string tool_use_id",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        json!({"type": "tool_result", "tool_use_id": 7, "content": "x"}),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((2, "no string `tool_use_id`")),
+            ),
+            (
+                "a tool_result with a non-boolean is_error",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        json!({"type": "tool_result", "tool_use_id": "c1", "content": "x", "is_error": "no"}),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((2, "non-boolean `is_error`")),
             ),
             (
                 "a user block with an extra field",
@@ -590,7 +637,6 @@ mod tests {
                 },
                 Some((2, "after a text block")),
             ),
-            // Rule 5.
             (
                 "a missing result",
                 {
@@ -627,7 +673,6 @@ mod tests {
                 ],
                 Some((2, "answers 1 tool calls")),
             ),
-            // Rule 6.
             (
                 "a trailing unanswered call",
                 vec![user(vec![txt("a")]), asst(vec![tool_use("c1", "a")])],

@@ -26,8 +26,8 @@ pub const CONTEXT_KEY: &str = "gwennol";
 
 /// Build the execution context for an action run on behalf of `call`.
 ///
-/// The agent loop passes the result to
-/// `Kernel::execute(…).with_exec_ctx(…)`; every approval raised underneath
+/// This is [`exec_context_with`] with an empty base; the agent loop passes
+/// that function's result to `Kernel::execute(…).with_exec_ctx(…)`; every approval raised underneath
 /// then carries the call as [`ApprovalRequest::cause`](crate::ApprovalRequest).
 pub fn exec_context(call: &ToolCall) -> ExecutionContext {
     exec_context_with(&Map::new(), call)
@@ -58,7 +58,7 @@ pub fn exec_context_with(base: &Map<String, Value>, call: &ToolCall) -> Executio
     ExecutionContext::new(Value::Object(entries))
 }
 
-/// Read back what [`exec_context`] wrote.
+/// Read back what [`exec_context`] or [`exec_context_with`] wrote.
 ///
 /// `None` for a context Gwennol did not write — an empty one, or an
 /// embedder's own blob. A malformed entry reads as `None` rather than

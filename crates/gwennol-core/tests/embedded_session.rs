@@ -2,7 +2,7 @@
 //! host is installed: the embedder's path through the loop.
 //!
 //! This binary never calls `boot` or `boot_with`. Its kernels carry only
-//! kernel intrinsics (`return`), a buffered provider, and fixture tools,
+//! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools,
 //! each declaring a secret so the kernel consults the resolver on every
 //! invocation (`gwead::kernel::secrets`: a non-empty declaration is what
 //! makes the kernel call it). The recording resolver is how a test
@@ -186,6 +186,20 @@ async fn a_sink_session_runs_without_an_installed_host() {
 }
 
 #[tokio::test]
+async fn new_without_a_host_is_not_booted_before_any_other_refusal() {
+    let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
+    let config = SessionConfig {
+        context: context(json!({"gwennol": {}})),
+        tool_plugins: Some(names(&["nope"])),
+        ..config("alpha")
+    };
+    assert!(matches!(
+        Session::new(kernel, config),
+        Err(SessionError::NotBooted)
+    ));
+}
+
+#[tokio::test]
 async fn run_on_a_sink_session_returns_without_a_turn() {
     let (kernel, seen) = kernel(vec![tool("tool_a", "alpha")]);
     let mut s =
@@ -223,13 +237,14 @@ async fn an_empty_context_leaves_the_provider_round_without_one() {
     let mut s =
         Session::with_events(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
-    assert!(
-        seen.lock()
-            .unwrap()
-            .iter()
-            .filter(|(subject, _)| subject == PROVIDER)
-            .all(|(_, ctx)| ctx.is_null())
-    );
+    let provider_contexts: Vec<Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(subject, _)| subject == PROVIDER)
+        .map(|(_, ctx)| ctx.clone())
+        .collect();
+    assert_eq!(provider_contexts, vec![Value::Null; 2]);
     let tool_ctx = one(&seen, "tool_a");
     assert_eq!(tool_ctx["gwennol"]["toolCall"]["name"], "alpha");
     assert_eq!(tool_ctx.as_object().unwrap().len(), 1);
@@ -250,10 +265,12 @@ async fn the_loops_own_context_key_is_refused() {
 
 #[tokio::test]
 async fn a_session_offers_the_tool_plugins_it_selected() {
+    // Plugin names sort opposite to the tool names they carry, so an
+    // ordering by plugin name would show.
     let (kernel, _) = kernel(vec![
-        tool("tool_c", "gamma"),
-        tool("tool_a", "alpha"),
-        tool("tool_b", "beta"),
+        tool("tool_x", "gamma"),
+        tool("tool_z", "alpha"),
+        tool("tool_y", "beta"),
         decoy(),
     ]);
     let session = |selection: Option<BTreeSet<String>>| {
@@ -275,7 +292,7 @@ async fn a_session_offers_the_tool_plugins_it_selected() {
             .collect()
     };
     assert_eq!(
-        offered(&session(Some(names(&["tool_b", "tool_a"]))).unwrap()),
+        offered(&session(Some(names(&["tool_y", "tool_z"]))).unwrap()),
         ["alpha", "beta"]
     );
     assert_eq!(offered(&session(None).unwrap()), ["alpha", "beta", "gamma"]);

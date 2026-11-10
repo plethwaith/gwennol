@@ -5,12 +5,13 @@
 //! and the `TOOL` plugins it offers: every one the kernel has, or the
 //! ones [`SessionConfig::tool_plugins`] names. [`Session::turn`] runs one
 //! user turn to completion; [`Session::run`] drives turns from
-//! [`Operator::input`] until the operator ends the session. Everything
-//! the loop shows a frontend goes through [`Operator::emit`] as an
-//! [`Event`] — or, for a session built with [`Session::with_events`],
-//! through its [`EventSink`]; everything a plugin wants from outside the sandbox still
-//! goes through the two gates, with the tool call that caused it named
-//! in the approval (see [`crate::context`]).
+//! [`Operator::input`] until the operator ends the session (a session built
+//! with [`Session::with_events`] has no input, and `run` returns at once).
+//! Everything the loop shows a frontend goes through [`Operator::emit`] as
+//! an [`Event`] — or, for a session built with [`Session::with_events`],
+//! through its [`EventSink`]; everything a plugin wants from outside the
+//! sandbox still goes through the two gates, with the tool call that caused
+//! it named in the approval (see [`crate::context`]).
 //!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
@@ -315,7 +316,8 @@ pub enum TurnError {
     RoundLimit(u32),
 }
 
-/// Why a [`Session`] could not be started.
+/// Why a [`Session`] could not be started, or why [`Session::restore`]
+/// refused a transcript.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// [`crate::boot`] has not run in this process.
@@ -344,9 +346,9 @@ pub enum SessionError {
         CONTEXT_KEY
     )]
     ReservedContextKey,
-    /// [`Session::restore`] was given a list the loop could not have
-    /// stored.
-    #[error("message {index} is not one the loop could have stored: {error}")]
+    /// [`Session::restore`] was given a list that breaks one of the rules
+    /// it checks.
+    #[error("message {index} breaks a rule restore checks: {error}")]
     Transcript {
         /// The offending message's position; the list's length when the
         /// list ends in an unanswered tool call.
@@ -430,9 +432,11 @@ pub struct SessionConfig {
     ///
     /// Selection applies before the duplicate tool-name refusal, so two
     /// plugins that advertise one tool name can share a kernel as long as
-    /// no session selects both. A name that is not a `TOOL` fulfiller
-    /// refuses the session ([`SessionError::Harvest`]). `Some` of an empty
-    /// set offers no tools.
+    /// every session on it selects at most one of them (a session whose
+    /// `tool_plugins` is `None` offers both, and is refused). A name that
+    /// is not a `TOOL` fulfiller with a `call` tool descriptor refuses the
+    /// session ([`SessionError::Harvest`]). `Some` of an empty set offers
+    /// no tools.
     pub tool_plugins: Option<BTreeSet<String>>,
 }
 
@@ -539,11 +543,12 @@ impl Session {
     /// Start a session that sends its events to `events` instead of the
     /// installed operator.
     ///
-    /// Never reads the process-global host, so it works on a kernel
-    /// [`crate::boot`] did not build — one with the SPI contracts, the
-    /// provider and the tools registered — and never returns
-    /// [`SessionError::NotBooted`]; several such sessions can share a
-    /// kernel and keep their events apart. There is no input source:
+    /// Does not read the process-global host itself, so it never returns
+    /// [`SessionError::NotBooted`], and works on a kernel [`crate::boot`]
+    /// did not build as long as no tool it offers reaches a `host_*` step:
+    /// those steps read the installed host through [`crate::host::host`],
+    /// which panics when none is installed. Several such sessions can
+    /// share a kernel and keep their events apart. There is no input source:
     /// [`Self::run`] returns at once, and the session is driven with
     /// [`Self::turn`]. Refuses as [`Self::new`] does, except for
     /// `NotBooted`.
@@ -578,7 +583,7 @@ impl Session {
 
     /// Replace the conversation with `messages`, between turns.
     ///
-    /// The whole list is checked first, against exactly the rules the loop
+    /// The whole list is checked first, against the rules the loop
     /// keeps while it runs — roles alternate starting with the user, every
     /// call is answered in the next message in order, results come before
     /// text, nothing is left unanswered — and on refusal the transcript is
@@ -588,9 +593,11 @@ impl Session {
     /// (the next turn's text joins it).
     ///
     /// Not checked: that `tool_use` ids are unique across the
-    /// conversation, and that a tool the list names is one this session
-    /// offers; the loop checks neither of what a provider sends. A call to
-    /// an unoffered tool is answered as an unavailable one.
+    /// conversation and that a tool the list names is one this session
+    /// offers (the loop checks neither of what a provider sends), and that
+    /// a `tool_result` carries `is_error`, which the loop always writes. If
+    /// the model calls an unoffered tool again, the loop answers that no
+    /// tool by that name is available.
     pub fn restore(&mut self, messages: Vec<Value>) -> Result<(), SessionError> {
         self.transcript = Transcript::from_messages(messages)
             .map_err(|(index, error)| SessionError::Transcript { index, error })?;
@@ -623,8 +630,7 @@ impl Session {
     /// input and this returns `Ok(())` without a turn.
     pub async fn run(&mut self, cancel: &CancellationToken) -> Result<(), TurnError> {
         let Frontend::Operator(operator) = &self.frontend else {
-            // A session built by `with_events` has no input source: the
-            // same answer as an operator whose `input` returns `None`.
+            // A session built by `with_events` has no input source.
             return Ok(());
         };
         let operator = operator.clone();

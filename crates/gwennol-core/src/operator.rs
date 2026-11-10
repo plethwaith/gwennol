@@ -75,7 +75,7 @@ pub struct ToolCall {
 /// wants to run …" and remember decisions per plugin.
 ///
 /// `cause` is the model's tool call that set this in motion, when the
-/// frontend ran the action through [`crate::context::exec_context`]; with it
+/// frontend ran the action through [`crate::context::exec_context_with`] or [`crate::context::exec_context`]; with it
 /// a prompt can say *the model asked `bash` to run `rm -rf build`* rather
 /// than merely *plugin `bash` wants to spawn a process*. It is `None` for an
 /// action the frontend started itself, which is the honest answer: nothing

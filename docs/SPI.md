@@ -313,9 +313,10 @@ A session can also offer a chosen subset: `SessionConfig::tool_plugins`
 names `TOOL` plugins (by plugin name, the unit a manifest grants authority
 to), and `spi::harvest_selected` harvests only those. The selection applies
 before the duplicate refusal above, so two plugins that advertise one tool
-name can share a kernel as long as no session selects both. A name that is
-not a registered `TOOL` fulfiller is refused
-(`HarvestError::NoSuchToolPlugin`).
+name can share a kernel as long as every session on it selects at most one
+of them (a session whose `tool_plugins` is `None` offers both, and is
+refused). A name that is not a registered `TOOL` fulfiller with a `call`
+tool descriptor is refused (`HarvestError::NoSuchToolPlugin`).
 
 ## Evolving a contract
 

@@ -85,7 +85,8 @@ pub fn register(kernel: &mut gwead::kernel::Kernel) -> Result<(), gwead::kernel:
     Ok(())
 }
 
-/// Why [`harvest_tools`] refused the kernel's tool inventory.
+/// Why [`harvest_tools`] or [`harvest_selected`] refused the kernel's tool
+/// inventory.
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
     /// Two plugins advertise the same `tool.name`, so "the descriptor
@@ -95,7 +96,7 @@ pub enum HarvestError {
     DuplicateToolName(String),
     /// A selection named a plugin that is not a `TOOL` fulfiller with a
     /// [`tool::CALL`] tool descriptor.
-    #[error("no TOOL plugin named {0:?} is registered")]
+    #[error("no TOOL plugin named {0:?} offers a `call` tool")]
     NoSuchToolPlugin(String),
 }
 
@@ -112,7 +113,8 @@ pub enum HarvestError {
 /// - when the caller selects plugins ([`harvest_selected`]), only those
 ///   plugins' descriptors survive, and the selection applies before the
 ///   duplicate refusal: two plugins that advertise one tool name can sit
-///   on one kernel as long as no selection holds both;
+///   on one kernel, and a selection holding at most one of them
+///   harvests; [`harvest_tools`] on that kernel is refused;
 /// - duplicate tool names are refused, not resolved;
 /// - the result is sorted by name, because tool order is model-visible
 ///   and prefix-sensitive: an unspecified order changes the prompt every

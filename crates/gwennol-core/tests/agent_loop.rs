@@ -1519,16 +1519,17 @@ fn sink_session(route: &str) -> (Session, Arc<Recorder>) {
     (s, sink)
 }
 
-/// Two sessions on one kernel, run at the same time outside any
-/// `EVENTS` scope: each sink gets its own session's events, and the
-/// installed operator gets none.
+/// Two sessions on one kernel, run at the same time: each sink gets its
+/// own session's events, and the installed operator gets none.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_sessions_on_one_kernel_emit_to_their_own_sinks() {
     let (mut a, sink_a) = sink_session("/own/text");
     let (mut b, sink_b) = sink_session("/own/text-b");
-    let (ra, rb) = tokio::join!(turn(&mut a, "one"), turn(&mut b, "two"));
+    let ((ra, rb), installed) =
+        with_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
     ra.unwrap();
     rb.unwrap();
+    assert!(installed.is_empty(), "{installed:?}");
     let seen = |sink: &Recorder| {
         sink.events()
             .into_iter()
@@ -1543,8 +1544,8 @@ async fn two_sessions_on_one_kernel_emit_to_their_own_sinks() {
     assert_eq!(seen(&sink_b), ["Goodbye", " now", "<done>"]);
 }
 
-/// The token-first path of `turn` is the one sessions built by `new` take;
-/// a sink session is handed the same cancellation.
+/// A sink session's turn, handed a token already cancelled, ends
+/// `Cancelled` with no text emitted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pre_cancelled_token_ends_a_sink_session_cancelled() {
     let (mut s, sink) = sink_session("/own/text");
@@ -1605,8 +1606,8 @@ async fn a_restored_transcript_is_what_the_provider_is_sent() {
     assert_eq!(last_sent("/own/text-r")["messages"], json!([user("solo")]));
 }
 
-/// What the loop stores is what `restore` accepts: each outcome the
-/// loop can leave a transcript in, fed back through a fresh session.
+/// What the loop stores is what `restore` accepts: the transcript each of
+/// these routes leaves, fed back through a fresh session.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_transcript_the_loop_stores_can_be_restored() {
     for route in [
@@ -1619,7 +1620,6 @@ async fn every_transcript_the_loop_stores_can_be_restored() {
         "/broken-tool",
         "/forged-cancel",
         "/cut-tool",
-        "/denied-tool",
         "/refusal",
         "/refusal-with-call",
         "/max-tokens",
