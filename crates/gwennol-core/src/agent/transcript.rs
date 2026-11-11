@@ -30,9 +30,10 @@ impl Transcript {
         &self.messages
     }
 
-    /// A transcript holding `messages`, if the checks here, in
-    /// [`check_user_message`] and in [`check_assistant_message`] pass:
-    /// whatever [`Self::messages`] returned passes. On refusal, the offending message's position (the list's
+    /// A transcript holding `messages`, if they pass the checks here (roles
+    /// alternate, each call is answered) and those of [`check_user_message`]
+    /// and [`check_assistant_message`]. Whatever [`Self::messages`] returned
+    /// passes. On refusal, the offending message's position (the list's
     /// length for a trailing unanswered call) and the rule it breaks.
     ///
     /// Not checked, because the loop checks neither of what a provider

@@ -2,9 +2,9 @@
 //! host is installed: the embedder's path through the loop.
 //!
 //! This binary never calls `boot` or `boot_with`. Its kernels carry
-//! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools,
-//! each declaring a secret so the kernel consults the resolver on every
-//! invocation (`gwead::kernel::secrets`: a non-empty declaration is what
+//! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools;
+//! the provider and each tool declare a secret so the kernel consults the
+//! resolver on every invocation (`gwead::kernel::secrets`: a non-empty declaration is what
 //! makes the kernel call it). The recording resolver is how a test
 //! observes the execution context each invocation ran under.
 
@@ -267,7 +267,7 @@ async fn the_loops_own_context_key_is_refused() {
 #[tokio::test]
 async fn a_session_offers_the_tool_plugins_it_selected() {
     // Plugin names sort opposite to the tool names they carry, so an
-    // ordering by plugin name would show. The sort itself is pinned by
+    // ordering by plugin name would show. The sort of a selection is pinned by
     // `a_selection_is_offered_sorted_by_tool_name`.
     let (kernel, _) = kernel(vec![
         tool("tool_x", "gamma"),
@@ -312,8 +312,8 @@ async fn a_session_offers_the_tool_plugins_it_selected() {
 
 /// The kernel hands the harvest its tool descriptors in an order that varies
 /// from process to process, so one pair of tools sorts correctly by chance in
-/// about half the runs. Eight tools sort correctly by chance in one run in
-/// 40320; the plugin names run opposite to the tool names.
+/// about half the runs. Eight tools sort correctly by chance in about one run
+/// in 40320 (8!); the plugin names run opposite to the tool names.
 #[tokio::test]
 async fn a_selection_is_offered_sorted_by_tool_name() {
     let plugins: Vec<(String, String)> = (0..8)

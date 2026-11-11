@@ -169,8 +169,9 @@ pub enum Event {
 /// A session built with `Session::with_events` sends every event here and
 /// none to an [`Operator`]. `emit` is called synchronously from the task
 /// driving the session's turn, in the order the events occur, so it must
-/// not block: a sink that blocks stalls its own session, and one that
-/// panics unwinds the turn's task.
+/// not block: a sink that blocks stalls the task driving the turn (a future
+/// joined with it included) and the thread running it, and one that panics
+/// unwinds the turn's task.
 pub trait EventSink: Send + Sync {
     /// Take one event. Called from the task driving the session's turn.
     fn emit(&self, event: Event);
