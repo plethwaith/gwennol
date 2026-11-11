@@ -25,12 +25,16 @@ pub mod llm_chat {
     pub const DEFINITION: &str = include_str!("../resources/spi/llm_chat.json");
 }
 
-/// The `TOOL` role: a tool the model can call.
+/// The `TOOL` role: a plugin offering tools the model can call.
 pub mod tool {
     /// The role name, as used in `roles` and `invoke:role:` permissions.
     pub const ROLE: &str = "TOOL";
-    /// The one required action: model-supplied arguments in, one uniform
-    /// `{content, is_error}` result out.
+    /// The one action the contract names, and it is optional: model-supplied
+    /// arguments in, one uniform `{content, is_error, truncated}` result
+    /// out. It is the name a plugin offering one tool conventionally gives
+    /// its action. A tool is any action of a `TOOL` plugin that carries a
+    /// `tool` block, whatever it is named (see
+    /// [`super::harvest_tools`]).
     pub const CALL: &str = "call";
     /// The contract document, as shipped. Canonical file:
     /// `plugins/spi/tool.json`; see [`super::llm_chat::DEFINITION`].
@@ -42,7 +46,7 @@ pub mod tool {
     /// compose this themselves; [`render_content`] is where it lands.
     pub const TRUNCATED_MARKER: &str = "[output truncated]";
 
-    /// A `call` result's `content` as the model should see it: verbatim,
+    /// A tool result's `content` as the model should see it: verbatim,
     /// plus [`TRUNCATED_MARKER`] on its own final line when the tool
     /// reported a cut. The one implementation of the convention — the
     /// agent loop renders through here, and so do the tests that
@@ -89,14 +93,14 @@ pub fn register(kernel: &mut gwead::kernel::Kernel) -> Result<(), gwead::kernel:
 /// inventory.
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
-    /// Two plugins advertise the same `tool.name`, so "the descriptor
-    /// with that name" is ambiguous — and real provider APIs reject
-    /// duplicate tools anyway.
-    #[error("duplicate tool name {0:?}: two TOOL plugins advertise it")]
+    /// Two offered tools carry the same `tool.name`, on two plugins or on
+    /// two actions of one, so "the descriptor with that name" is ambiguous
+    /// — and real provider APIs reject duplicate tools anyway.
+    #[error("duplicate tool name {0:?}: more than one offered tool carries it")]
     DuplicateToolName(String),
-    /// A selection named a plugin that is not a `TOOL` fulfiller with a
-    /// [`tool::CALL`] tool descriptor.
-    #[error("no TOOL plugin named {0:?} offers a `call` tool")]
+    /// A selection named a plugin that offers no tool: not a `TOOL`
+    /// fulfiller, or one none of whose actions carries a `tool` block.
+    #[error("no TOOL plugin named {0:?} offers a tool")]
     NoSuchToolPlugin(String),
 }
 
@@ -107,15 +111,16 @@ pub enum HarvestError {
 /// action of *any* plugin, in unspecified order, so the raw list is not
 /// what the model gets:
 ///
-/// - only descriptors whose plugin fulfils the [`tool::ROLE`] role via
-///   its [`tool::CALL`] action survive — anything else never faced the
-///   contract check;
+/// - only descriptors of a plugin that fulfils the [`tool::ROLE`] role
+///   survive, one for each of its actions that carries a `tool` block; a
+///   `tool` block on a plugin outside the role is never offered;
 /// - when the caller selects plugins ([`harvest_selected`]), only those
 ///   plugins' descriptors survive, and the selection applies before the
 ///   duplicate refusal: two plugins that advertise one tool name can sit
 ///   on one kernel, and a selection holding at most one of them
 ///   harvests; [`harvest_tools`] on that kernel is refused;
-/// - duplicate tool names are refused, not resolved;
+/// - duplicate tool names are refused, not resolved, whether the two
+///   tools are on two plugins or on one;
 /// - the result is sorted by name, because tool order is model-visible
 ///   and prefix-sensitive: an unspecified order changes the prompt every
 ///   process start and busts provider-side prompt caching.
@@ -141,10 +146,11 @@ pub fn harvest_tools(
 /// [`harvest_tools`] restricted to the named plugins.
 ///
 /// Selection is by plugin name, the unit a manifest grants authority to,
-/// and applies before the duplicate-name refusal. A name that is not a
-/// `TOOL` fulfiller with a `call` tool descriptor is refused as
-/// [`HarvestError::NoSuchToolPlugin`], the first such name in the set's
-/// order. An empty selection harvests nothing.
+/// and applies before the duplicate-name refusal. A selected plugin brings
+/// every tool it offers. A name that offers no tool (not a `TOOL`
+/// fulfiller, or one none of whose actions carries a `tool` block) is
+/// refused as [`HarvestError::NoSuchToolPlugin`], the first such name in
+/// the set's order. An empty selection harvests nothing.
 pub fn harvest_selected(
     kernel: &gwead::kernel::Kernel,
     plugins: &BTreeSet<String>,
@@ -161,7 +167,7 @@ fn harvest(
         .registry()
         .get_tool_descriptors()
         .into_iter()
-        .filter(|d| fulfillers.contains(&d.plugin_key) && d.action_name == tool::CALL)
+        .filter(|d| fulfillers.contains(&d.plugin_key))
         .collect();
     if let Some(selection) = selection {
         if let Some(missing) = selection
@@ -185,6 +191,37 @@ fn harvest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_result_shape_is_one_definition_and_call_is_optional() {
+        let contract: serde_json::Value = serde_json::from_str(tool::DEFINITION).unwrap();
+        let actions = contract["actions"].as_object().unwrap();
+        assert_eq!(actions.keys().collect::<Vec<_>>(), ["call"]);
+        assert_eq!(contract["actions"]["call"]["optional"], true);
+        assert_eq!(
+            contract["actions"]["call"]["output"],
+            serde_json::json!({"$ref": "#/$defs/Result"})
+        );
+        let result = &contract["$defs"]["Result"];
+        assert_eq!(result["required"], serde_json::json!(["content"]));
+        assert_eq!(result["additionalProperties"], false);
+        let mut properties: Vec<&String> =
+            result["properties"].as_object().unwrap().keys().collect();
+        properties.sort();
+        assert_eq!(properties, ["content", "is_error", "truncated"]);
+    }
+
+    #[test]
+    fn harvest_refusals_read_as_written() {
+        assert_eq!(
+            HarvestError::DuplicateToolName("x".into()).to_string(),
+            "duplicate tool name \"x\": more than one offered tool carries it"
+        );
+        assert_eq!(
+            HarvestError::NoSuchToolPlugin("x".into()).to_string(),
+            "no TOOL plugin named \"x\" offers a tool"
+        );
+    }
 
     #[test]
     fn the_truncation_marker_lands_on_its_own_final_line() {

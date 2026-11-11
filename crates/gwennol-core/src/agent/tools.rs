@@ -99,7 +99,7 @@ impl ToolTable {
     }
 }
 
-/// A `TOOL` `call` result, as the contract shapes it.
+/// A tool's result, as the contract shapes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolOutput {
     pub content: String,
@@ -107,7 +107,7 @@ pub(crate) struct ToolOutput {
     pub truncated: bool,
 }
 
-/// Read a `call` action's output. Fail-closed like every contract
+/// Read the output of an action run as a tool. Fail-closed like every contract
 /// shape: a result missing `content`, mistyping a field, or carrying
 /// one the closed schema does not allow is not a result.
 pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
