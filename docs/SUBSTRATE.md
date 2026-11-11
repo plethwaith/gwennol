@@ -23,7 +23,7 @@ Three facts, each verified in Gwead's source rather than assumed:
    import, `() -> ()` entry, `null` result. Nothing that needs I/O can
    live there.
 2. **The script-runtime ABI is the only guest surface with reach.** A
-   module in that slot gets the full `gwead1` import set: stream
+   module in that slot gets the full `gwead@1` import set: stream
    read/write/close, the last-recorded stream error's text, the
    pre-provisioned `long_running` dataflow output,
    `host_invoke`/`host_invoke_streaming` back into the kernel,
@@ -39,7 +39,7 @@ Three facts, each verified in Gwead's source rather than assumed:
 
 Given fact 3, option (b) strictly contains option (a): a bundled
 interpreter is *also* a wasm module somebody writes against the
-`gwead1` imports — the binding layer is the same work — plus an entire
+`gwead@1` imports — the binding layer is the same work — plus an entire
 interpreter, plus the actual plugin logic rewritten in untyped strings
 inside manifest JSON, unreachable by `cargo test`, `clippy`, or
 `rustfmt`. And the roadmap's "3. Plugin substrate" done-when requires
@@ -188,7 +188,7 @@ guests compile from source on every run.
 
 The imports live in one place, `gwennol_guest::sys`, and target
 Gwead's script-runtime ABI version 1 — the wasm import module name
-`"gwead1"` *is* the version handshake, so a kernel speaking a
+`"gwead@1"` *is* the version handshake, so a kernel speaking a
 different ABI fails module instantiation deterministically rather than
 misbehaving mid-stream. Until Gwead 1.0 that ABI may change between
 releases and guest modules must be rebuilt against the hosting kernel

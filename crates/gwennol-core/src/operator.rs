@@ -5,6 +5,9 @@
 //! request — describes what it wants as an [`ApprovalRequest`] and asks the
 //! operator. Secrets are fetched the same way, so the host never holds a key
 //! it was not handed for a specific plugin.
+//!
+//! A frontend that only needs a session's events implements [`EventSink`]
+//! instead and starts its session with `Session::with_events`.
 
 use std::path::PathBuf;
 
@@ -72,7 +75,7 @@ pub struct ToolCall {
 /// wants to run …" and remember decisions per plugin.
 ///
 /// `cause` is the model's tool call that set this in motion, when the
-/// frontend ran the action through [`crate::context::exec_context`]; with it
+/// frontend ran the action through [`crate::context::exec_context_with`] or [`crate::context::exec_context`]; with it
 /// a prompt can say *the model asked `bash` to run `rm -rf build`* rather
 /// than merely *plugin `bash` wants to spawn a process*. It is `None` for an
 /// action the frontend started itself, which is the honest answer: nothing
@@ -159,6 +162,19 @@ pub enum Event {
     },
     /// The current turn is complete.
     TurnComplete,
+}
+
+/// Where a session's [`Event`]s go.
+///
+/// A session built with `Session::with_events` sends every event here and
+/// none to an [`Operator`]. `emit` is called synchronously from the task
+/// driving the session's turn, in the order the events occur, so it must
+/// not block: a sink that blocks stalls the task driving the turn (a future
+/// joined with it included) and the thread running it, and one that panics
+/// unwinds the turn's task.
+pub trait EventSink: Send + Sync {
+    /// Take one event. Called from the task driving the session's turn.
+    fn emit(&self, event: Event);
 }
 
 /// One user turn handed to the loop.
