@@ -291,6 +291,104 @@ fn a_task_runs_headlessly_with_every_decision_traced() {
     assert_eq!(wire[1]["content"][0], thinking_block());
 }
 
+/// `--trace` writes the lines stderr carries as the run's trace, and
+/// not the host's log (`--log` takes that), so with the log elsewhere
+/// the file is stderr exactly. Both record files are owner-only.
+/// Mutations: drop the write from `Headless::note`; drop it from the
+/// outcome line; write the transcript through `std::fs::write`.
+#[test]
+fn a_print_run_writes_its_trace_to_a_file_as_it_writes_stderr() {
+    let f = fixture();
+    let config = f.config("traced-file", "/traced-file", "");
+    let trace = f.scratch.join("p.trace");
+    let transcript = f.scratch.join("p.json");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .arg("--log")
+        .arg(f.scratch.join("p.log"))
+        .arg("--trace")
+        .arg(&trace)
+        .arg("--transcript")
+        .arg(&transcript)
+        .arg("What does hello.txt say?"));
+    assert!(r.status.success(), "{:?}", r.status);
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), r.stderr);
+    assert!(
+        r.stderr.contains("gwennol: -> read toolu_01: "),
+        "{}",
+        r.stderr
+    );
+    assert!(r.stderr.contains("gwennol: done (EndTurn)"), "{}", r.stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&trace, &transcript] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} is owner-only", path.display());
+        }
+    }
+}
+
+/// A trace that cannot be created is a startup error: exit 2 before
+/// the run's first request. Mutation: ignore the failure to create the
+/// trace at startup (`.transpose().ok().flatten()` in `print::run`), so
+/// the run proceeds and exits 0.
+#[test]
+fn an_unwritable_trace_fails_a_print_run_before_any_request() {
+    let f = fixture();
+    let config = f.config("trace-startup", "/trace-startup", "");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .args(["--trace", "/nonexistent/dir/t.log"])
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    r.stderr_has("gwennol: trace /nonexistent/dir/t.log: ");
+    let seen = f
+        .stub
+        .requests()
+        .iter()
+        .filter(|(path, _, _)| path.starts_with("/trace-startup/"))
+        .count();
+    assert_eq!(seen, 0, "a request reached the provider");
+}
+
+/// A trace that fails part-way is said once, stops, and turns a
+/// completed turn into exit 2. `/dev/full` fails every write with
+/// `ENOSPC`. Mutation: drop `settle` from `print::run` (exit 0).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_trace_that_fails_mid_run_is_said_once_and_fails_a_completed_turn() {
+    let f = fixture();
+    let config = f.config("trace-full", "/trace-full", "");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .args(["--trace", "/dev/full"])
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    let said = r
+        .stderr
+        .lines()
+        .filter(|l| l.starts_with("gwennol: trace /dev/full: "))
+        .count();
+    assert_eq!(said, 1, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "Let me read it.\nIt says:      1\thello from the workspace\n"
+    );
+}
+
 #[test]
 fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
     let f = fixture();
@@ -340,6 +438,38 @@ fn a_transcript_that_cannot_be_written_comes_after_the_outcome() {
         .find("gwennol: transcript /nonexistent/dir/t.json: ")
         .expect("transcript failure line");
     assert!(failed_turn < failed_write, "{}", r.stderr);
+}
+
+/// The line that reports a transcript that cannot be written is a
+/// trace line like the rest: with `--trace` it is in the file as well
+/// as on stderr, so with the log elsewhere the file is stderr exactly.
+/// Mutation: write the transcript-failure line to stderr alone
+/// (`eprintln!` in place of `record::say` in `print::run`).
+#[test]
+fn a_transcript_failure_is_in_the_trace_file_too() {
+    let f = fixture();
+    let config = f.config("transcript-traced", "", "");
+    let trace = f.scratch.join("tf.trace");
+    let r = run(f
+        .gwennol()
+        .env(KEY_VAR, API_KEY)
+        .arg("--config")
+        .arg(&config)
+        .args(["--allow", &f.allow_stub(), "--allow", "read:**"])
+        .args(["--transcript", "/nonexistent/dir/t.json"])
+        .arg("--log")
+        .arg(f.scratch.join("tf.log"))
+        .arg("--trace")
+        .arg(&trace)
+        .arg("What does hello.txt say?"));
+    assert_eq!(r.status.code(), Some(2), "{:?}", r.status);
+    assert!(
+        r.stderr
+            .contains("gwennol: transcript /nonexistent/dir/t.json: "),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), r.stderr);
 }
 
 #[test]

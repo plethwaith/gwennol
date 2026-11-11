@@ -10,7 +10,8 @@
 //! than routed to it), so `Esc` there denies rather than cancels, and a
 //! letter there answers only once the keyboard has been quiet for
 //! [`prompt::ARM_DELAY`]; the pane's own keys (paging, focus, expand:
-//! [`pane`]) come next, and the editor last.
+//! [`pane`]) come next, and the editor last. After each turn's outcome
+//! the `--transcript` file, when there is one, is rewritten.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::watch;
 
+use crate::record;
 use crate::show::outcome_line;
 use crate::tui::editor::{Command, Submission};
 use crate::tui::keys::{Input, KeySource};
@@ -150,7 +152,7 @@ pub(crate) fn handle_key(
             }
             Submission::Command(Command::Help) => {
                 for line in super::ui::HELP {
-                    ui.push(Entry::Trace((*line).to_string()));
+                    ui.push_help(line);
                 }
                 ui.editor.commit();
                 ui.follow_tail();
@@ -240,49 +242,52 @@ pub async fn drive<B: Backend, K: KeySource>(
                 since: Instant::now(),
             };
         });
-        let cancel = CancellationToken::new();
-        let fut = session.turn(&text, &cancel);
-        tokio::pin!(fut);
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        tick.tick().await; // the first tick fires immediately; consumed so later ones are spaced.
+        // The turn's future borrows the session; it is dropped with
+        // this block, so the transcript below can read the session.
+        let outcome = {
+            let cancel = CancellationToken::new();
+            let fut = session.turn(&text, &cancel);
+            tokio::pin!(fut);
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            tick.tick().await; // the first tick fires immediately; consumed so later ones are spaced.
 
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                key = keys.next() => {
-                    match key {
-                        Some(input) => {
-                            if handle_key(shared, &cancel, true, input, Instant::now())
-                                == Some(Action::ForceExit)
-                            {
-                                return Ok(ExitCode::from(EXIT_CANCELLED));
+            loop {
+                tokio::select! {
+                    biased;
+                    key = keys.next() => {
+                        match key {
+                            Some(input) => {
+                                if handle_key(shared, &cancel, true, input, Instant::now())
+                                    == Some(Action::ForceExit)
+                                {
+                                    return Ok(ExitCode::from(EXIT_CANCELLED));
+                                }
+                                draw(shared, terminal)?;
                             }
-                            draw(shared, terminal)?;
-                        }
-                        None => {
-                            // The source closed: as a running `/exit`,
-                            // but there is nothing left to poll for, so
-                            // the turn is awaited directly rather than
-                            // through a select a closed source would
-                            // otherwise always win.
-                            shared.update(|ui| ui.exiting = true);
-                            cancel.cancel();
-                            break fut.await;
+                            None => {
+                                // The source closed: as a running `/exit`,
+                                // but there is nothing left to poll for, so
+                                // the turn is awaited directly rather than
+                                // through a select a closed source would
+                                // otherwise always win.
+                                shared.update(|ui| ui.exiting = true);
+                                cancel.cancel();
+                                break fut.await;
+                            }
                         }
                     }
+                    // See `idle_step`: `Ok` only, so a permanently
+                    // dropped sender disables this arm instead of
+                    // spinning it at 100% CPU.
+                    Ok(_) = changes.changed() => { draw(shared, terminal)?; }
+                    _ = tick.tick() => {
+                        shared.update(|ui| ui.tick += 1);
+                        draw(shared, terminal)?;
+                    }
+                    r = &mut fut => break r,
                 }
-                // See `idle_step`: `Ok` only, so a permanently
-                // dropped sender disables this arm instead of
-                // spinning it at 100% CPU.
-                Ok(_) = changes.changed() => { draw(shared, terminal)?; }
-                _ = tick.tick() => {
-                    shared.update(|ui| ui.tick += 1);
-                    draw(shared, terminal)?;
-                }
-                r = &mut fut => break r,
             }
         };
-
         let (line, _) = outcome_line(&outcome);
         last_failed = matches!(&outcome, Err(e) if !matches!(e, TurnError::Cancelled { .. }));
         let exiting = shared.update(|ui| {
@@ -290,6 +295,18 @@ pub async fn drive<B: Backend, K: KeySource>(
             ui.turn = TurnState::Idle;
             std::mem::take(&mut ui.exiting)
         });
+        // Whatever the outcome: the file holds the conversation as the
+        // provider saw it through this turn. A failed write is shown
+        // and kept, and the next turn tries again.
+        let transcript = shared.lock().transcript.clone();
+        if let Some(path) = transcript
+            && let Err(Fatal(message)) = record::write_transcript(&path, &session.chat_input())
+        {
+            shared.update(|ui| {
+                ui.push(Entry::Trace(format!("gwennol: {message}")));
+                ui.record_failures.push(message);
+            });
+        }
         draw(shared, terminal)?;
         if exiting {
             return Ok(exit_code(last_failed));
@@ -871,5 +888,39 @@ mod tests {
                 "the ready redraw was handled before the ready key"
             );
         }
+    }
+
+    /// `/help` shows its lines in the pane and writes none of them to
+    /// the `--trace` file: they are not a record of the run. Mutation:
+    /// the `/help` arm pushes through `Ui::push`, and the capture holds
+    /// the `HELP` lines.
+    #[test]
+    fn help_lines_are_shown_but_not_recorded() {
+        let capture = crate::record::testing::Capture::default();
+        let shared = Shared::new();
+        shared.update(|ui| {
+            ui.trace = Some(crate::record::TraceFile::from_writer(
+                std::path::Path::new("t.log"),
+                Box::new(capture.clone()),
+            ));
+            ui.editor.paste("/help");
+        });
+        handle_key(
+            &shared,
+            &CancellationToken::new(),
+            false,
+            Input::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Instant::now(),
+        );
+        let guard = shared.lock();
+        let shown: Vec<&str> = guard.entries[guard.entries.len() - crate::tui::ui::HELP.len()..]
+            .iter()
+            .map(|e| match e {
+                Entry::Trace(text) => text.as_str(),
+                other => panic!("expected a Trace entry, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(shown, crate::tui::ui::HELP);
+        assert_eq!(capture.0.lock().unwrap().as_slice(), b"");
     }
 }

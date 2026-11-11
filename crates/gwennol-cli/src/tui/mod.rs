@@ -33,6 +33,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::policy::RuleSpec;
+use crate::record::{self, TraceFile};
 use crate::{Cli, Fatal, Mode, frontend};
 use drive::drive;
 use keys::TerminalKeys;
@@ -42,21 +43,25 @@ use ui::{Entry, Shared};
 
 /// Boot for a session: `frontend::start` with the interactive operator,
 /// the startup warnings as the pane's first entries. No terminal state
-/// is touched: a startup error prints to a normal terminal. `--transcript`
-/// is print mode only (`lib.rs`'s help says so): a session rejects it
-/// here rather than silently writing nothing.
+/// is touched: a startup error prints to a normal terminal. Both record
+/// files (`--transcript`, `--trace`) are created before anything boots,
+/// so a path that cannot be written is a startup error; the transcript
+/// then holds the conversation as the provider sees it, from the start.
 pub fn start(
     cli: &Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
 ) -> Result<(Session, Arc<Shared>), Fatal> {
-    if cli.transcript.is_some() {
-        return Err(Fatal(
-            "--transcript is print-mode only (-p); a session does not write one".to_string(),
-        ));
+    let trace = cli.trace.as_deref().map(TraceFile::create).transpose()?;
+    if let Some(path) = &cli.transcript {
+        record::create_transcript(path)?;
     }
     let shared = Shared::new();
-    shared.update(|ui| ui.workspace = workspace.clone());
+    shared.update(|ui| {
+        ui.workspace = workspace.clone();
+        ui.trace = trace;
+        ui.transcript = cli.transcript.clone();
+    });
     let mut warnings = Vec::new();
     let session = frontend::start(
         cli,
@@ -74,6 +79,9 @@ pub fn start(
         },
         &mut warnings,
     )?;
+    if let Some(path) = &cli.transcript {
+        record::write_transcript(path, &session.chat_input())?;
+    }
     shared.update(|ui| {
         for w in warnings {
             ui.push(Entry::Trace(format!("gwennol: {w}")));
@@ -82,30 +90,51 @@ pub fn start(
     Ok((session, shared))
 }
 
-/// The session: start, then the terminal, the loop, and the restore.
+/// The session: start, then the terminal and the loop, then the record
+/// failures once the terminal is back.
 pub async fn run(
     cli: Cli,
     workspace: PathBuf,
     flag_rules: Vec<RuleSpec>,
 ) -> Result<ExitCode, Fatal> {
     let (mut session, shared) = start(&cli, workspace, flag_rules)?;
+    let code = on_terminal(&mut session, &shared, cli.first_turn()).await;
+    finish(code, &shared, &mut std::io::stderr())
+}
+
+/// The loop on the terminal: raw mode and the alternate screen are
+/// entered here and restored when this returns, whichever way it does.
+async fn on_terminal(
+    session: &mut Session,
+    shared: &Arc<Shared>,
+    first: Option<String>,
+) -> Result<ExitCode, Fatal> {
     screen::install_panic_hook();
     let screen = Screen::enter(std::io::stdout(), true, Kitty::Probe)
         .map_err(|e| Fatal(format!("terminal setup: {e}")))?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))
         .map_err(|e| Fatal(format!("terminal: {e}")))?;
     let mut keys = TerminalKeys::new();
-    let code = drive(
-        &mut session,
-        &shared,
-        &mut terminal,
-        &mut keys,
-        cli.first_turn(),
-    )
-    .await;
+    let code = drive(session, shared, &mut terminal, &mut keys, first).await;
     drop(terminal);
     drop(screen);
     code
+}
+
+/// What is left to say once the terminal is back: each record failure
+/// the session kept is written to `err`, where it outlives the
+/// alternate screen, before an error `code` is returned as it is; a
+/// `code` of success becomes exit 2 when any failed ([`record::settle`]).
+fn finish(
+    code: Result<ExitCode, Fatal>,
+    shared: &Shared,
+    err: &mut impl std::io::Write,
+) -> Result<ExitCode, Fatal> {
+    let failures = shared.lock().record_failures.clone();
+    for message in &failures {
+        let _ = writeln!(err, "gwennol: {message}");
+    }
+    code.map(|code| record::settle(code, !failures.is_empty()))
 }
 
 #[cfg(test)]
@@ -139,6 +168,10 @@ mod tests {
     /// environment regardless. Guards the no-rules warning going only
     /// to the log in a session, not the pane. Mutation: restore the
     /// `warnings.push` in `frontend.rs` — two entries instead of one.
+    /// With `--trace`, the warning is also the trace file's first
+    /// line, because `start` gives the pane its trace before it pushes
+    /// the warnings. Mutation: move `ui.trace = trace;` after the
+    /// warnings loop — the file is empty.
     #[test]
     fn startup_warnings_are_the_first_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -167,6 +200,8 @@ mod tests {
             config_path.to_str().unwrap(),
             "--secret",
             &format!("{PROVIDER}:api_key=env:GWENNOL_TEST_STARTUP_WARNING_38_UNSET"),
+            "--trace",
+            root.path().join("t.log").to_str().unwrap(),
         ]);
         let cli = Cli::from_arg_matches(&matches).unwrap();
         // No --allow/--deny rule at all: the empty-policy warning
@@ -185,25 +220,79 @@ mod tests {
             ),
             other => panic!("expected a Trace entry, got {other:?}"),
         }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("t.log")).unwrap(),
+            format!("{}\n", guard.entries[0].text()),
+            "the startup warning is in the trace file"
+        );
     }
 
-    /// `tui::start` rejects `--transcript` outright rather than
-    /// accepting it and silently writing nothing, as a session did
-    /// before this round (`lib.rs`'s help now says print-mode only).
-    /// The check runs before the plugin bundle would be needed, so
-    /// this needs none. Mutation: drop the `cli.transcript.is_some()`
-    /// check — `start` then fails on the missing bundle instead, with
-    /// no mention of `--transcript`.
+    /// `tui::start` creates both record files before it boots anything,
+    /// so a path that cannot be written is a startup error naming it.
+    /// `--plugins` points at a directory that does not exist, so a
+    /// missing pre-boot check falls through to the plugins error and
+    /// never reaches a boot. Mutations: remove the pre-boot `create` of
+    /// either file: the message is then the plugins one.
     #[test]
-    fn a_session_rejects_transcript() {
-        let matches = Cli::command().get_matches_from(["gwennol", "--transcript", "/tmp/x"]);
-        let cli = Cli::from_arg_matches(&matches).unwrap();
-        match start(&cli, PathBuf::from("."), Vec::new()) {
-            Err(Fatal(message)) => assert!(
-                message.contains("--transcript"),
-                "wrong rejection reason: {message}"
+    fn a_session_reports_an_unwritable_record_before_it_boots() {
+        for (flag, path, prefix) in [
+            (
+                "--transcript",
+                "/nonexistent/dir/t.json",
+                "transcript /nonexistent/dir/t.json: ",
             ),
-            Ok(_) => panic!("expected --transcript to be rejected"),
+            (
+                "--trace",
+                "/nonexistent/dir/t.log",
+                "trace /nonexistent/dir/t.log: ",
+            ),
+        ] {
+            let matches = Cli::command().get_matches_from([
+                "gwennol",
+                "--plugins",
+                "/nonexistent/plugins",
+                flag,
+                path,
+            ]);
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            match start(&cli, PathBuf::from("."), Vec::new()) {
+                Err(Fatal(message)) => {
+                    assert!(message.starts_with(prefix), "{flag}: {message}")
+                }
+                Ok(_) => panic!("{flag}: expected a startup error"),
+            }
         }
+    }
+
+    /// A record failure kept before the terminal could be entered is
+    /// still said, ahead of the terminal error that ends the run, and a
+    /// clean run becomes exit 2. Mutation: return an error `code`
+    /// before reading `record_failures` (nothing is said).
+    #[test]
+    fn kept_record_failures_are_said_even_when_the_terminal_fails() {
+        let shared = Shared::new();
+        shared.update(|ui| ui.record_failures.push("trace t.log: boom".to_string()));
+        let mut said = Vec::new();
+        let code = finish(
+            Err(Fatal("terminal setup: no tty".to_string())),
+            &shared,
+            &mut said,
+        );
+        assert_eq!(
+            String::from_utf8(said).unwrap(),
+            "gwennol: trace t.log: boom\n"
+        );
+        assert!(
+            matches!(&code, Err(Fatal(m)) if m == "terminal setup: no tty"),
+            "{code:?}"
+        );
+
+        let mut said = Vec::new();
+        let code = finish(Ok(ExitCode::SUCCESS), &shared, &mut said);
+        assert_eq!(code.unwrap(), ExitCode::from(crate::EXIT_USAGE));
+        assert_eq!(
+            String::from_utf8(said).unwrap(),
+            "gwennol: trace t.log: boom\n"
+        );
     }
 }
