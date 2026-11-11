@@ -303,13 +303,12 @@ first at the nearest namespace wins, silently — register one) but not for
 tools — a deployment registers many `TOOL` plugins at once. Selection is
 by descriptor: the model names a tool, the loop finds the descriptor
 with that `name`, and its `plugin_key`/`action_name` say exactly what to
-execute. The role is no
-longer a registration-time check. It is what the harvest keys on, and the
-audit handle: `roles: ["TOOL"]` finds the plugins, and their `tool` blocks
-are everything the model can call, *because* the harvest rules above admit
-nothing else. That is a property of the embedder holding the line, not of
-the engine: Gwead itself would happily harvest a `tool` block from a
-plugin that never claimed the role.
+execute. The role is what the harvest keys on, and the audit handle:
+`roles: ["TOOL"]` finds the plugins, and their `tool` blocks are everything
+the model can call, *because* the harvest rules above admit nothing else.
+That is a property of the embedder holding the line, not of the engine:
+Gwead itself would happily harvest a `tool` block from a plugin that never
+claimed the role.
 
 A session can also offer a chosen subset: `SessionConfig::tool_plugins`
 names `TOOL` plugins (by plugin name, the unit a manifest grants authority

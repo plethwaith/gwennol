@@ -607,7 +607,8 @@ async fn every_offered_action_is_held_to_its_own_schema_and_the_result_shape() {
     ] {
         let sink = Arc::new(Recorder::default());
         let mut s = session(&kernel, config(tool), sink.clone()).unwrap();
-        s.turn("go", &CancellationToken::new()).await.unwrap();
+        let outcome = s.turn("go", &CancellationToken::new()).await.unwrap();
+        assert_eq!(outcome.rounds, 2, "{tool}");
         let events = sink.0.lock().unwrap();
         let failures: Vec<&Event> = events
             .iter()

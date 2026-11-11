@@ -98,7 +98,7 @@ pub enum HarvestError {
     /// — and real provider APIs reject duplicate tools anyway.
     #[error("duplicate tool name {0:?}: more than one offered tool carries it")]
     DuplicateToolName(String),
-    /// A selection named a plugin that offers no tool: not a `TOOL`
+    /// A selection held a name that offers no tool: not a `TOOL`
     /// fulfiller, or one none of whose actions carries a `tool` block.
     #[error("no TOOL plugin named {0:?} offers a tool")]
     NoSuchToolPlugin(String),
@@ -196,6 +196,7 @@ mod tests {
     fn the_result_shape_is_one_definition_and_call_is_optional() {
         let contract: serde_json::Value = serde_json::from_str(tool::DEFINITION).unwrap();
         let actions = contract["actions"].as_object().unwrap();
+        assert_eq!(contract["version"], "0.3.0");
         assert_eq!(actions.keys().collect::<Vec<_>>(), ["call"]);
         assert_eq!(contract["actions"]["call"]["optional"], true);
         assert_eq!(
