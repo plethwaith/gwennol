@@ -9,6 +9,8 @@
 //!
 //! The wire shapes the contracts pin down are documented in `docs/SPI.md`.
 
+use std::collections::BTreeSet;
+
 /// The `LLM_CHAT` role: a chat-completion model provider.
 pub mod llm_chat {
     /// The role name, as used in `roles` and `invoke:role:` permissions.
@@ -83,7 +85,8 @@ pub fn register(kernel: &mut gwead::kernel::Kernel) -> Result<(), gwead::kernel:
     Ok(())
 }
 
-/// Why [`harvest_tools`] refused the kernel's tool inventory.
+/// Why [`harvest_tools`] or [`harvest_selected`] refused the kernel's tool
+/// inventory.
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
     /// Two plugins advertise the same `tool.name`, so "the descriptor
@@ -91,6 +94,10 @@ pub enum HarvestError {
     /// duplicate tools anyway.
     #[error("duplicate tool name {0:?}: two TOOL plugins advertise it")]
     DuplicateToolName(String),
+    /// A selection named a plugin that is not a `TOOL` fulfiller with a
+    /// [`tool::CALL`] tool descriptor.
+    #[error("no TOOL plugin named {0:?} offers a `call` tool")]
+    NoSuchToolPlugin(String),
 }
 
 /// The tools the model may call, as harvested descriptors.
@@ -103,6 +110,11 @@ pub enum HarvestError {
 /// - only descriptors whose plugin fulfils the [`tool::ROLE`] role via
 ///   its [`tool::CALL`] action survive — anything else never faced the
 ///   contract check;
+/// - when the caller selects plugins ([`harvest_selected`]), only those
+///   plugins' descriptors survive, and the selection applies before the
+///   duplicate refusal: two plugins that advertise one tool name can sit
+///   on one kernel, and a selection holding at most one of them
+///   harvests; [`harvest_tools`] on that kernel is refused;
 /// - duplicate tool names are refused, not resolved;
 /// - the result is sorted by name, because tool order is model-visible
 ///   and prefix-sensitive: an unspecified order changes the prompt every
@@ -123,6 +135,27 @@ pub enum HarvestError {
 pub fn harvest_tools(
     kernel: &gwead::kernel::Kernel,
 ) -> Result<Vec<gwead::kernel::registry::ToolDescriptor>, HarvestError> {
+    harvest(kernel, None)
+}
+
+/// [`harvest_tools`] restricted to the named plugins.
+///
+/// Selection is by plugin name, the unit a manifest grants authority to,
+/// and applies before the duplicate-name refusal. A name that is not a
+/// `TOOL` fulfiller with a `call` tool descriptor is refused as
+/// [`HarvestError::NoSuchToolPlugin`], the first such name in the set's
+/// order. An empty selection harvests nothing.
+pub fn harvest_selected(
+    kernel: &gwead::kernel::Kernel,
+    plugins: &BTreeSet<String>,
+) -> Result<Vec<gwead::kernel::registry::ToolDescriptor>, HarvestError> {
+    harvest(kernel, Some(plugins))
+}
+
+fn harvest(
+    kernel: &gwead::kernel::Kernel,
+    selection: Option<&BTreeSet<String>>,
+) -> Result<Vec<gwead::kernel::registry::ToolDescriptor>, HarvestError> {
     let fulfillers = kernel.role_candidates(None, tool::ROLE);
     let mut descriptors: Vec<_> = kernel
         .registry()
@@ -130,6 +163,15 @@ pub fn harvest_tools(
         .into_iter()
         .filter(|d| fulfillers.contains(&d.plugin_key) && d.action_name == tool::CALL)
         .collect();
+    if let Some(selection) = selection {
+        if let Some(missing) = selection
+            .iter()
+            .find(|name| !descriptors.iter().any(|d| &d.plugin_key == *name))
+        {
+            return Err(HarvestError::NoSuchToolPlugin(missing.clone()));
+        }
+        descriptors.retain(|d| selection.contains(&d.plugin_key));
+    }
     descriptors.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
     if let Some(pair) = descriptors
         .windows(2)

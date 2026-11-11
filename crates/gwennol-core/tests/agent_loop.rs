@@ -30,8 +30,8 @@ use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_core::{
-    Access, ApprovalRequest, Decision, Event, Operator, Session, SessionConfig, SessionError,
-    StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
+    Access, ApprovalRequest, Decision, Event, EventSink, Operator, Session, SessionConfig,
+    SessionError, StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
 };
 
 mod common;
@@ -532,6 +532,11 @@ fn round_of(body: &Value) -> usize {
 }
 
 fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
+    // `/own/<route>` answers as `<route>` does, with request counts and
+    // recorded requests of its own: the tests that carry a transcript
+    // from one session to another use it, so they leave the routes
+    // other tests count requests on alone.
+    let route = route.strip_prefix("/own").unwrap_or(route);
     let round = round_of(body);
     let one_call = |name: &str, input: Value| -> Vec<Value> {
         if round == 0 {
@@ -542,6 +547,8 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
     };
     match route {
         "/text" => vec![text("Hello"), text(" there"), end("end_turn")],
+        "/text-b" => vec![text("Goodbye"), text(" now"), end("end_turn")],
+        "/text-r" | "/text-c" => vec![text("Resumed"), end("end_turn")],
         "/tools" if round == 0 => vec![
             text("Looking."),
             call("c1", "echo", json!({"message": "hi"})),
@@ -1485,6 +1492,182 @@ async fn a_new_turn_joins_the_trailing_user_message_after_a_failed_one() {
         sent[before + 1]["messages"],
         json!([{"role": "user", "content": [text("first"), text("again")]}])
     );
+}
+
+// ------------------------------------------------- embedder's seams
+
+/// A session's own sink: every event, in order.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<Event>>);
+
+impl EventSink for Recorder {
+    fn emit(&self, event: Event) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+impl Recorder {
+    fn events(&self) -> Vec<Event> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A streamed session against one stub route, with its own sink.
+fn sink_session(route: &str) -> (Session, Arc<Recorder>) {
+    let sink = Arc::new(Recorder::default());
+    let s = Session::with_events(fixture().kernel.clone(), config(route), sink.clone()).unwrap();
+    (s, sink)
+}
+
+/// Two sessions on one kernel, run at the same time: each sink gets its
+/// own session's events, and the installed operator gets none.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_sessions_on_one_kernel_emit_to_their_own_sinks() {
+    let (mut a, sink_a) = sink_session("/own/text");
+    let (mut b, sink_b) = sink_session("/own/text-b");
+    let ((ra, rb), installed) =
+        with_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
+    ra.unwrap();
+    rb.unwrap();
+    assert!(installed.is_empty(), "{installed:?}");
+    let seen = |sink: &Recorder| {
+        sink.events()
+            .into_iter()
+            .map(|e| match e {
+                Event::Text(t) => t,
+                Event::TurnComplete => "<done>".into(),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(seen(&sink_a), ["Hello", " there", "<done>"]);
+    assert_eq!(seen(&sink_b), ["Goodbye", " now", "<done>"]);
+}
+
+/// A sink session's turn, handed a token already cancelled, ends
+/// `Cancelled` with no text emitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pre_cancelled_token_ends_a_sink_session_cancelled() {
+    let (mut s, sink) = sink_session("/own/text");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        s.turn("never", &cancel).await.unwrap_err(),
+        TurnError::Cancelled { detail: None }
+    ));
+    assert_eq!(s.transcript(), &[user("never")]);
+    assert!(
+        sink.events().iter().all(|e| !matches!(e, Event::Text(_))),
+        "no text reaches the sink: {:?}",
+        sink.events()
+    );
+}
+
+/// What the stub received for `route`'s newest request.
+fn last_sent(route: &str) -> Value {
+    fixture()
+        .stub
+        .requests_for(route)
+        .pop()
+        .expect("the route was asked")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_transcript_is_what_the_provider_is_sent() {
+    // A completed tool exchange, then a turn that fails: the
+    // transcript ends in the user's text.
+    let mut first = session("/own/tools");
+    turn(&mut first, "one").await.unwrap();
+    assert_eq!(first.transcript().len(), 4);
+    let mut failing = session("/own/fatal");
+    failing.restore(first.transcript().to_vec()).unwrap();
+    assert!(matches!(
+        turn(&mut failing, "two").await.unwrap_err(),
+        TurnError::Provider(_)
+    ));
+    let stored = failing.transcript().to_vec();
+    assert_eq!(stored.len(), 5);
+    assert_eq!(stored[4], user("two"));
+
+    let mut resumed = session("/own/text-r");
+    resumed.restore(stored.clone()).unwrap();
+    assert_eq!(resumed.transcript(), &stored[..]);
+    turn(&mut resumed, "three").await.unwrap();
+    let sent = last_sent("/own/text-r");
+    let mut expected = stored[..4].to_vec();
+    expected.push(json!({"role": "user", "content": [text("two"), text("three")]}));
+    assert_eq!(sent["messages"], Value::Array(expected));
+    assert_eq!(resumed.transcript().len(), 6);
+
+    // Replacing again drops what the turn appended.
+    resumed.restore(vec![]).unwrap();
+    assert!(resumed.transcript().is_empty());
+    turn(&mut resumed, "solo").await.unwrap();
+    assert_eq!(last_sent("/own/text-r")["messages"], json!([user("solo")]));
+}
+
+/// What the loop stores is what `restore` accepts: the transcript each of
+/// these routes leaves, fed back through a fresh session.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_transcript_the_loop_stores_can_be_restored() {
+    for route in [
+        "/text",
+        "/tools",
+        "/opaque",
+        "/fail-tool",
+        "/unknown-tool",
+        "/bad-args",
+        "/broken-tool",
+        "/forged-cancel",
+        "/cut-tool",
+        "/refusal",
+        "/refusal-with-call",
+        "/max-tokens",
+        "/empty",
+        "/fatal",
+        "/truncated",
+    ] {
+        let mut s = session(&format!("/own{route}"));
+        let _ = turn(&mut s, "go").await;
+        let stored = s.transcript().to_vec();
+        let mut fresh = session("/own/text-r");
+        fresh
+            .restore(stored.clone())
+            .unwrap_or_else(|e| panic!("{route}: {e}: {stored:?}"));
+        assert_eq!(fresh.transcript(), &stored[..], "{route}");
+    }
+}
+
+/// The loop's own context key is refused from `Session::new` as well.
+#[test]
+fn the_loops_own_context_key_is_refused_by_new() {
+    let config = SessionConfig {
+        context: json!({"gwennol": {}}).as_object().unwrap().clone(),
+        ..config("/text")
+    };
+    assert!(matches!(
+        Session::new(fixture().kernel.clone(), config),
+        Err(SessionError::ReservedContextKey)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_restore_leaves_the_transcript_as_it_was() {
+    let mut s = session("/own/text-c");
+    turn(&mut s, "hi").await.unwrap();
+    let before = s.transcript().to_vec();
+    let unanswered = vec![
+        user("a"),
+        json!({"role": "assistant", "content": [call("c1", "echo", json!({}))]}),
+    ];
+    match s.restore(unanswered).unwrap_err() {
+        SessionError::Transcript { index, error } => {
+            assert_eq!(index, 2);
+            assert!(error.contains("unanswered"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.transcript(), &before[..]);
 }
 
 // ------------------------------------------------------- cancellation

@@ -69,4 +69,4 @@ pub use kernel::{
     BootError, HOST_FS_MANIFEST, HOST_HTTP_MANIFEST, HOST_MANIFESTS, HOST_PROCESS_MANIFEST, boot,
     boot_with,
 };
-pub use operator::{Access, ApprovalRequest, Decision, Event, Operator, ToolCall, Turn};
+pub use operator::{Access, ApprovalRequest, Decision, Event, EventSink, Operator, ToolCall, Turn};
