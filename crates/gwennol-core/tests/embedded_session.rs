@@ -1,8 +1,8 @@
 //! A session on a kernel this crate did not build: the embedder's path
 //! through the loop.
 //!
-//! This crate has no host to boot, and this binary links no native step
-//! bodies. Its kernels carry
+//! This crate has no host to boot, and this binary links none of the host's
+//! native step bodies. Its kernels carry
 //! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools;
 //! the provider and each tool declare a secret so the kernel consults the
 //! resolver on every invocation (`gwead::kernel::secrets`: a non-empty declaration is what
@@ -182,15 +182,16 @@ async fn a_sink_session_receives_its_events_in_order() {
     );
 }
 
-/// The table is not empty here: gwead submits its own intrinsics, so what
-/// this observes is that none of the host's six step bodies is among them.
+/// Gwead submits two entries of its own, `gwead.intrinsics.throw_error` and
+/// `gwead.intrinsics.let`; the table holds those two and nothing else, so
+/// none of the host's six step bodies is among them.
 #[test]
 fn the_loop_alone_links_no_native_step_bodies() {
     let table = NativeStepImplTable::discover().unwrap();
-    assert!(
-        table.get("gwead.intrinsics.let").is_some(),
-        "the table is the one discover builds"
-    );
+    for name in ["gwead.intrinsics.throw_error", "gwead.intrinsics.let"] {
+        assert!(table.get(name).is_some(), "{name} is the kernel's own");
+    }
+    assert_eq!(table.len(), 2, "only gwead's own entries");
     for name in [
         "gwennol.host_fs.read",
         "gwennol.host_fs.write",

@@ -1,11 +1,10 @@
 # Plugins
 
-The Gwead documents bundled with Gwennol, registered at boot by
-`gwennol-host`, which registers the role contracts through `gwennol-core`.
-Each is a single JSON file: Gwead resolves nothing from disk, so a
-manifest carries everything it needs inline, and a plugin never spans
-files. The folders group documents by kind, in registration order — role
-contracts must be registered before the plugins that claim them.
+The Gwead documents bundled with Gwennol. Each is a single JSON file:
+Gwead resolves nothing from disk, so a manifest carries everything it needs
+inline, and a plugin never spans files. The folders group documents by
+kind, in registration order — role contracts must be registered before the
+plugins that claim them.
 
 - `spi/` — role contracts, one document per role: `llm_chat.json`
   (`LLM_CHAT`, streaming) and `tool.json` (`TOOL`). SPI definitions are

@@ -6,6 +6,6 @@ offers, on any Gwead kernel that has the bundled SPI contracts registered
 (`spi::register`). It sends each `Event` to the `EventSink` the session was
 started with, and reads no process-global state.
 
-The crate links no native step bodies and makes no policy decisions: what a
+The crate links no native step bodies of its own and makes no policy decisions: what a
 plugin's steps do, and who is asked before they do it, belong to whoever
 builds the kernel. `gwennol-host` is one such host.

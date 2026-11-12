@@ -4,15 +4,16 @@
 //! that was cut before it did anything from one that was cut somewhere in
 //! its work. They are the loop's contract with any step, whoever supplies it.
 
-/// The error code of a step that was stopped before it did anything: a
-/// `KernelError::PluginError` carrying it, so the loop recognises the
-/// withdrawal as data and never by reading error text or guessing from a
-/// token's state. It carries more than the kernel's typed cancellation can:
+/// The error code of a cancelled step, carried by a
+/// `KernelError::PluginError`, so the loop recognises the cancellation as
+/// data and never by reading error text or guessing from a token's state.
+/// On its own the loop reads it as a cancellation somewhere in the step's
+/// work; only with [`CANCELLED_AT_APPROVAL`] as `params.phase` does it say
 /// nothing ran.
 pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 
-/// The `params.phase` value that marks a [`CANCELLED_CODE`] error as having
-/// withdrawn the step before it began its work. A cancellation without it
+/// The `params.phase` value that marks a [`CANCELLED_CODE`] error as
+/// reporting that the step was stopped before it began its work. A cancellation without it
 /// lands somewhere in the work, where the step cannot say how far it got,
 /// and the loop then tells the model the call may have run in part or in
 /// full.

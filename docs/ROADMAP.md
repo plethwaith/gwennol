@@ -8,7 +8,7 @@ feature-complete rival to existing harnesses.
 
 ## Architecture (decided)
 
-- **Two layers.** `gwennol-core` is the agent loop and the SPI contracts it
+- **Three layers.** `gwennol-core` is the agent loop and the SPI contracts it
   consumes, on any Gwead kernel; `gwennol-host` is the host: Gwead
   `KernelConfig`, the native host step types, the host plugin manifests, and
   the `Operator` trait. Frontends implement `Operator`
@@ -260,7 +260,7 @@ written, and it must be settled before a provider exists.
   cannot be held open; its race is pinned at the boundary after it.
   A host step cancelled inside its work says so as the kernel's own
   typed `Cancelled`; only a withdrawn approval keeps the structured
-  shape — a `PluginError` carrying `steps::CANCELLED_CODE`, with
+  shape — a `PluginError` carrying `gwennol_core::cancel::CANCELLED_CODE`, with
   `params.phase` naming it, since nothing ran is one thing more than
   the typed variant can carry. The loop's own token is the authority
   either way: once it has fired, whatever a step reports is the cut

@@ -61,7 +61,8 @@
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a step that has not
-//!   begun its work reports that it was stopped before it started, a
+//!   begun its work can report that it was stopped before it started
+//!   ([`crate::cancel`]), a
 //!   running tool step observes the token and stops, reported as the
 //!   kernel's typed cancellation. The turn's own token
 //!   is the authority: once it has fired, whatever a step reports is
@@ -279,7 +280,7 @@ pub enum TurnError {
     #[error("provider refused the turn: {0}")]
     Provider(Failure),
     /// The provider's `chat` action failed as a step: the transport,
-    /// a step's refusal, or the kernel said no before the vendor answered.
+    /// a step, or the kernel said no before the vendor answered.
     /// Uniformly fatal; the message is not for consumers to read.
     #[error("provider step failed: {0}")]
     Step(KernelError),
@@ -1034,8 +1035,7 @@ impl Cut {
 /// Whether a kernel error carries a cancellation: the kernel's typed
 /// [`KernelError::Cancelled`] — a step that stopped on its token,
 /// or the kernel's own between-step check — or a step's structured
-/// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE), which says it was
-/// stopped before it began. Never on its own a reason to treat a turn as cancelled:
+/// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a reason to treat a turn as cancelled:
 /// the turn's token is the authority. Without it, the structured
 /// code has two sources: the kernel's action ceiling stopping a step
 /// that had not begun, which arrives as the code when the step unwinds
@@ -1060,7 +1060,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 

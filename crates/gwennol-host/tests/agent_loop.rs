@@ -602,7 +602,7 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
         "/always-retryable" | "/always-retryable-saturating" | "/always-retryable-cancelled" => {
             vec![json!({"type": "error", "message": "still overloaded", "retryable": true})]
         }
-        "/fatal" => vec![
+        "/fatal" | "/fatal-in-run" => vec![
             json!({"type": "error", "message": "bad key", "retryable": false, "kind": "authentication_error"}),
         ],
         "/unknown-retryable" => vec![json!({"type": "error", "message": "who knows"})],
@@ -1827,6 +1827,57 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
         TurnError::Cancelled { detail: None }
     ));
     assert_eq!(buffered.transcript(), &[user("never")]);
+}
+
+/// An operator that only feeds turns from its own queue.
+struct Queue(Mutex<VecDeque<String>>);
+
+#[async_trait::async_trait]
+impl Operator for Queue {
+    async fn approve(&self, _: ApprovalRequest) -> Decision {
+        Decision::Allow
+    }
+    async fn secret(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+    fn emit(&self, _: Event) {}
+    async fn input(&self) -> Option<Turn> {
+        self.0.lock().unwrap().pop_front().map(|text| Turn { text })
+    }
+}
+
+/// `gwennol_host::run` stops at the first turn that does not complete: it
+/// returns that turn's error, not a cancellation, and leaves the next turn
+/// unread in the operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_stops_at_the_first_turn_that_fails() {
+    let f = fixture();
+    let mut s = session("/fatal-in-run");
+    let operator = Queue(Mutex::new(VecDeque::from([
+        "one".to_string(),
+        "two".to_string(),
+    ])));
+    let before = f.stub.requests_for("/fatal-in-run").len();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        gwennol_host::run(&mut s, &operator, &CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, Err(TurnError::Provider(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        operator.0.lock().unwrap().iter().collect::<Vec<_>>(),
+        ["two"],
+        "the next turn was not taken"
+    );
+    assert_eq!(
+        f.stub.requests_for("/fatal-in-run").len() - before,
+        1,
+        "one provider request"
+    );
 }
 
 /// `gwennol_host::run`'s own select — cancelling before it reads the next
