@@ -121,8 +121,8 @@ implements them.
   embedder harvests Gwead's tool descriptors and hands them to the model
   as `chat`'s `tools` input. A second declaration in the contract would
   only be a copy that can drift — the manifest is already the audit
-  surface, so it is also the source of truth. Since `TOOL` 0.3.0 a plugin
-  offers one tool per action that carries one. See `docs/SPI.md`.
+  surface, so it is also the source of truth. Since `TOOL` 0.3.0 a `TOOL`
+  plugin offers one tool per action that carries a `tool` block. See `docs/SPI.md`.
 
 ### 3. Plugin substrate
 

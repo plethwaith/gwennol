@@ -6,7 +6,7 @@ from [Plethwaith Labs](https://plethwaith.com), built on the
 
 The idea: in every coding agent today, tools run as host-native code with
 permission prompts bolted on afterwards. In Gwennol, tools and model providers
-are sandboxed Gwead plugins. A plugin's manifest declares the host step types
+run in sandboxed Gwead plugins. A plugin's manifest declares the host step types
 it may use, and the kernel refuses anything else at dispatch time — so the
 manifest is an accurate statement of what a plugin can reach, and "where can my
 API key go?" is answered by reading ten lines of JSON.

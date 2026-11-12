@@ -434,10 +434,9 @@ pub struct SessionConfig {
     /// plugins that advertise one tool name can share a kernel as long as
     /// every session on it selects at most one of them (a session whose
     /// `tool_plugins` is `None` offers both, and is refused). A selected
-    /// plugin brings every tool it offers; a name that offers no tool (not
-    /// a `TOOL` fulfiller, or one none of whose actions carries a `tool`
-    /// block) refuses the session ([`SessionError::Harvest`]). `Some` of an
-    /// empty set offers no tools.
+    /// plugin brings every tool it offers; a name that offers no tool
+    /// refuses the session ([`SessionError::Harvest`]). `Some` of an empty
+    /// set offers no tools.
     pub tool_plugins: Option<BTreeSet<String>>,
 }
 

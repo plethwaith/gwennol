@@ -98,8 +98,7 @@ pub enum HarvestError {
     /// — and real provider APIs reject duplicate tools anyway.
     #[error("duplicate tool name {0:?}: more than one offered tool carries it")]
     DuplicateToolName(String),
-    /// A selection held a name that offers no tool: not a `TOOL`
-    /// fulfiller, or one none of whose actions carries a `tool` block.
+    /// A selection held a name that offers no tool.
     #[error("no TOOL plugin named {0:?} offers a tool")]
     NoSuchToolPlugin(String),
 }
@@ -147,10 +146,9 @@ pub fn harvest_tools(
 ///
 /// Selection is by plugin name, the unit a manifest grants authority to,
 /// and applies before the duplicate-name refusal. A selected plugin brings
-/// every tool it offers. A name that offers no tool (not a `TOOL`
-/// fulfiller, or one none of whose actions carries a `tool` block) is
-/// refused as [`HarvestError::NoSuchToolPlugin`], the first such name in
-/// the set's order. An empty selection harvests nothing.
+/// every tool it offers. A name that offers no tool is refused as
+/// [`HarvestError::NoSuchToolPlugin`], the first such name in the set's
+/// order. An empty selection harvests nothing.
 pub fn harvest_selected(
     kernel: &gwead::kernel::Kernel,
     plugins: &BTreeSet<String>,
