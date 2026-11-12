@@ -911,6 +911,34 @@ async fn the_provider_answers_a_buffered_turn() {
     );
 }
 
+/// An image block in a user message is in the vendor's request body,
+/// unchanged and in place, on both forms.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_block_reaches_the_vendor_request_through_the_bundled_provider() {
+    let f = fixture();
+    let data = "QUJD".repeat(256);
+    let messages = json!([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": data}}
+    ]}]);
+    let input = |stream: bool| json!({"messages": messages.clone(), "stream": stream});
+    f.buffered("/image-pin", input(false)).await;
+    f.streamed("/image-pin-stream", input(true)).await;
+    for route in ["/image-pin", "/image-pin-stream"] {
+        let sent: Vec<Value> = f
+            .stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| *p == format!("{route}/v1/messages"))
+            .map(|(_, _, body)| body["messages"].clone())
+            .collect();
+        assert_eq!(sent, vec![messages.clone()], "{route}");
+    }
+}
+
 /// The vendor saying no is the contract's Failure on both paths — data
 /// with `retryable` filled from the vendor's answer, never a step
 /// error the loop would have to read.

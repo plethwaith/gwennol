@@ -11,7 +11,9 @@
 //!   pass through verbatim and `messages` nearly so — the rewrite is
 //!   confined to `opaque` blocks: this provider's are unwrapped back
 //!   into the vendor blocks they carry, another provider's are dropped
-//!   with a note. What else needs code is the defaults and the knobs
+//!   with a note. A user message's blocks, the contract's `image` block
+//!   among them, pass through verbatim and in place. What else needs
+//!   code is the defaults and the knobs
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
 //!   exclusions").
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
@@ -1142,6 +1144,25 @@ mod tests {
             r.dropped,
             vec!["message 1: dropped an opaque block produced by provider-other"]
         );
+    }
+
+    #[test]
+    fn a_user_image_block_reaches_the_request_in_place() {
+        let image = json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+        }});
+        let input = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "compare"},
+                image,
+                {"type": "text", "text": "with the last"}
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [{"type": "text", "text": "again"}]}
+        ]});
+        let r = build_request(&input, &json!({})).unwrap();
+        assert_eq!(r.body["messages"], input["messages"]);
+        assert!(r.dropped.is_empty(), "{:?}", r.dropped);
     }
 
     #[test]

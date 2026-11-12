@@ -9,17 +9,19 @@
 
 use gwead::serde_json::{Value, json};
 
+use crate::content::ImageFormat;
+
 /// The messages of one session, oldest first.
 ///
-/// A turn's pieces land here only when they are whole: the user's text
-/// at the start of the turn, an assistant message once the provider has
+/// A turn's pieces land here only when they are whole: the user's
+/// content at the start of the turn, an assistant message once the provider has
 /// finished producing it, the tool results once every call in that
 /// message has been answered. Nothing partial is ever stored, so a turn
-/// that fails or is cancelled leaves the transcript ending in a user
-/// message — the last thing that completed — and the next turn's text
-/// joins that message rather than following it, keeping the roles
-/// alternating and every tool call answered in the message right after
-/// it.
+/// that fails or is cancelled once its content is stored leaves the
+/// transcript ending in a user message — the last thing that completed —
+/// and the next turn's content joins that message rather than following
+/// it, keeping the roles alternating and every tool call answered in the
+/// message right after it.
 #[derive(Debug, Default)]
 pub(crate) struct Transcript {
     messages: Vec<Value>,
@@ -36,10 +38,7 @@ impl Transcript {
     /// offending message's position (the list's length for a trailing
     /// unanswered call) and the rule it breaks.
     ///
-    /// Not checked, because the loop checks neither of what a provider
-    /// sends: that `tool_use` ids are unique across the conversation, and
-    /// that a tool name is one the session offers. Nor that a `tool_result`
-    /// carries `is_error`, which the loop always writes.
+    /// What this does not check is listed on `Session::restore`.
     pub(crate) fn from_messages(messages: Vec<Value>) -> Result<Self, (usize, String)> {
         // The calls the previous assistant message made, awaiting answers.
         let mut owed: Vec<ToolUse> = Vec::new();
@@ -98,22 +97,21 @@ impl Transcript {
         Ok(Self { messages })
     }
 
-    /// Add the user's text. When the transcript already ends in a user
-    /// message — the previous turn did not complete — the text becomes
-    /// another block of that message, after any tool results it holds:
-    /// the protocol wants results before text, and a vendor rejects two
-    /// user messages in a row.
-    pub(crate) fn push_user_text(&mut self, text: &str) {
-        let block = json!({"type": "text", "text": text});
+    /// Add the user's content blocks, in the order given.
+    /// When the transcript already ends in a user message, the blocks become
+    /// the end of that message, after any tool results it holds: the
+    /// protocol wants results before text and images, and a vendor rejects
+    /// two user messages in a row.
+    pub(crate) fn push_user_content(&mut self, blocks: Vec<Value>) {
         if let Some(last) = self.messages.last_mut()
             && last["role"] == "user"
             && let Some(content) = last["content"].as_array_mut()
         {
-            content.push(block);
+            content.extend(blocks);
             return;
         }
         self.messages
-            .push(json!({"role": "user", "content": [block]}));
+            .push(json!({"role": "user", "content": blocks}));
     }
 
     /// Add an assistant message, exactly as the provider produced it.
@@ -239,8 +237,9 @@ pub(crate) fn check_block(block: &Value) -> Result<Option<ToolUse>, String> {
 /// Check a whole user message and return the `tool_use_id`s of its leading
 /// `tool_result` blocks, in order.
 ///
-/// Fail-closed like [`check_block`]: only the two block types the loop
-/// stores, with no field it does not store, and results before text.
+/// Fail-closed like [`check_block`]: only the block types the loop
+/// stores (`text`, `image`, `tool_result`), with no field it does not
+/// store, and results before any text or image.
 pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
     let Some(fields) = message.as_object() else {
         return Err(format!("user message is not an object: {message}"));
@@ -262,7 +261,8 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
         return Err("message has an empty `content` array".into());
     }
     let mut ids = Vec::new();
-    let mut seen_text = false;
+    // The kind of the first `text` or `image` block seen, if any.
+    let mut seen_content: Option<&str> = None;
     for block in content {
         let Some(block_fields) = block.as_object() else {
             return Err(format!("content block is not an object: {block}"));
@@ -272,12 +272,17 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
                 if !matches!(block_fields.get("text"), Some(Value::String(_))) {
                     return Err("text block has no string `text`".into());
                 }
-                seen_text = true;
+                seen_content.get_or_insert("a text");
                 &["type", "text"]
             }
+            Some("image") => {
+                check_image_source(block_fields.get("source"))?;
+                seen_content.get_or_insert("an image");
+                &["type", "source"]
+            }
             Some("tool_result") => {
-                if seen_text {
-                    return Err("tool_result block comes after a text block".into());
+                if let Some(kind) = seen_content {
+                    return Err(format!("tool_result block comes after {kind} block"));
                 }
                 let Some(Value::String(id)) = block_fields.get("tool_use_id") else {
                     return Err("tool_result block has no string `tool_use_id`".into());
@@ -308,6 +313,41 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
         }
     }
     Ok(ids)
+}
+
+/// Check an `image` block's `source`: closed, inline base64 of a media
+/// type the contract names, with some data. Not checked: that `data` is
+/// base64, or that it decodes to the format `media_type` names.
+fn check_image_source(source: Option<&Value>) -> Result<(), String> {
+    let Some(source) = source.and_then(Value::as_object) else {
+        return Err("image block has no object `source`".into());
+    };
+    for key in source.keys() {
+        if !["type", "media_type", "data"].contains(&key.as_str()) {
+            return Err(format!(
+                "image source carries a field the contract does not allow: {key:?}"
+            ));
+        }
+    }
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return Err("image source type is not `base64`".into());
+    }
+    match source.get("media_type").and_then(Value::as_str) {
+        Some(media_type)
+            if ImageFormat::ALL
+                .iter()
+                .any(|f| f.media_type() == media_type) => {}
+        other => {
+            return Err(format!(
+                "image block has a media type the contract does not name: {}",
+                other.map_or_else(|| "(none)".to_string(), str::to_string)
+            ));
+        }
+    }
+    if !matches!(source.get("data"), Some(Value::String(data)) if !data.is_empty()) {
+        return Err("image block has no non-empty string `data`".into());
+    }
+    Ok(())
 }
 
 /// Check a whole assistant message and return its tool calls in order.
@@ -344,11 +384,11 @@ mod tests {
     #[test]
     fn a_new_turn_joins_a_trailing_user_message_after_its_results() {
         let mut t = Transcript::default();
-        t.push_user_text("first");
+        t.push_user_content(vec![txt("first")]);
         assert_eq!(t.messages().len(), 1);
         // The previous turn failed: the transcript still ends in the
         // user's text, and the retry joins it as a second block.
-        t.push_user_text("again");
+        t.push_user_content(vec![txt("again")]);
         assert_eq!(t.messages().len(), 1);
         assert_eq!(
             t.messages()[0]["content"],
@@ -363,11 +403,36 @@ mod tests {
         ]);
         // Failed after the results landed: the next text goes after
         // them, in the same message — results before text.
-        t.push_user_text("carry on");
+        t.push_user_content(vec![txt("carry on")]);
         assert_eq!(t.messages().len(), 3);
         let last = &t.messages()[2]["content"];
         assert_eq!(last[0]["type"], "tool_result");
         assert_eq!(last[1], json!({"type": "text", "text": "carry on"}));
+    }
+
+    #[test]
+    fn content_joins_a_trailing_user_message_in_the_order_given() {
+        let mut t = Transcript::default();
+        t.push_assistant(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "t", "input": {}}
+        ]}));
+        t.push_tool_results(vec![
+            json!({"type": "tool_result", "tool_use_id": "c1", "content": "r", "is_error": false}),
+        ]);
+        let image = json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+        }});
+        t.push_user_content(vec![
+            json!({"type": "text", "text": "one"}),
+            image.clone(),
+            json!({"type": "text", "text": "two"}),
+        ]);
+        let content = t.messages().last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[1], json!({"type": "text", "text": "one"}));
+        assert_eq!(content[2], image);
+        assert_eq!(content[3], json!({"type": "text", "text": "two"}));
     }
 
     #[test]
@@ -454,6 +519,9 @@ mod tests {
     fn txt(t: &str) -> Value {
         json!({"type": "text", "text": t})
     }
+    fn img(media_type: &str, data: &str) -> Value {
+        json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+    }
     fn asst(blocks: Vec<Value>) -> Value {
         json!({"role": "assistant", "content": blocks})
     }
@@ -495,6 +563,30 @@ mod tests {
                 {
                     let mut m = exchange();
                     m[2] = user(vec![tr("c1", "r1"), tr("c2", "r2"), txt("again")]);
+                    m
+                },
+                None,
+            ),
+            (
+                "text then an image",
+                vec![user(vec![txt("look"), img("image/png", "iVBORw0KGgo=")])],
+                None,
+            ),
+            (
+                "an image alone",
+                vec![user(vec![img("image/webp", "AAAA")])],
+                None,
+            ),
+            (
+                "an image and text joined after results",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![
+                        tr("c1", "r1"),
+                        tr("c2", "r2"),
+                        img("image/gif", "R0lGODlh"),
+                        txt("again"),
+                    ]);
                     m
                 },
                 None,
@@ -570,7 +662,7 @@ mod tests {
             ),
             (
                 "a user block of unknown type",
-                vec![user(vec![json!({"type": "image"})])],
+                vec![user(vec![json!({"type": "audio"})])],
                 Some((0, "unknown user content block type")),
             ),
             (
@@ -637,6 +729,87 @@ mod tests {
                     m
                 },
                 Some((2, "after a text block")),
+            ),
+            (
+                "an image block with no source",
+                vec![user(vec![json!({"type": "image"})])],
+                Some((0, "no object `source`")),
+            ),
+            (
+                "an image block whose source is not an object",
+                vec![user(vec![json!({"type": "image", "source": "x"})])],
+                Some((0, "no object `source`")),
+            ),
+            (
+                "an image block with an extra field",
+                vec![user(vec![{ let mut b = img("image/png", "AA"); b["extra"] = json!(1); b }])],
+                Some((0, "user content block carries a field")),
+            ),
+            (
+                "an image source with an extra field",
+                vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["extra"] = json!(1); b }])],
+                Some((0, "image source carries a field")),
+            ),
+            (
+                "an image source of type url",
+                vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["type"] = json!("url"); b }])],
+                Some((0, "type is not `base64`")),
+            ),
+            (
+                "an image source with no type",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("type");
+                    b
+                }])],
+                Some((0, "type is not `base64`")),
+            ),
+            (
+                "an image source with no media type",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("media_type");
+                    b
+                }])],
+                Some((0, "media type the contract does not name: (none)")),
+            ),
+            (
+                "an image source with no data",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("data");
+                    b
+                }])],
+                Some((0, "no non-empty string `data`")),
+            ),
+            (
+                "an image of a media type the contract does not name",
+                vec![user(vec![img("image/bmp", "AA")])],
+                Some((0, "media type the contract does not name")),
+            ),
+            (
+                "an image with empty data",
+                vec![user(vec![img("image/png", "")])],
+                Some((0, "non-empty string `data`")),
+            ),
+            (
+                "an image with numeric data",
+                vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["data"] = json!(5); b }])],
+                Some((0, "non-empty string `data`")),
+            ),
+            (
+                "a tool_result after an image block",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![img("image/png", "AA"), tr("c1", "r1"), tr("c2", "r2")]);
+                    m
+                },
+                Some((2, "after an image block")),
+            ),
+            (
+                "an image block in an assistant message",
+                vec![user(vec![txt("a")]), asst(vec![img("image/png", "AA")])],
+                Some((1, "unknown assistant content block type")),
             ),
             (
                 "a missing result",

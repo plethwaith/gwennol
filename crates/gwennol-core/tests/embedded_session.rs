@@ -20,7 +20,10 @@ use gwead::kernel::{Kernel, KernelConfig};
 use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
-use gwennol_core::{Event, EventSink, Session, SessionConfig, SessionError, ToolCall, spi};
+use gwennol_core::{
+    ContentError, Event, EventSink, Image, Session, SessionConfig, SessionError, ToolCall,
+    TurnError, UserContent, spi,
+};
 
 const PROVIDER: &str = "embed_llm";
 
@@ -135,6 +138,46 @@ fn config(tool: &str) -> SessionConfig {
         plugin_configs: [(PROVIDER.to_string(), json!({"answers": answers}))].into(),
         ..SessionConfig::default()
     }
+}
+
+/// A config whose provider's `answers` hold only `first`.
+fn answering(first: Value) -> SessionConfig {
+    SessionConfig {
+        provider: Some(PROVIDER.into()),
+        stream: false,
+        plugin_configs: [(PROVIDER.to_string(), json!({"answers": [first]}))].into(),
+        ..SessionConfig::default()
+    }
+}
+
+/// A config whose provider says "done" in one round.
+fn done() -> SessionConfig {
+    answering(answer(
+        vec![json!({"type": "text", "text": "done"})],
+        "end_turn",
+    ))
+}
+
+/// A config whose provider refuses every turn.
+fn refusing() -> SessionConfig {
+    answering(json!({"error": {"message": "no images", "retryable": false}}))
+}
+
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// A PNG-signed image of `len` bytes.
+fn png(len: usize) -> Image {
+    let mut bytes = PNG_SIGNATURE.to_vec();
+    bytes.resize(len, 0);
+    Image::new(bytes).unwrap()
+}
+
+fn provider_requests(seen: &Seen) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(subject, _)| subject == PROVIDER)
+        .count()
 }
 
 fn names(set: &[&str]) -> BTreeSet<String> {
@@ -618,4 +661,147 @@ async fn every_offered_action_is_held_to_its_own_schema_and_the_result_shape() {
             "{tool}: {events:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_turn_carries_text_and_images_in_the_order_given() {
+    let (kernel, _) = kernel(vec![]);
+    let gif = Image::new(b"GIF89a".to_vec()).unwrap();
+    // Twelve bytes whose standard base64 ends in `++//`.
+    let mut plus_slash = PNG_SIGNATURE.to_vec();
+    plus_slash.extend([0x00, 0xFB, 0xEF, 0xFF]);
+    let plus_slash = Image::new(plus_slash).unwrap();
+    let mut s = Session::new(kernel.clone(), done(), Arc::new(Recorder::default())).unwrap();
+    s.turn_with(
+        vec![
+            "compare".into(),
+            png(8).into(),
+            "with".into(),
+            gif.into(),
+            plus_slash.into(),
+        ],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.transcript()[0],
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "compare"},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "text", "text": "with"},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/gif", "data": "R0lGODlh"}},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoA++//"}}
+        ]})
+    );
+    assert_eq!(s.chat_input()["messages"], json!(s.transcript()));
+
+    let mut second = Session::new(kernel, done(), Arc::new(Recorder::default())).unwrap();
+    second.restore(s.transcript().to_vec()).unwrap();
+    assert_eq!(second.transcript(), s.transcript());
+}
+
+#[tokio::test]
+async fn turn_stores_what_turn_with_stores_for_one_text() {
+    let (kernel, _) = kernel(vec![]);
+    let mut a = Session::new(kernel.clone(), done(), Arc::new(Recorder::default())).unwrap();
+    let mut b = Session::new(kernel, done(), Arc::new(Recorder::default())).unwrap();
+    a.turn("go", &CancellationToken::new()).await.unwrap();
+    b.turn_with(vec!["go".into()], &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(a.transcript(), b.transcript());
+}
+
+#[tokio::test]
+async fn content_is_refused_before_anything_is_stored() {
+    let (kernel, seen) = kernel(vec![]);
+    let sink = Arc::new(Recorder::default());
+    let config = SessionConfig {
+        max_image_bytes: 16,
+        ..done()
+    };
+    let mut s = Session::new(kernel, config, sink.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    let untouched = |s: &Session| {
+        assert!(s.transcript().is_empty());
+        assert!(sink.0.lock().unwrap().is_empty());
+        assert_eq!(provider_requests(&seen), 0);
+    };
+
+    assert_eq!(SessionConfig::default().max_image_bytes, 2 << 20);
+
+    let err = s.turn_with(vec![], &cancel).await.unwrap_err();
+    assert!(
+        matches!(err, TurnError::Content(ContentError::Empty)),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the turn's content was refused: the turn carries no content"
+    );
+    untouched(&s);
+
+    let err = s
+        .turn_with(vec!["look".into(), png(17).into()], &cancel)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TurnError::Content(ContentError::ImageTooLarge {
+                index: 1,
+                bytes: 17,
+                max: 16
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the turn's content was refused: image at position 1 is 17 bytes; \
+         the session's max_image_bytes is 16"
+    );
+    untouched(&s);
+
+    s.turn_with(vec![png(16).into()], &cancel).await.unwrap();
+    assert_eq!(s.transcript().len(), 2);
+}
+
+#[tokio::test]
+async fn an_image_the_provider_refuses_stays_until_restore_removes_it() {
+    let (kernel, _) = kernel(vec![]);
+    let mut s = Session::new(kernel, refusing(), Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    let err = s
+        .turn_with(vec!["look".into(), UserContent::Image(png(8))], &cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(s.transcript().len(), 1);
+    assert_eq!(s.transcript()[0]["content"].as_array().unwrap().len(), 2);
+
+    let err = s.turn("again", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(s.transcript().len(), 1);
+    let content = s.transcript()[0]["content"].as_array().unwrap().clone();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[1]["type"], "image");
+
+    let without: Vec<Value> = content
+        .into_iter()
+        .filter(|block| block["type"] != "image")
+        .collect();
+    s.restore(vec![json!({"role": "user", "content": without})])
+        .unwrap();
+    assert_eq!(
+        s.transcript()[0]["content"],
+        json!([
+            {"type": "text", "text": "look"},
+            {"type": "text", "text": "again"}
+        ])
+    );
 }

@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "name": "LLM_CHAT",
   "displayName": "Chat-model provider",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the vendor answered but the turn failed, a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
@@ -157,7 +157,8 @@
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/TextBlock" },
-              { "$ref": "#/$defs/ToolResultBlock" }
+              { "$ref": "#/$defs/ToolResultBlock" },
+              { "$ref": "#/$defs/ImageBlock" }
             ]
           }
         }
@@ -200,6 +201,27 @@
       "properties": {
         "type": { "const": "text" },
         "text": { "type": "string" }
+      }
+    },
+    "ImageBlock": {
+      "type": "object",
+      "required": ["type", "source"],
+      "additionalProperties": false,
+      "description": "An image the user shows the model, in its position among the message's blocks. User messages only.",
+      "properties": {
+        "type": { "const": "image" },
+        "source": { "$ref": "#/$defs/Base64ImageSource" }
+      }
+    },
+    "Base64ImageSource": {
+      "type": "object",
+      "required": ["type", "media_type", "data"],
+      "additionalProperties": false,
+      "description": "The image's bytes, inline. `type` is a discriminator: a later version of this contract can add another source beside this one.",
+      "properties": {
+        "type": { "const": "base64" },
+        "media_type": { "enum": ["image/jpeg", "image/png", "image/gif", "image/webp"] },
+        "data": { "type": "string", "minLength": 1, "description": "The file's bytes in standard padded base64 (RFC 4648 section 4)." }
       }
     },
     "ToolUseBlock": {
