@@ -126,6 +126,33 @@ impl Transcript {
         self.messages
             .push(json!({"role": "user", "content": results}));
     }
+
+    /// Remove and return the user content no assistant message answers:
+    /// the blocks of the last message after its leading `tool_result`
+    /// blocks, when that message is a user message, in stored order. The
+    /// results stay, so every call keeps its answer; a message left with
+    /// no blocks is removed, so what remains passes
+    /// [`Self::from_messages`].
+    pub(crate) fn retract_unanswered(&mut self) -> Vec<Value> {
+        let Some(last) = self.messages.last_mut() else {
+            return Vec::new();
+        };
+        if last["role"] != "user" {
+            return Vec::new();
+        }
+        let Some(content) = last["content"].as_array_mut() else {
+            return Vec::new();
+        };
+        let results = content
+            .iter()
+            .take_while(|block| block["type"] == "tool_result")
+            .count();
+        let retracted = content.split_off(results);
+        if content.is_empty() {
+            self.messages.pop();
+        }
+        retracted
+    }
 }
 
 /// An assistant message rebuilt from a stream, per the contract's rule:
@@ -535,6 +562,72 @@ mod tests {
     }
     fn tool_use(id: &str, name: &str) -> Value {
         json!({"type": "tool_use", "id": id, "name": name, "input": {}})
+    }
+
+    #[test]
+    fn retract_unanswered_takes_the_user_content_no_answer_follows() {
+        let exchange = || {
+            vec![
+                user(vec![txt("go")]),
+                asst(vec![txt("ok"), tool_use("c1", "a"), tool_use("c2", "b")]),
+                user(vec![tr("c1", "r1"), tr("c2", "r2")]),
+            ]
+        };
+        let mut after_results = exchange();
+        after_results[2] = user(vec![
+            tr("c1", "r1"),
+            tr("c2", "r2"),
+            img_ref("image/png", "k"),
+            txt("again"),
+        ]);
+        let mut kept_results = exchange();
+        kept_results[2] = user(vec![tr("c1", "r1"), tr("c2", "r2")]);
+        /// A case's name, its messages, the blocks returned, and the
+        /// messages left.
+        type Case<'a> = (&'a str, Vec<Value>, Vec<Value>, Vec<Value>);
+        let table: Vec<Case> = vec![
+            ("empty", vec![], vec![], vec![]),
+            (
+                "ends in an answer",
+                vec![user(vec![txt("go")]), asst(vec![txt("yo")])],
+                vec![],
+                vec![user(vec![txt("go")]), asst(vec![txt("yo")])],
+            ),
+            (
+                "an image alone",
+                vec![user(vec![img("image/png", "AA")])],
+                vec![img("image/png", "AA")],
+                vec![],
+            ),
+            ("results only", exchange(), vec![], exchange()),
+            (
+                "content after results",
+                after_results,
+                vec![img_ref("image/png", "k"), txt("again")],
+                kept_results,
+            ),
+            (
+                "several turns' content",
+                vec![
+                    user(vec![txt("go")]),
+                    asst(vec![txt("yo")]),
+                    user(vec![txt("a"), img("image/gif", "R0lGODlh"), txt("b")]),
+                ],
+                vec![txt("a"), img("image/gif", "R0lGODlh"), txt("b")],
+                vec![user(vec![txt("go")]), asst(vec![txt("yo")])],
+            ),
+        ];
+        for (name, messages, returned, left) in table {
+            let mut t = Transcript::from_messages(messages).unwrap();
+            assert_eq!(t.retract_unanswered(), returned, "{name}: returned");
+            assert_eq!(t.messages(), left.as_slice(), "{name}: left");
+            assert!(
+                Transcript::from_messages(t.messages().to_vec()).is_ok(),
+                "{name}: restore accepts what is left"
+            );
+            assert_eq!(t.retract_unanswered(), Vec::<Value>::new(), "{name}: twice");
+            assert_eq!(t.messages(), left.as_slice(), "{name}: twice, left");
+        }
     }
 
     #[test]

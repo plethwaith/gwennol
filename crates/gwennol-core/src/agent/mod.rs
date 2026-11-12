@@ -85,7 +85,8 @@
 //!   that fails or is cancelled once its content is stored therefore
 //!   leaves the transcript ending in a user message — the user's
 //!   content, or the last round's results — and the next turn's content
-//!   joins that message. Nothing that happened is lost from the model's
+//!   joins that message. [`Session::retract_unanswered`] takes back the
+//!   user's content at that end; tool results stay. Nothing that happened is lost from the model's
 //!   view, and nothing half-happened enters it.
 //!
 //! What the loop deliberately does not do: choose policy, persist
@@ -576,6 +577,28 @@ impl Session {
         Ok(())
     }
 
+    /// Take back the user content no assistant message answers, between
+    /// turns, and return it.
+    ///
+    /// A turn that fails or is cancelled once its content is stored leaves
+    /// that content at the end of the transcript, and the next turn sends it
+    /// again (see the module docs). This removes every text and image block
+    /// of the last message when that message is a user message, whichever
+    /// turns stored them and however they ended: several failed turns in a
+    /// row give back all their content, and so does a turn that completed
+    /// with an empty message the loop did not store. The blocks come back
+    /// in stored order, exactly as [`Self::transcript`] showed them, so a
+    /// frontend can put the user's text back in its input.
+    ///
+    /// Tool results stay, so every call the model made keeps its answer;
+    /// content an assistant message has answered is not taken back. A user
+    /// message left with no blocks is removed, and what remains is a list
+    /// [`Self::restore`] accepts. The list is empty when the transcript does
+    /// not end in user content. No event is sent.
+    pub fn retract_unanswered(&mut self) -> Vec<Value> {
+        self.transcript.retract_unanswered()
+    }
+
     /// Send one event to wherever this session's events go.
     fn emit(&self, event: Event) {
         self.events.emit(event);
@@ -619,7 +642,8 @@ impl Session {
     /// vendor's or the provider's to answer, as a [`TurnError::Provider`].
     ///
     /// Content of a turn that fails after it is stored stays in the
-    /// transcript, so an image the provider refused is sent again.
+    /// transcript, so an image the provider refused is sent again until
+    /// [`Self::retract_unanswered`] removes it.
     pub async fn turn_with(
         &mut self,
         content: Vec<UserContent>,
