@@ -34,7 +34,7 @@ fn fixture() -> &'static Fixture {
         // behind the /var symlink, and future host_fs tests here would
         // compare approval paths against workspace joins.
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
-        let mut kernel = gwennol_core::boot(Arc::new(Permissive), workspace).unwrap();
+        let mut kernel = gwennol_host::boot(Arc::new(Permissive), workspace).unwrap();
         for plugin in [fixture_provider(), fixture_tool(), decoy_tool()] {
             kernel
                 .register_plugin_from_json(&plugin.to_string())

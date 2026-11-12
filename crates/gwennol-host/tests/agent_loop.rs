@@ -28,11 +28,12 @@ use std::time::Duration;
 use gwead::kernel::Kernel;
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_core::{
-    Access, ApprovalRequest, Decision, Event, EventSink, Operator, Session, SessionConfig,
-    SessionError, StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
+    Event, EventSink, Session, SessionConfig, SessionError, StopReason, ToolCall, TurnError,
+    TurnOutcome, spi,
 };
+use gwennol_host::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
+use gwennol_host::{Access, ApprovalRequest, Decision, Operator, OperatorEvents, Turn};
 
 mod common;
 use common::{assert_conforms, contracts};
@@ -162,7 +163,7 @@ impl Wake for Woken {
 
 /// Approves everything except plugins named `denied*`; holds approvals
 /// for plugins named `gated*` until the test releases them; records
-/// every request; feeds `Session::run` from a queue.
+/// every request; feeds `gwennol_host::run` from a queue.
 #[derive(Default)]
 struct Harness {
     requests: Mutex<Vec<ApprovalRequest>>,
@@ -230,7 +231,7 @@ fn fixture() -> &'static Fixture {
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         std::fs::write(workspace.join("hello.txt"), "hello from the workspace\n").unwrap();
         let harness = Arc::new(Harness::default());
-        let mut kernel = gwennol_core::boot(harness.clone(), workspace.clone()).unwrap();
+        let mut kernel = gwennol_host::boot(harness.clone(), workspace.clone()).unwrap();
         for plugin in fixture_plugins() {
             kernel
                 .register_plugin_from_json(&plugin.to_string())
@@ -277,9 +278,19 @@ fn config(route: &str) -> SessionConfig {
     }
 }
 
+/// A session on the fixture's kernel whose events go to the fixture's
+/// operator, as a frontend that booted the host starts one.
+fn new_session(kernel: Arc<Kernel>, config: SessionConfig) -> Result<Session, SessionError> {
+    Session::with_events(
+        kernel,
+        config,
+        Arc::new(OperatorEvents(fixture().harness.clone())),
+    )
+}
+
 /// A streamed session against one stub route.
 fn session(route: &str) -> Session {
-    Session::new(fixture().kernel.clone(), config(route)).unwrap()
+    new_session(fixture().kernel.clone(), config(route)).unwrap()
 }
 
 /// A buffered session answering from canned responses.
@@ -287,7 +298,7 @@ fn canned(answers: Vec<Value>) -> Session {
     let f = fixture();
     let mut configs = BTreeMap::new();
     configs.insert(CANNED_LLM.to_string(), json!({"answers": answers}));
-    Session::new(
+    new_session(
         f.kernel.clone(),
         SessionConfig {
             provider: Some(CANNED_LLM.into()),
@@ -406,7 +417,7 @@ fn fixture_plugins() -> Vec<Value> {
             "forger",
             &[],
             json!([{"id": "t", "type": "throw_error", "params": {
-                "code": gwennol_core::steps::CANCELLED_CODE, "message": "forged"}}]),
+                "code": gwennol_core::cancel::CANCELLED_CODE, "message": "forged"}}]),
         ),
         tool_plugin(
             "fixture_slow",
@@ -736,14 +747,14 @@ async fn a_session_needs_one_named_or_unambiguous_provider() {
     let f = fixture();
     // Two fulfillers are registered: resolving by role refuses rather
     // than picking silently.
-    let err = Session::new(f.kernel.clone(), SessionConfig::default()).unwrap_err();
+    let err = new_session(f.kernel.clone(), SessionConfig::default()).unwrap_err();
     match err {
         SessionError::AmbiguousProvider(names) => {
             assert_eq!(names, vec![CANNED_LLM.to_string(), STREAM_LLM.to_string()]);
         }
         other => panic!("{other}"),
     }
-    let err = Session::new(
+    let err = new_session(
         f.kernel.clone(),
         SessionConfig {
             provider: Some("fixture_echo".into()),
@@ -982,9 +993,12 @@ async fn run_takes_turns_from_the_operator_until_input_ends() {
     }
     let cancel = CancellationToken::new();
     let (outcome, events) = with_events(async {
-        tokio::time::timeout(Duration::from_secs(30), s.run(&cancel))
-            .await
-            .unwrap()
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel),
+        )
+        .await
+        .unwrap()
     })
     .await;
     outcome.unwrap();
@@ -1175,7 +1189,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     // The backoff is clamped before the first wait and doubled without
     // overflow: an hour's initial backoff under a millisecond ceiling
     // retries at once, and a maximal one never panics the loop.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1188,7 +1202,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     )
     .unwrap();
     assert_eq!(turn(&mut s, "clamped").await.unwrap().rounds, 1);
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1256,7 +1270,7 @@ async fn off_contract_streams_fail_the_turn_closed() {
 
     // The event cap is the loop's bound on buffering.
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_event_bytes: 4096,
@@ -1279,7 +1293,7 @@ async fn off_contract_streams_fail_the_turn_closed() {
 async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
     let mut cfg = config("/stall");
     cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] = json!(500);
-    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
+    let mut s = new_session(fixture().kernel.clone(), cfg).unwrap();
     let (outcome, events) = with_events(async { turn(&mut s, "stall").await }).await;
     let err = outcome.unwrap_err();
     assert!(
@@ -1313,7 +1327,7 @@ async fn a_failure_the_cut_finds_waiting_ends_the_turn_cancelled_with_its_text()
     let mut cfg = config("/hold");
     cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] =
         json!(IDLE.as_millis() as u64);
-    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
+    let mut s = new_session(fixture().kernel.clone(), cfg).unwrap();
     let cancel = CancellationToken::new();
     let sink = Arc::new(Sink::default());
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
@@ -1431,7 +1445,7 @@ async fn refusal_and_max_tokens_end_the_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_round_limit_bounds_a_turn() {
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_rounds: 3,
@@ -1447,7 +1461,7 @@ async fn the_round_limit_bounds_a_turn() {
     assert_eq!(s.transcript()[6]["role"], "user");
 
     // Zero is read as one, and reported as what ran.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_rounds: 0,
@@ -1469,7 +1483,7 @@ async fn the_round_limit_bounds_a_turn() {
 async fn a_new_turn_joins_the_trailing_user_message_after_a_failed_one() {
     let f = fixture();
     // One attempt only: the first turn fails on the stub's first answer.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1636,19 +1650,6 @@ async fn every_transcript_the_loop_stores_can_be_restored() {
             .unwrap_or_else(|e| panic!("{route}: {e}: {stored:?}"));
         assert_eq!(fresh.transcript(), &stored[..], "{route}");
     }
-}
-
-/// The loop's own context key is refused from `Session::new` as well.
-#[test]
-fn the_loops_own_context_key_is_refused_by_new() {
-    let config = SessionConfig {
-        context: json!({"gwennol": {}}).as_object().unwrap().clone(),
-        ..config("/text")
-    };
-    assert!(matches!(
-        Session::new(fixture().kernel.clone(), config),
-        Err(SessionError::ReservedContextKey)
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1845,7 +1846,7 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
     let (outcomes, events) = with_events(async {
         let mut outcomes = Vec::new();
         for _ in 0..16 {
-            outcomes.push(s.run(&cancel).await);
+            outcomes.push(gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel).await);
         }
         outcomes
     })
@@ -1871,7 +1872,7 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_during_the_retry_backoff_ends_the_turn_cancelled() {
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {

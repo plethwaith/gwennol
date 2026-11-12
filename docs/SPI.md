@@ -3,7 +3,7 @@
 Gwennol defines two Gwead roles: `LLM_CHAT`, implemented by model provider
 plugins, and `TOOL`, implemented by tool plugins. The contract documents
 live in [`plugins/spi/`](../plugins/spi/) and are registered by
-`gwennol_core::boot` before any plugin can claim a role. This page is the
+`gwennol_host::boot` before any plugin can claim a role. This page is the
 prose half of those contracts: the wire shapes, and the rules the JSON
 schemas cannot state.
 

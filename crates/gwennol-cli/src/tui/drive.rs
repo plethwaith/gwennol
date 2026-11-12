@@ -1,7 +1,7 @@
 //! The loop: idle until a turn is submitted, then drive
 //! [`Session::turn`] itself, one turn at a time (D7), keys always
 //! polled before the turn future or a redraw so a queued `/exit`
-//! is never left behind. `Session::run` is never called: it stops at
+//! is never left behind. `gwennol_host::run` is never called: it stops at
 //! the first turn that does not complete, and a session must carry on
 //! past a failed or cancelled one. Keys go to an open approval prompt
 //! before anything else typed reaches the editor or the token (a
@@ -427,7 +427,7 @@ mod tests {
         use std::path::Path;
         use std::task::{Context, Poll, Waker};
 
-        use gwennol_core::{Decision, Operator};
+        use gwennol_host::{Decision, Operator};
 
         use crate::tui::prompt::tests::{op, write_req};
 
@@ -658,7 +658,7 @@ mod tests {
         use std::path::Path;
         use std::task::{Context, Poll, Waker};
 
-        use gwennol_core::Operator;
+        use gwennol_host::Operator;
 
         use crate::tui::prompt::tests::{op, write_req};
 

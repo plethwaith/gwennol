@@ -759,7 +759,8 @@ pub fn render(ui: &Ui, frame: &mut Frame) {
 
 #[cfg(test)]
 mod tests {
-    use gwennol_core::{Access, ApprovalRequest, Failure, ToolCall};
+    use gwennol_core::{Failure, ToolCall};
+    use gwennol_host::{Access, ApprovalRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

@@ -1,7 +1,8 @@
-//! A session on a kernel `boot` did not build, in a process where no
-//! host is installed: the embedder's path through the loop.
+//! A session on a kernel this crate did not build: the embedder's path
+//! through the loop.
 //!
-//! This binary never calls `boot` or `boot_with`. Its kernels carry
+//! This crate has no host to boot, and this binary links no native step
+//! bodies. Its kernels carry
 //! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools;
 //! the provider and each tool declare a secret so the kernel consults the
 //! resolver on every invocation (`gwead::kernel::secrets`: a non-empty declaration is what
@@ -155,12 +156,8 @@ fn one(seen: &Seen, subject: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_sink_session_runs_without_an_installed_host() {
+async fn a_sink_session_receives_its_events_in_order() {
     let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
-    assert!(matches!(
-        Session::new(kernel.clone(), config("alpha")),
-        Err(SessionError::NotBooted)
-    ));
     let sink = Arc::new(Recorder::default());
     let mut s = Session::with_events(kernel, config("alpha"), sink.clone()).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
@@ -185,29 +182,25 @@ async fn a_sink_session_runs_without_an_installed_host() {
     );
 }
 
-#[tokio::test]
-async fn new_without_a_host_is_not_booted_before_any_other_refusal() {
-    let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
-    let config = SessionConfig {
-        context: context(json!({"gwennol": {}})),
-        tool_plugins: Some(names(&["nope"])),
-        provider: Some("nope".into()),
-        ..config("alpha")
-    };
-    assert!(matches!(
-        Session::new(kernel, config),
-        Err(SessionError::NotBooted)
-    ));
-}
-
-#[tokio::test]
-async fn run_on_a_sink_session_returns_without_a_turn() {
-    let (kernel, seen) = kernel(vec![tool("tool_a", "alpha")]);
-    let mut s =
-        Session::with_events(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
-    s.run(&CancellationToken::new()).await.unwrap();
-    assert!(seen.lock().unwrap().is_empty(), "no provider call");
-    assert!(s.transcript().is_empty());
+/// The table is not empty here: gwead submits its own intrinsics, so what
+/// this observes is that none of the host's six step bodies is among them.
+#[test]
+fn the_loop_alone_links_no_native_step_bodies() {
+    let table = NativeStepImplTable::discover().unwrap();
+    assert!(
+        table.get("gwead.intrinsics.let").is_some(),
+        "the table is the one discover builds"
+    );
+    for name in [
+        "gwennol.host_fs.read",
+        "gwennol.host_fs.write",
+        "gwennol.host_fs.list",
+        "gwennol.host_process.run",
+        "gwennol.host_http.get",
+        "gwennol.host_http.post",
+    ] {
+        assert!(table.get(name).is_none(), "{name} is linked");
+    }
 }
 
 #[tokio::test]

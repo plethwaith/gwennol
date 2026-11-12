@@ -36,6 +36,7 @@ use gwead::kernel::host_api::PluginErrorPayload;
 use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
+use gwennol_core::cancel::{CANCELLED_AT_APPROVAL, CANCELLED_CODE};
 
 /// The boxed future a native step implementation returns.
 pub(crate) type StepFuture<'a> =
@@ -50,20 +51,6 @@ pub(crate) type StepFuture<'a> =
 pub(crate) fn capped(requested: u64, ceiling: u64) -> usize {
     requested.min(ceiling) as usize
 }
-
-/// The error code a host step's approval fails with when it was
-/// withdrawn: a `KernelError::PluginError` carrying it, so a consumer —
-/// the agent loop — recognises the withdrawal as data and never by
-/// reading error text or guessing from a token's state. The one
-/// cancellation a host step reports structurally, because it carries
-/// more than [`StepError::Cancelled`] can: nothing ran.
-pub const CANCELLED_CODE: &str = "gwennol.cancelled";
-
-/// The `params.phase` value on a cancellation that withdrew the step's
-/// approval: the operator never answered, so nothing was done. Every
-/// other cancellation lands somewhere in the work, where the step
-/// cannot say how far it got.
-pub const CANCELLED_AT_APPROVAL: &str = "approval";
 
 /// The typed error a host step returns when it observed its
 /// cancellation token in the middle of its work: the kernel's watchdog

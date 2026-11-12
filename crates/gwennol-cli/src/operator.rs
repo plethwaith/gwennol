@@ -22,7 +22,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn};
+use gwennol_core::Event;
+use gwennol_host::{ApprovalRequest, Decision, Operator, Turn};
 
 use crate::policy::Policy;
 use crate::record::{self, SharedTrace};

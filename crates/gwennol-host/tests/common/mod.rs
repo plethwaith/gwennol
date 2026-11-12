@@ -22,7 +22,8 @@ use boon::{Compiler, SchemaIndex, Schemas};
 use gwead::kernel::streams::{STREAM_EOF, StreamRegistry, read_async_shared};
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn, spi};
+use gwennol_core::{Event, spi};
+use gwennol_host::{ApprovalRequest, Decision, Operator, Turn};
 
 /// Allows everything, knows no secrets: contract and substrate dispatch
 /// need no policy.

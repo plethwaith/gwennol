@@ -1,6 +1,6 @@
 # The guest-side half of the plugin substrate: everything in this crate
 # runs *inside* a Gwead script-runtime wasm module, never in the host
-# process. gwennol-core must never depend on it.
+# process. Neither gwennol-core nor gwennol-host may depend on it outside their tests.
 #
 # Not yet published: the crate is consumed by path from the bundled guest
 # crates in this workspace. Publishing becomes worthwhile when plugins

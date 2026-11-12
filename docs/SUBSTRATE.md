@@ -12,7 +12,7 @@ own "script runtime", with the step's `source` string selecting an
 entry point rather than carrying code. The helper is
 [`crates/gwennol-guest`](../crates/gwennol-guest); the worked example
 is [`crates/sse-guest`](../crates/sse-guest) with its integration
-suite at `crates/gwennol-core/tests/guest_substrate.rs`.
+suite at `crates/gwennol-host/tests/guest_substrate.rs`.
 
 ## The reality the decision was made against
 
@@ -131,7 +131,7 @@ of that language would execute inside this plugin's code — listing a
 name is a trust statement about code. Under the naming convention
 above the blast radius is already narrow (a plugin's language is its
 own name, so only its own steps select its module), but the gate is
-enforced regardless, and `gwennol_core::boot` trusts nobody: bundling
+enforced regardless, and `gwennol_host::boot` trusts nobody: bundling
 a guest-backed plugin means going through `boot_with` and saying so.
 
 Secrets stay narrow the same way: a script step's `passSecrets`

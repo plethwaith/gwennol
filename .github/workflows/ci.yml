@@ -22,7 +22,7 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # The path-based directory fallback's Redox shape, linted (see the
       # Tests job for what running it covers).
-      - run: cargo clippy --locked -p gwennol-core --all-targets -- -D warnings
+      - run: cargo clippy --locked -p gwennol-host --all-targets -- -D warnings
         env:
           GWENNOL_NO_DIR_HANDLES: "1"
 
@@ -42,7 +42,7 @@ jobs:
       # here; forcing its cfg off on this one runs its Redox shape (unix
       # without handles), less the pins of the guarantees only handles
       # make. The non-unix arms still compile nowhere in CI.
-      - run: cargo test --locked -p gwennol-core
+      - run: cargo test --locked -p gwennol-host
         env:
           GWENNOL_NO_DIR_HANDLES: "1"
       # The documented bundling command, as a user would run it: the

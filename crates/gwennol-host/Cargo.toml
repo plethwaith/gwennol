@@ -1,0 +1,66 @@
+[package]
+name = "gwennol-host"
+description = "The Gwennol host: a Gwead kernel configured with the native filesystem, process and HTTP steps, the Operator trait that approves them, and the plugin manifests that publish them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["agent", "llm", "wasm", "gwead"]
+categories = ["development-tools"]
+# The integration suites cannot run from a published tarball — they use
+# path-only dev-dependencies (stripped by `cargo package`) and shell
+# out to build workspace crates — and shipping them would leave the
+# package with test files that no longer compile. `cargo package`'s
+# verify step builds only the lib, so nothing else would catch that.
+exclude = ["tests/"]
+
+[dependencies]
+gwennol-core = { path = "../gwennol-core" }
+gwead.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+async-trait.workspace = true
+# `start_paused = true` tests (the idle-timeout tests in `steps/http.rs`)
+# need the mocked clock this feature adds. `cargo test` / `clippy
+# --all-targets` unify it into every crate's `tokio` for those builds —
+# Cargo unifies features per package, dev-dependencies included,
+# whenever a dev target is compiled — but this workspace's own
+# `resolver = "3"` keeps it out of the *normal* dependency graph, so
+# nothing shipped links it (`cargo tree --edges normal` carries no
+# `test-util`).
+tokio = { workspace = true, features = ["test-util"] }
+# Guest wasm modules travel inline in plugin manifests as base64; the
+# substrate tests encode the compiled example guest with it.
+base64 = "0.22"
+# The substrate tests pin gwennol-guest's re-declared STREAM_* codes
+# against gwead's, and build the example guest's manifest from the
+# names sse-guest itself exports. Path-only dev-dependencies, stripped
+# by `cargo package`.
+gwennol-guest = { path = "../gwennol-guest" }
+sse-guest = { path = "../sse-guest" }
+# The bundled plugins suite builds the committed manifests through the
+# same bundler `cargo xtask bundle` runs. Path-only, stripped by
+# `cargo package`.
+#
+# `provider-anthropic` and `tool-edit` are not dev-dependencies: both
+# invoke `gwennol_guest::entrypoints!`, which exports unmangled `alloc`
+# and `execute`, so two of them linked into one test binary can fail
+# with duplicate symbols.
+xtask = { path = "../xtask" }
+# The integration suites pin fixture payloads to the SPI contract
+# schemas with the same validator the loop uses on tool arguments.
+boon = "0.6"

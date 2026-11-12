@@ -6,11 +6,11 @@
 //! directly; `editor` is the line editor: history, word navigation,
 //! bracketed paste, slash commands; `ui` holds the pane's entries, the
 //! turn's state and the editor, and maps loop [`gwennol_core::Event`]s
-//! onto them; `operator` is the [`gwennol_core::Operator`] that turns
+//! onto them; `operator` is the [`gwennol_host::Operator`] that turns
 //! approvals and events into pane updates; `drive` is the loop itself,
 //! driving [`gwennol_core::agent::Session::turn`] one turn at a time so
 //! a failed or cancelled turn leaves the session running rather than
-//! ending it, as [`gwennol_core::agent::Session::run`] would; `prompt`
+//! ending it, as [`gwennol_host::run`] would; `prompt`
 //! is the approval prompt a request no rule decides opens in the
 //! pane; `pane` is the pane's own keys: paging, and focusing a tool
 //! call or result to expand it.
@@ -155,7 +155,7 @@ mod tests {
     /// one (D6): a session asks at a prompt for what no rule
     /// decides, so "every request will be denied" is false there,
     /// and it goes only to the log. This is the only unit test in
-    /// this crate that boots the host (`gwennol_core::host`'s
+    /// this crate that boots the host (`gwennol_host::host`'s
     /// `OnceLock` installs once per process, and `boot_with` fails
     /// every call after the first with `BootError::AlreadyInstalled`;
     /// nothing else here reaches it). An explicit `--secret` rule

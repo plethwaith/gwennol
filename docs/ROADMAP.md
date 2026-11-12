@@ -8,9 +8,10 @@ feature-complete rival to existing harnesses.
 
 ## Architecture (decided)
 
-- **Two layers.** `gwennol-core` is the host library: Gwead `KernelConfig`,
-  the native host step types, bundled SPI and plugin manifests, the agent
-  loop, and the `Operator` trait. Frontends implement `Operator`
+- **Two layers.** `gwennol-core` is the agent loop and the SPI contracts it
+  consumes, on any Gwead kernel; `gwennol-host` is the host: Gwead
+  `KernelConfig`, the native host step types, the host plugin manifests, and
+  the `Operator` trait. Frontends implement `Operator`
   (approve / secret / emit / input) and own *all* policy. CLI first, then a
   TUI, later web/desktop — each a second `Operator`, never a rewrite.
 - **Everything model-shaped is a plugin.** The `LLM_CHAT` SPI is implemented
@@ -361,7 +362,7 @@ prompt exists to paper over it.
   a choice someone made, even for the bundled provider.
 - **Owed to milestone 1:** the directory-handle (`openat`-family)
   write that closes the parent-swap race the milestone-1 approval
-  tolerated under interactive review. It is a `gwennol-core` change,
+  tolerated under interactive review. It is a `gwennol-host` change,
   not a frontend one, and landed as its own change after this
   milestone (`steps::dir`, which `host_fs.list` shares), pinned by a
   write and a listing whose directory is swapped for a symlink while
@@ -393,7 +394,7 @@ prompt exists to paper over it.
   cancelling the turn does, and an answer whose receiver is gone is
   ignored.
 - **Settled: the frontend drives `turn`, one token per turn.**
-  `Session::run` stops at the first turn that does not complete; a
+  `gwennol_host::run` stops at the first turn that does not complete; a
   session must continue past a failed or cancelled one, so the loop
   awaits the editor, runs each turn on a fresh token, and shows its
   outcome line.

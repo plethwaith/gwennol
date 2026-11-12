@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use gwennol_core::Decision;
+use gwennol_host::Decision;
 use serde::Deserialize;
 
 use crate::policy::{RuleSpec, Source};
@@ -81,7 +81,7 @@ pub enum EnvMode {
     #[default]
     Allowlist,
     /// The whole environment this process was launched with. An
-    /// explicit choice: see `gwennol_core::ProcessEnv`.
+    /// explicit choice: see `gwennol_host::ProcessEnv`.
     Inherit,
 }
 
