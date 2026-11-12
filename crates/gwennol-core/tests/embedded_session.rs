@@ -185,8 +185,7 @@ async fn a_sink_session_receives_its_events_in_order() {
 /// Gwead submits two entries of its own to this table,
 /// `gwead.intrinsics.throw_error` and `gwead.intrinsics.let`; the table
 /// holds those two and nothing else, so none of the host's six step bodies
-/// is among them. `NativeStepImplTable` exposes `get` and `len` but no way
-/// to list its names, so the count is the only way to say "nothing else".
+/// is among them.
 #[test]
 fn the_table_holds_only_the_kernels_own_entries() {
     let table = NativeStepImplTable::discover().unwrap();

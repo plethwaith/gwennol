@@ -2,8 +2,8 @@
 //!
 //! Gwennol defines two roles: [`llm_chat`] for model providers and [`tool`]
 //! for model-callable tools. The contract documents live in the repository
-//! at `plugins/spi/` and are embedded here; [`register`] registers them
-//! before any plugin can claim a role, because Gwead checks a plugin
+//! at `plugins/spi/` and are embedded here; [`register`] registers them,
+//! and must run before any plugin claims a role, because Gwead checks a plugin
 //! against a role's contract only when the contract is already registered —
 //! a claim on an unknown role loads with nothing but a warning.
 //!
