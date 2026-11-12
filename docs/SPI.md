@@ -313,12 +313,11 @@ claimed the role.
 A session can also offer a chosen subset: `SessionConfig::tool_plugins`
 names `TOOL` plugins (by plugin name, the unit a manifest grants authority
 to), and `spi::harvest_selected` harvests only those; a selected plugin
-brings all its tools. The selection applies
-before the duplicate refusal above, so two plugins that advertise one tool
-name can share a kernel as long as every session on it selects at most one
-of them (a session whose `tool_plugins` is `None` offers both, and is
-refused). A name that offers no tool is refused
-(`HarvestError::NoSuchToolPlugin`).
+brings all its tools. The selection applies before the duplicate refusal
+above, so two plugins that advertise one tool name can share a kernel as
+long as every session on it selects at most one of them (a session whose
+`tool_plugins` is `None` offers both, and is refused). A name that offers
+no tool is refused (`HarvestError::NoSuchToolPlugin`).
 
 ### A plugin with several tools
 
