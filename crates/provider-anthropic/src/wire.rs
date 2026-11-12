@@ -11,8 +11,10 @@
 //!   pass through verbatim and `messages` nearly so — the rewrite is
 //!   confined to `opaque` blocks: this provider's are unwrapped back
 //!   into the vendor blocks they carry, another provider's are dropped
-//!   with a note. A user message's blocks, the contract's `image` block
-//!   among them, pass through verbatim and in place. What else needs
+//!   with a note. A user message's blocks pass through verbatim and in
+//!   place, an `image` block with a `base64` source among them. `chat`
+//!   declines a turn holding an image with any other source before a
+//!   request is built ([`unsupported_image_source`]). What else needs
 //!   code is the defaults and the knobs
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
 //!   exclusions").
@@ -276,9 +278,8 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     })
 }
 
-/// Why a turn failed, with the vendor's answer in hand — the contract's
-/// `Failure`, carried either as the buffered `{"error": …}` output or as
-/// the stream's `error` event.
+/// Why a turn failed — the contract's `Failure`, carried either as the
+/// `{"error": …}` output or as the stream's `error` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     /// Human-readable, informational.
@@ -322,10 +323,46 @@ impl Failure {
         Value::Object(fields)
     }
 
-    /// The contract's buffered failed form.
+    /// The contract's failed form, `{"error": …}`.
     pub fn into_buffered_output(self) -> Value {
         json!({ "error": Value::Object(self.fields()) })
     }
+}
+
+/// The failure for the first image block whose source is not inline
+/// bytes, scanning `input`'s messages in order, or `None` when every
+/// image is `base64`.
+///
+/// Fail-closed: every source type but `base64` is declined, not sent to
+/// the vendor, so a source this provider cannot send never reaches it.
+/// Nothing is dispatched before this runs.
+pub fn unsupported_image_source(input: &Value) -> Option<Failure> {
+    let messages = input.get("messages")?.as_array()?;
+    for (i, message) in messages.iter().enumerate() {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+            let kind = block
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str);
+            if kind != Some("base64") {
+                let shown = kind.map_or_else(|| "missing".to_string(), |t| format!("{t:?}"));
+                return Some(Failure::new(
+                    format!(
+                        "message {i}: an image block's source type is {shown}; this provider sends only inline (base64) image bytes"
+                    ),
+                    Some(false),
+                    "unsupported_image_source",
+                ));
+            }
+        }
+    }
+    None
 }
 
 use gwennol_guest::retryable_http_status as retryable_status;
@@ -1163,6 +1200,71 @@ mod tests {
         let r = build_request(&input, &json!({})).unwrap();
         assert_eq!(r.body["messages"], input["messages"]);
         assert!(r.dropped.is_empty(), "{:?}", r.dropped);
+    }
+
+    #[test]
+    fn only_inline_image_sources_are_sent() {
+        let inline = json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+        }});
+        let text = json!({"type": "text", "text": "t"});
+        let source = |source: Value| json!({"type": "image", "source": source});
+        let reference = source(json!({
+            "type": "reference", "media_type": "image/png", "reference": "a.png"
+        }));
+        let user = |blocks: Vec<Value>| json!({"role": "user", "content": blocks});
+
+        let ok = json!({"messages": [user(vec![text.clone(), inline.clone()])]});
+        assert_eq!(unsupported_image_source(&ok), None);
+
+        let first = json!({"messages": [user(vec![text.clone(), reference.clone()])]});
+        assert_eq!(
+            unsupported_image_source(&first),
+            Some(Failure {
+                message: "message 0: an image block's source type is \"reference\"; this provider sends only inline (base64) image bytes".into(),
+                retryable: Some(false),
+                kind: Some("unsupported_image_source".into()),
+            })
+        );
+
+        let later = json!({"messages": [
+            user(vec![inline.clone()]),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![reference.clone()]),
+        ]});
+        assert!(
+            unsupported_image_source(&later)
+                .unwrap()
+                .message
+                .starts_with("message 2: an image block's source type is \"reference\"; ")
+        );
+
+        let older = json!({"messages": [
+            user(vec![text.clone(), reference.clone()]),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![text.clone()]),
+        ]});
+        assert!(
+            unsupported_image_source(&older)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"reference\"; ")
+        );
+
+        let untyped = json!({"messages": [user(vec![source(json!({"data": "x"}))])]});
+        assert!(
+            unsupported_image_source(&untyped)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is missing; ")
+        );
+        let url = json!({"messages": [user(vec![source(json!({"type": "url"}))])]});
+        assert!(
+            unsupported_image_source(&url)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"url\"; ")
+        );
     }
 
     #[test]

@@ -1,9 +1,12 @@
-//! What a user turn can carry: text, and images.
+//! What a user turn can carry: text, images, and references to images the
+//! provider resolves.
 //!
 //! [`Session::turn_with`](crate::Session::turn_with) takes a list of
 //! [`UserContent`] and stores it as one run of blocks, in the order given.
 //! An [`Image`] is built from a file's bytes alone: its format is read
-//! from how the bytes start, so a caller never labels one.
+//! from how the bytes start, so a caller never labels one. An
+//! [`ImageReference`] is the exception: there are no bytes to read a
+//! format from, so the caller declares it.
 
 use std::fmt;
 
@@ -19,11 +22,14 @@ pub enum UserContent {
     Text(String),
     /// An image.
     Image(Image),
+    /// An image named by a reference the provider resolves.
+    ImageReference(ImageReference),
 }
 
 impl UserContent {
     /// The `LLM_CHAT` content block for this item: a `text` block, or an
-    /// `image` block with a `base64` source (standard, padded).
+    /// `image` block with a `base64` source (standard, padded) or a
+    /// `reference` source.
     pub(crate) fn block(&self) -> Value {
         match self {
             Self::Text(text) => json!({"type": "text", "text": text}),
@@ -33,6 +39,14 @@ impl UserContent {
                     "type": "base64",
                     "media_type": image.format.media_type(),
                     "data": STANDARD.encode(&image.bytes),
+                },
+            }),
+            Self::ImageReference(image) => json!({
+                "type": "image",
+                "source": {
+                    "type": "reference",
+                    "media_type": image.format.media_type(),
+                    "reference": image.reference,
                 },
             }),
         }
@@ -57,6 +71,12 @@ impl From<Image> for UserContent {
     }
 }
 
+impl From<ImageReference> for UserContent {
+    fn from(image: ImageReference) -> Self {
+        Self::ImageReference(image)
+    }
+}
+
 /// The image formats the `LLM_CHAT` contract names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -72,7 +92,7 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    /// Every format, in the order the contract's `media_type` enum lists
+    /// Every format, in the order the contract's `ImageMediaType` enum lists
     /// them.
     pub const ALL: &'static [ImageFormat] = &[Self::Jpeg, Self::Png, Self::Gif, Self::Webp];
 
@@ -146,6 +166,52 @@ impl fmt::Debug for Image {
             self.bytes.len()
         )
     }
+}
+
+/// An image the provider resolves from `reference`, a string the embedder
+/// chose (a path, a storage key).
+///
+/// The loop stores the reference and never interprets it. The format is the
+/// caller's declaration, not checked against anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageReference {
+    format: ImageFormat,
+    reference: String,
+}
+
+impl ImageReference {
+    /// A reference to an image of the declared format. The reference must
+    /// not be empty; whether a provider can resolve it is the provider's
+    /// to answer.
+    pub fn new(
+        format: ImageFormat,
+        reference: impl Into<String>,
+    ) -> Result<ImageReference, ImageReferenceError> {
+        let reference = reference.into();
+        if reference.is_empty() {
+            return Err(ImageReferenceError::Empty);
+        }
+        Ok(ImageReference { format, reference })
+    }
+
+    /// The format the caller declared.
+    pub fn format(&self) -> ImageFormat {
+        self.format
+    }
+
+    /// The reference, as given.
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+}
+
+/// Why [`ImageReference::new`] refused a reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ImageReferenceError {
+    /// The reference was an empty string.
+    #[error("the image reference is empty")]
+    Empty,
 }
 
 /// Why [`Image::new`] refused some bytes.
@@ -228,6 +294,21 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn an_image_reference_is_declared_and_never_empty() {
+        let reference = ImageReference::new(ImageFormat::Webp, "k").unwrap();
+        assert_eq!(reference.format(), ImageFormat::Webp);
+        assert_eq!(reference.reference(), "k");
+        assert_eq!(
+            UserContent::from(reference).block(),
+            json!({"type": "image", "source": {
+                "type": "reference", "media_type": "image/webp", "reference": "k"}})
+        );
+        let err = ImageReference::new(ImageFormat::Png, "").unwrap_err();
+        assert_eq!(err, ImageReferenceError::Empty);
+        assert_eq!(err.to_string(), "the image reference is empty");
     }
 
     #[test]

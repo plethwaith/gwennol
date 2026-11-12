@@ -67,13 +67,18 @@ ignores blocks another produced (a conversation that changes provider
 mid-way loses only what the new provider could not have used).
 
 An `image` block is an image the user shows the model, in its position
-among the message's blocks. Its `source` carries the file's bytes inline,
-as standard base64 with a media type; the schema lists the fields and the
-media types. The loop builds the block from bytes (`Image::new`) and
-transforms nothing. `Session::turn_with` refuses an image over
-`SessionConfig::max_image_bytes` before storing it; limits on dimensions
-and count are the vendor's, and a vendor that will not take the image
-answers with a `Failure`.
+among the message's blocks. Its `source` carries the image one of two
+ways: the file's bytes inline, as standard base64, or a `reference` the
+embedder chose (a path, a storage key); both name a media type, and the
+schema lists the fields and the media types. The consumer never
+interprets a reference: it stores and replays it, and resolving it is the
+provider's. A provider that cannot resolve a reference, or cannot take an
+image, answers with a `Failure`. The loop builds the inline block from an
+`Image`, whose format it reads from the bytes, and the reference block
+from an `ImageReference`, whose format the caller declares;
+`SessionConfig::max_image_bytes` measures images, not references, and
+`Session::turn_with` refuses an image over it before storing anything.
+Limits on dimensions and count are the vendor's.
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
@@ -128,18 +133,19 @@ alike — and open beyond its two required fields: a provider may add its
 own counters (cache reads, say), and consumers must tolerate and may
 ignore them.
 
-### Failure, buffered — settled
+### Failure — settled
 
 Settled with the first real provider to inform it ("4. Provider and
 tools" in the roadmap). The buffered form has a third shape,
 `{"error": {"message", "retryable"?, "kind"?}}` — the same three
 fields the stream's `error` event carries — for a turn the vendor
-answered and refused: a non-2xx status, or an error
-document in place of a message. The provider fills `retryable` from
+answered and refused (a non-2xx status, or an error
+document in place of a message), or one the provider declined (below),
+which answers a streamed request, too. The provider fills `retryable` from
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
 malformed-request and not-found answers will fail again) and `kind`
-with the vendor's own class identifier. Consumers branch on
+with its own class identifier. Consumers branch on
 `retryable` and nothing else: `kind` and `message` are informational.
 
 What stays a step error is exactly what the provider could not classify
@@ -150,10 +156,16 @@ must not retry it, and **must not** infer meaning from its message. That
 is the same line the `TOOL` contract draws below: an outcome the caller
 should react to arrives as data, or it is an error nobody should parse.
 
+A provider that declines the request before calling a vendor (an image
+source it cannot resolve) answers the same failed form, on either path;
+on a streamed request it comes back in place of `{"stream": …}`, since no
+stream was started. It is not retryable.
+
 ### Response, streamed
 
-With `stream: true` the result is instead `{"stream": <handle>}` — an
-integer Gwead stream handle. A handle is an index into the
+With `stream: true` the result is instead `{"stream": <handle>}` — an integer
+Gwead stream handle — unless the provider declined the request before
+starting a stream (the failed form, above). A handle is an index into the
 `StreamRegistry` the caller attached to the execution with
 `.with_streams(…)`, and is meaningless against any other table: each
 table numbers its handles from 1, and an execution run *without* a
@@ -195,7 +207,9 @@ event (above), always followed by end-of-stream and never by `end`;
 end-of-stream with no `end` or `error` event at all, the cause lost; or
 the read itself failing, reporting the text the kernel recorded for
 the failure rather than a misleadingly clean end. A failure before any
-bytes flow is an ordinary step error. Whichever shape it takes,
+bytes flow is an ordinary step error, unless the provider declined the
+request before starting the stream, which is the failed form (above).
+Whichever shape it takes,
 consumers must treat a stream that did not reach `end` as a failed
 turn, not a short answer.
 Events can be arbitrarily long — a `tool_use` event carries its whole
@@ -393,11 +407,10 @@ rather than oversights. Each would be a contract change; none blocks
   is the tool's problem (lossy conversion, or refusing); the `image`
   block exists for user content only. Truncation is signalled as data
   (`truncated`, above), never inside `content`.
-- **Image sources other than inline bytes.** An `image` block's `source`
-  has a `type` so that another way of naming the bytes, a reference the
-  provider resolves, can be added beside `base64`; none exists, so every
-  image travels inline.
+- **How a reference is resolved.** The contract says the provider
+  resolves an image reference, not how; no host step exists for it, and
+  the bundled provider resolves none.
 - **A provider's declaration of what it accepts.** Whether a model takes
   images depends on the model a provider's `$config` names, so neither
-  the contract nor a manifest says; a provider that cannot take an image
-  answers `Failure`.
+  the contract nor a manifest says; a provider that cannot take an image,
+  or resolve its source, answers `Failure`.

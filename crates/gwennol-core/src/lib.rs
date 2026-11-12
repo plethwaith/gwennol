@@ -41,6 +41,8 @@ pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
     Usage, resolve_provider,
 };
-pub use content::{ContentError, Image, ImageError, ImageFormat, UserContent};
+pub use content::{
+    ContentError, Image, ImageError, ImageFormat, ImageReference, ImageReferenceError, UserContent,
+};
 pub use events::{Event, EventSink, ToolCall};
 pub use gwead;

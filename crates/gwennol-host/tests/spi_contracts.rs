@@ -369,6 +369,44 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
+    // A reference source, held to the same minimal-pair discipline.
+    let reference = json!({"type": "reference", "media_type": "image/png", "reference": "a.png"});
+    assert_conforms(c.chat_input, &image_input(reference.clone()));
+    for (fault, key, value) in [
+        (
+            "a reference source carrying data",
+            "data",
+            json!("iVBORw0KGgo="),
+        ),
+        ("an empty reference", "reference", json!("")),
+        ("a reference source of type url", "type", json!("url")),
+    ] {
+        let mut source = reference.clone();
+        source[key] = value;
+        let bad = image_input(source);
+        assert!(
+            c.schemas.validate(&bad, c.chat_input).is_err(),
+            "schema accepted {fault}: {bad}"
+        );
+    }
+    let mut no_media_type = reference.clone();
+    no_media_type.as_object_mut().unwrap().remove("media_type");
+    let mut inline_with_reference = valid.clone();
+    inline_with_reference["reference"] = json!("a.png");
+    for (fault, source) in [
+        ("a reference source with no media type", no_media_type),
+        (
+            "an inline source carrying a reference",
+            inline_with_reference,
+        ),
+    ] {
+        let bad = image_input(source);
+        assert!(
+            c.schemas.validate(&bad, c.chat_input).is_err(),
+            "schema accepted {fault}: {bad}"
+        );
+    }
+
     // usage is required on the buffered form and the end event — pinned
     // as minimal pairs: each payload is valid until usage alone is
     // removed, so the rejection is attributable to exactly that field.

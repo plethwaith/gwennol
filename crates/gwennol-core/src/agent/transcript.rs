@@ -315,22 +315,26 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
     Ok(ids)
 }
 
-/// Check an `image` block's `source`: closed, inline base64 of a media
-/// type the contract names, with some data. Not checked: that `data` is
-/// base64, or that it decodes to the format `media_type` names.
+/// Check an `image` block's `source`: closed, and either inline base64 or
+/// a reference, each of a media type the contract names, with a non-empty
+/// string `data` or `reference`. The field set is chosen by `source.type`.
+/// Not checked: that `data` is base64, that it decodes to the format
+/// `media_type` names, or that a reference names anything.
 fn check_image_source(source: Option<&Value>) -> Result<(), String> {
     let Some(source) = source.and_then(Value::as_object) else {
         return Err("image block has no object `source`".into());
     };
+    let (allowed, payload): (&[&str], &str) = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => (&["type", "media_type", "data"], "data"),
+        Some("reference") => (&["type", "media_type", "reference"], "reference"),
+        _ => return Err("image source type is not `base64` or `reference`".into()),
+    };
     for key in source.keys() {
-        if !["type", "media_type", "data"].contains(&key.as_str()) {
+        if !allowed.contains(&key.as_str()) {
             return Err(format!(
                 "image source carries a field the contract does not allow: {key:?}"
             ));
         }
-    }
-    if source.get("type").and_then(Value::as_str) != Some("base64") {
-        return Err("image source type is not `base64`".into());
     }
     match source.get("media_type").and_then(Value::as_str) {
         Some(media_type)
@@ -344,8 +348,8 @@ fn check_image_source(source: Option<&Value>) -> Result<(), String> {
             ));
         }
     }
-    if !matches!(source.get("data"), Some(Value::String(data)) if !data.is_empty()) {
-        return Err("image block has no non-empty string `data`".into());
+    if !matches!(source.get(payload), Some(Value::String(text)) if !text.is_empty()) {
+        return Err(format!("image block has no non-empty string `{payload}`"));
     }
     Ok(())
 }
@@ -519,6 +523,10 @@ mod tests {
     fn txt(t: &str) -> Value {
         json!({"type": "text", "text": t})
     }
+    fn img_ref(media_type: &str, reference: &str) -> Value {
+        json!({"type": "image", "source": {"type": "reference", "media_type": media_type, "reference": reference}})
+    }
+
     fn img(media_type: &str, data: &str) -> Value {
         json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
     }
@@ -575,6 +583,20 @@ mod tests {
             (
                 "an image alone",
                 vec![user(vec![img("image/webp", "AAAA")])],
+                None,
+            ),
+            (
+                "an image reference alone",
+                vec![user(vec![img_ref("image/png", "shots/a.png")])],
+                None,
+            ),
+            (
+                "text, an image reference and an inline image",
+                vec![user(vec![
+                    txt("look"),
+                    img_ref("image/jpeg", "k"),
+                    img("image/png", "AA"),
+                ])],
                 None,
             ),
             (
@@ -753,7 +775,7 @@ mod tests {
             (
                 "an image source of type url",
                 vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["type"] = json!("url"); b }])],
-                Some((0, "type is not `base64`")),
+                Some((0, "image source type is not `base64` or `reference`")),
             ),
             (
                 "an image source with no type",
@@ -763,6 +785,49 @@ mod tests {
                     b
                 }])],
                 Some((0, "type is not `base64`")),
+            ),
+            (
+                "a reference source carrying data",
+                vec![user(vec![{ let mut b = img_ref("image/png", "k"); b["source"]["data"] = json!("AA"); b }])],
+                Some((0, "image source carries a field the contract does not allow: \"data\"")),
+            ),
+            (
+                "a base64 source carrying a reference",
+                vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["reference"] = json!("k"); b }])],
+                Some((0, "image source carries a field the contract does not allow: \"reference\"")),
+            ),
+            (
+                "an empty reference",
+                vec![user(vec![img_ref("image/png", "")])],
+                Some((0, "image block has no non-empty string `reference`")),
+            ),
+            (
+                "a numeric reference",
+                vec![user(vec![{ let mut b = img_ref("image/png", "k"); b["source"]["reference"] = json!(5); b }])],
+                Some((0, "image block has no non-empty string `reference`")),
+            ),
+            (
+                "a reference source with no reference",
+                vec![user(vec![{
+                    let mut b = img_ref("image/png", "k");
+                    b["source"].as_object_mut().unwrap().remove("reference");
+                    b
+                }])],
+                Some((0, "image block has no non-empty string `reference`")),
+            ),
+            (
+                "a reference of a media type the contract does not name",
+                vec![user(vec![img_ref("image/bmp", "k")])],
+                Some((0, "media type the contract does not name: image/bmp")),
+            ),
+            (
+                "a tool_result after an image reference",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![img_ref("image/png", "k"), tr("c1", "r1"), tr("c2", "r2")]);
+                    m
+                },
+                Some((2, "after an image block")),
             ),
             (
                 "an image source with no media type",

@@ -21,8 +21,8 @@ use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
 use gwennol_core::{
-    ContentError, Event, EventSink, Image, Session, SessionConfig, SessionError, ToolCall,
-    TurnError, UserContent, spi,
+    ContentError, Event, EventSink, Image, ImageFormat, ImageReference, RetryPolicy, Session,
+    SessionConfig, SessionError, ToolCall, TurnError, UserContent, spi,
 };
 
 const PROVIDER: &str = "embed_llm";
@@ -804,4 +804,122 @@ async fn an_image_the_provider_refuses_stays_until_restore_removes_it() {
             {"type": "text", "text": "again"}
         ])
     );
+}
+
+#[tokio::test]
+async fn a_turn_carries_an_image_reference_unread() {
+    let (kernel, _) = kernel(vec![]);
+    let config = SessionConfig {
+        max_image_bytes: 8,
+        ..done()
+    };
+    let reference = ImageReference::new(ImageFormat::Png, "screenshots/first.png").unwrap();
+    assert!(reference.reference().len() > 8);
+    let mut s = Session::new(
+        kernel.clone(),
+        config.clone(),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    s.turn_with(
+        vec!["see".into(), reference.into(), png(8).into()],
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.transcript()[0],
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "see"},
+            {"type": "image", "source": {
+                "type": "reference", "media_type": "image/png",
+                "reference": "screenshots/first.png"}},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+        ]})
+    );
+    assert_eq!(s.chat_input()["messages"], json!(s.transcript()));
+
+    let mut second = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
+    second.restore(s.transcript().to_vec()).unwrap();
+    assert_eq!(second.transcript(), s.transcript());
+}
+
+#[tokio::test]
+async fn a_streamed_round_can_answer_the_failed_form() {
+    let streamed = |first: Value, retry: RetryPolicy| SessionConfig {
+        stream: true,
+        retry,
+        ..answering(first)
+    };
+    let once = RetryPolicy {
+        max_attempts: 1,
+        ..RetryPolicy::default()
+    };
+    let retrying = RetryPolicy {
+        max_attempts: 2,
+        initial_backoff: std::time::Duration::ZERO,
+        max_backoff: std::time::Duration::ZERO,
+    };
+    let cancel = CancellationToken::new();
+
+    let (host, seen) = kernel(vec![]);
+    let failure = json!({"error": {"message": "cannot resolve", "retryable": false}});
+    let mut s = Session::new(
+        host,
+        streamed(failure, retrying.clone()),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    let err = s.turn("go", &cancel).await.unwrap_err();
+    match &err {
+        TurnError::Provider(f) => assert_eq!(f.message, "cannot resolve"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(provider_requests(&seen), 1);
+
+    let (host, seen) = kernel(vec![]);
+    let sink = Arc::new(Recorder::default());
+    let busy = json!({"error": {"message": "busy", "retryable": true}});
+    let mut s = Session::new(host, streamed(busy, retrying), sink.clone()).unwrap();
+    let err = s.turn("go", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(provider_requests(&seen), 2);
+    let retries = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::Retry { .. }))
+        .count();
+    assert_eq!(retries, 1);
+
+    for (answer, needle) in [
+        (
+            json!({"error": {"message": "m"}, "usage": {}}),
+            "the failed form carries fields beside `error`",
+        ),
+        (json!({"error": "nope"}), "`error` is not an object: "),
+        (
+            json!({"error": {"retryable": false}}),
+            "failure has no `message`",
+        ),
+        (
+            answer(vec![json!({"type": "text", "text": "hi"})], "end_turn"),
+            "streamed chat output is neither {\"stream\": handle} nor the failed form: ",
+        ),
+    ] {
+        let (host, _) = kernel(vec![]);
+        let mut s = Session::new(
+            host,
+            streamed(answer.clone(), once.clone()),
+            Arc::new(Recorder::default()),
+        )
+        .unwrap();
+        let err = s.turn("go", &cancel).await.unwrap_err();
+        match &err {
+            TurnError::Contract(text) => assert!(text.starts_with(needle), "{answer}: {text}"),
+            other => panic!("{answer}: {other:?}"),
+        }
+    }
 }

@@ -214,7 +214,7 @@ mod tests {
         use crate::content::ImageFormat;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.4.0");
+        assert_eq!(contract["version"], "0.5.0");
         let defs = &contract["$defs"];
         assert_eq!(
             defs["UserMessage"]["properties"]["content"]["items"]["oneOf"],
@@ -228,13 +228,28 @@ mod tests {
         assert_eq!(defs["ImageBlock"]["required"], json!(["type", "source"]));
         assert_eq!(
             defs["ImageBlock"]["properties"]["source"],
-            json!({"$ref": "#/$defs/Base64ImageSource"})
+            json!({"oneOf": [
+                {"$ref": "#/$defs/Base64ImageSource"},
+                {"$ref": "#/$defs/ReferenceImageSource"}
+            ]})
         );
         let source = &defs["Base64ImageSource"];
         assert_eq!(source["additionalProperties"], false);
         assert_eq!(source["required"], json!(["type", "media_type", "data"]));
+        let reference = &defs["ReferenceImageSource"];
+        assert_eq!(reference["additionalProperties"], false);
         assert_eq!(
-            source["properties"]["media_type"]["enum"],
+            reference["required"],
+            json!(["type", "media_type", "reference"])
+        );
+        for source in [source, reference] {
+            assert_eq!(
+                source["properties"]["media_type"],
+                json!({"$ref": "#/$defs/ImageMediaType"})
+            );
+        }
+        assert_eq!(
+            defs["ImageMediaType"]["enum"],
             json!(
                 ImageFormat::ALL
                     .iter()

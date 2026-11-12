@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "name": "LLM_CHAT",
   "displayName": "Chat-model provider",
-  "version": "0.4.0",
-  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the vendor answered but the turn failed, a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
+  "version": "0.5.0",
+  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
-      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`.",
+      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`, unless the provider declined the request before starting a stream, in which case it is the failed form.",
       "input": {
         "type": "object",
         "required": ["messages"],
@@ -69,7 +69,7 @@
             "type": "object",
             "required": ["error"],
             "additionalProperties": false,
-            "description": "The failed form, buffered path only: the request reached the vendor and the vendor said no — a non-2xx status, or an error document — so the provider can still say why, as data. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn. A streamed turn reports the same failure as its `error` event instead.",
+            "description": "The failed form: the provider can say why the turn failed, as data. Either the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
             "properties": {
               "error": { "$ref": "#/$defs/Failure" }
             }
@@ -207,22 +207,37 @@
       "type": "object",
       "required": ["type", "source"],
       "additionalProperties": false,
-      "description": "An image the user shows the model, in its position among the message's blocks. User messages only.",
+      "description": "An image the user shows the model, in its position among the message's blocks. User messages only. `source.type` says how the image travels: its bytes inline, or a reference the provider resolves.",
       "properties": {
         "type": { "const": "image" },
-        "source": { "$ref": "#/$defs/Base64ImageSource" }
+        "source": { "oneOf": [ { "$ref": "#/$defs/Base64ImageSource" }, { "$ref": "#/$defs/ReferenceImageSource" } ] }
       }
     },
     "Base64ImageSource": {
       "type": "object",
       "required": ["type", "media_type", "data"],
       "additionalProperties": false,
-      "description": "The image's bytes, inline. `type` is a discriminator: a later version of this contract can add another source beside this one.",
+      "description": "The image's bytes, inline.",
       "properties": {
         "type": { "const": "base64" },
-        "media_type": { "enum": ["image/jpeg", "image/png", "image/gif", "image/webp"] },
+        "media_type": { "$ref": "#/$defs/ImageMediaType" },
         "data": { "type": "string", "minLength": 1, "description": "The file's bytes in standard padded base64 (RFC 4648 section 4)." }
       }
+    },
+    "ReferenceImageSource": {
+      "type": "object",
+      "required": ["type", "media_type", "reference"],
+      "additionalProperties": false,
+      "description": "An image named by a reference in place of its bytes. The consumer stores and replays the reference unchanged and never interprets it; resolving it is the provider's. A provider that cannot resolve it answers with the failed form (`retryable` false) without calling a vendor. `media_type` is declared by whoever built the block, since the consumer has no bytes to read it from.",
+      "properties": {
+        "type": { "const": "reference" },
+        "media_type": { "$ref": "#/$defs/ImageMediaType" },
+        "reference": { "type": "string", "minLength": 1, "description": "Chosen by the embedder: a path, a storage key." }
+      }
+    },
+    "ImageMediaType": {
+      "description": "The image formats this contract names.",
+      "enum": ["image/jpeg", "image/png", "image/gif", "image/webp"]
     },
     "ToolUseBlock": {
       "type": "object",
