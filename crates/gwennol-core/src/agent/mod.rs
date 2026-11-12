@@ -117,7 +117,8 @@ use stream::{EventReader, ReadError};
 use tools::{ToolTable, parse_output};
 use transcript::{MessageBuilder, ToolUse, Transcript, check_assistant_message, check_block};
 
-/// Why a turn the vendor answered failed — the `LLM_CHAT` `Failure`.
+/// Why a turn failed, as the provider reports it: the vendor said no, or
+/// the provider declined the request (the `LLM_CHAT` `Failure`).
 ///
 /// Consumers branch on `retryable` and nothing else; `kind` and
 /// `message` are for people.
@@ -269,8 +270,8 @@ pub enum TurnError {
         /// hid one; `None` for a plain cancellation.
         detail: Option<String>,
     },
-    /// The vendor refused, and the failure is not one to repeat — or
-    /// was, and the retries ran out.
+    /// The vendor refused, or the provider declined the request, and the
+    /// failure is not one to repeat — or was, and the retries ran out.
     #[error("provider refused the turn: {0}")]
     Provider(Failure),
     /// The provider's `chat` action failed as a step: the transport,
@@ -435,7 +436,8 @@ pub struct SessionConfig {
     /// the conversation's images together, not one image: a request that
     /// is too large for the bundled provider's guest fails the turn as
     /// [`TurnError::Step`]. An embedder that raises the kernel's memory
-    /// limit can raise this with it.
+    /// limit can raise this with it. An image reference has no bytes here
+    /// and is not measured.
     pub max_image_bytes: usize,
 }
 
@@ -562,7 +564,8 @@ impl Session {
     /// offers (the loop checks neither of what a provider sends), that
     /// a `tool_result` carries `is_error`, which the loop always writes,
     /// that an image block's `data` is base64 or decodes to the format its
-    /// `media_type` names, and that an image is within
+    /// `media_type` names, that an image reference names anything a
+    /// provider can resolve, and that an image is within
     /// [`SessionConfig::max_image_bytes`] (a transcript another session
     /// returned is accepted whatever that session's cap was). If
     /// the model calls an unoffered tool again, the loop answers that no
@@ -601,17 +604,18 @@ impl Session {
             .await
     }
 
-    /// Run one user turn whose content is `content`: text and images, in
-    /// the order given, stored as one run of blocks. Otherwise exactly
+    /// Run one user turn whose content is `content`: text, images and image
+    /// references, in the order given, stored as one run of blocks. Otherwise exactly
     /// [`Self::turn`].
     ///
     /// Refused as [`TurnError::Content`], with the transcript untouched,
     /// no event emitted and no provider call made, when `content` is empty
     /// or an image is larger than [`SessionConfig::max_image_bytes`]; every
-    /// item is checked before the first is stored. The loop transforms no
-    /// image. Dimensions, how many images a request may carry, and whether
-    /// the model takes images at all are the vendor's to answer, as a
-    /// [`TurnError::Provider`].
+    /// item is checked before the first is stored. An image reference is
+    /// not measured. The loop transforms no image and reads no reference.
+    /// Dimensions, how many images a request may carry, whether the model
+    /// takes images at all, and whether a reference can be resolved are the
+    /// vendor's or the provider's to answer, as a [`TurnError::Provider`].
     ///
     /// Content of a turn that fails after it is stored stays in the
     /// transcript, so an image the provider refused is sent again.
@@ -826,6 +830,13 @@ impl Session {
             .await
             .map_err(fatal)?
             .output;
+        // A provider that declined before starting a stream answers the
+        // failed form in place of a handle.
+        if let Some(fields) = out.as_object()
+            && fields.contains_key("error")
+        {
+            return interpret_failed_form(fields);
+        }
         let handle = match out.as_object() {
             Some(fields) if fields.len() == 1 => fields.get("stream").and_then(Value::as_u64),
             _ => None,
@@ -835,7 +846,7 @@ impl Session {
             .and_then(NonZeroU32::new)
             .ok_or_else(|| {
                 TurnError::Contract(format!(
-                    "streamed chat output is not {{\"stream\": handle}}: {out}"
+                    "streamed chat output is neither {{\"stream\": handle}} nor the failed form: {out}"
                 ))
             })?;
         let reader = EventReader::new(streams, id, self.config.max_event_bytes);
@@ -1164,6 +1175,25 @@ fn round_from(
     })
 }
 
+/// Read the failed form of `chat`'s output: `fields` holds `error`, and
+/// nothing else.
+fn interpret_failed_form(fields: &Map<String, Value>) -> Result<RoundResult, TurnError> {
+    if fields.len() != 1 {
+        return Err(TurnError::Contract(
+            "the failed form carries fields beside `error`".into(),
+        ));
+    }
+    let error = &fields["error"];
+    let Some(error) = error.as_object() else {
+        return Err(TurnError::Contract(format!(
+            "`error` is not an object: {error}"
+        )));
+    };
+    Failure::parse(error, false)
+        .map(RoundResult::Failed)
+        .map_err(TurnError::Contract)
+}
+
 /// Read the buffered form of `chat`'s output.
 fn interpret_buffered(out: &Value) -> Result<RoundResult, TurnError> {
     let Some(fields) = out.as_object() else {
@@ -1171,20 +1201,8 @@ fn interpret_buffered(out: &Value) -> Result<RoundResult, TurnError> {
             "chat output is not an object: {out}"
         )));
     };
-    if let Some(error) = fields.get("error") {
-        if fields.len() != 1 {
-            return Err(TurnError::Contract(
-                "the failed form carries fields beside `error`".into(),
-            ));
-        }
-        let Some(error) = error.as_object() else {
-            return Err(TurnError::Contract(format!(
-                "`error` is not an object: {error}"
-            )));
-        };
-        return Failure::parse(error, false)
-            .map(RoundResult::Failed)
-            .map_err(TurnError::Contract);
+    if fields.contains_key("error") {
+        return interpret_failed_form(fields);
     }
     if fields.contains_key("stream") {
         return Err(TurnError::Contract(

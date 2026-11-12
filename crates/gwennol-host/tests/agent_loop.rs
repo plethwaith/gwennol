@@ -29,8 +29,8 @@ use gwead::kernel::Kernel;
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    Event, EventSink, Image, Session, SessionConfig, SessionError, StopReason, ToolCall, TurnError,
-    TurnOutcome, spi,
+    Event, EventSink, Image, ImageFormat, ImageReference, Session, SessionConfig, SessionError,
+    StopReason, ToolCall, TurnError, TurnOutcome, spi,
 };
 use gwennol_host::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_host::{Access, ApprovalRequest, Decision, Operator, OperatorEvents, Turn};
@@ -921,7 +921,13 @@ async fn what_a_turn_with_an_image_stores_conforms_to_the_contract() {
     tokio::time::timeout(
         Duration::from_secs(30),
         s.turn_with(
-            vec!["look".into(), Image::new(bytes).unwrap().into()],
+            vec![
+                "look".into(),
+                Image::new(bytes).unwrap().into(),
+                ImageReference::new(ImageFormat::Jpeg, "store/42")
+                    .unwrap()
+                    .into(),
+            ],
             &cancel,
         ),
     )
@@ -929,6 +935,10 @@ async fn what_a_turn_with_an_image_stores_conforms_to_the_contract() {
     .expect("the turn finishes within 30s")
     .unwrap();
     assert_eq!(s.transcript()[0]["content"][1]["type"], "image");
+    assert_eq!(
+        s.transcript()[0]["content"][2]["source"]["type"],
+        "reference"
+    );
     assert_conforms(contracts().chat_input, &s.chat_input());
 }
 

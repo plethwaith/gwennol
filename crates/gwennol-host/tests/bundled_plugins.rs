@@ -26,7 +26,10 @@ use gwead::kernel::streams::StreamRegistry;
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{Event, Session, SessionConfig, StopReason, spi};
+use gwennol_core::{
+    Event, ImageFormat, ImageReference, Session, SessionConfig, StopReason, TurnError, UserContent,
+    spi,
+};
 use gwennol_host::{
     Access, ApprovalRequest, Decision, HostConfig, Operator, OperatorEvents, ProcessEnv, Turn,
 };
@@ -275,6 +278,38 @@ impl Fixture {
             .output;
         assert_conforms(contracts().chat_output, &out);
         out
+    }
+
+    /// One provider turn, as the raw output of `chat`, for a request whose
+    /// answer the test expects to be neither a message nor a stream.
+    async fn raw(&self, route: &str, input: Value, streams: bool) -> Value {
+        assert_conforms(contracts().chat_input, &input);
+        let config = self.config(route);
+        let mut execution = self
+            .kernel
+            .execute(PROVIDER, spi::llm_chat::CHAT, input)
+            .with_config(&config);
+        if streams {
+            execution = execution.with_streams(Arc::new(Mutex::new(StreamRegistry::new())));
+        }
+        let out = execution
+            .run()
+            .await
+            .expect("a declined request is not a step error")
+            .output;
+        assert_conforms(contracts().chat_output, &out);
+        out
+    }
+
+    /// The paths of every request the vendor stub has received.
+    fn requested(&self) -> Vec<String> {
+        self.stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect()
     }
 
     /// One streamed provider turn, drained to its events.
@@ -937,6 +972,70 @@ async fn an_image_block_reaches_the_vendor_request_through_the_bundled_provider(
             .collect();
         assert_eq!(sent, vec![messages.clone()], "{route}");
     }
+}
+
+/// The bundled provider resolves no reference: it declines one as the
+/// contract's Failure on either form, before anything reaches the vendor,
+/// and a loop session reads that as a provider refusal that stays until
+/// the transcript is restored.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_reference_is_declined_before_the_vendor_is_called() {
+    let f = fixture();
+    let reference = json!({"type": "image", "source": {
+        "type": "reference", "media_type": "image/png", "reference": "shots/login.png"}});
+    let messages = json!([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        reference
+    ]}]);
+    let declined = json!({"error": {
+        "message": "message 0: an image block's source type is \"reference\"; this provider sends only inline (base64) image bytes",
+        "retryable": false,
+        "kind": "unsupported_image_source"
+    }});
+    let input = |stream: bool| json!({"messages": messages.clone(), "stream": stream});
+    assert_eq!(f.raw("/ref-decline", input(false), false).await, declined);
+    assert_eq!(
+        f.raw("/ref-decline-stream", input(true), true).await,
+        declined
+    );
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(PROVIDER.to_string(), f.config("/ref-decline-loop"));
+    let mut session = new_session(
+        f.kernel.clone(),
+        SessionConfig {
+            plugin_configs: configs,
+            ..SessionConfig::default()
+        },
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let content = vec![
+        UserContent::from("what is this?"),
+        ImageReference::new(ImageFormat::Png, "shots/login.png")
+            .unwrap()
+            .into(),
+    ];
+    let err = session.turn_with(content, &cancel).await.unwrap_err();
+    match &err {
+        TurnError::Provider(failure) => {
+            assert_eq!(failure.kind.as_deref(), Some("unsupported_image_source"));
+            assert_eq!(failure.retryable, Some(false));
+        }
+        other => panic!("{other:?}"),
+    }
+    let err = session.turn("again", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(session.transcript().len(), 1);
+    assert_eq!(session.transcript()[0]["content"][1], reference);
+
+    let requested = f.requested();
+    assert!(
+        requested
+            .iter()
+            .all(|path| !path.starts_with("/ref-decline")),
+        "{requested:?}"
+    );
 }
 
 /// The vendor saying no is the contract's Failure on both paths — data
