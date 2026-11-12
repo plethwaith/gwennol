@@ -253,7 +253,7 @@ pub enum TurnError {
     /// [`Session::turn_with`] refused its content. Nothing was stored,
     /// no event was sent and the provider was not called.
     #[error("the turn's content was refused: {0}")]
-    Content(#[from] ContentError),
+    Content(ContentError),
     /// The token was cancelled. `detail` is the text the kernel
     /// recorded for a stream source whose failure the read that met
     /// the cut found waiting: the kernel polls the source before the
@@ -614,27 +614,26 @@ impl Session {
     /// [`TurnError::Provider`].
     ///
     /// Content of a turn that fails after it is stored stays in the
-    /// transcript and the next turn's content joins it, so an image the
-    /// provider refused is sent again; [`Self::restore`] with the block
-    /// removed is how an embedder drops it.
+    /// transcript, so an image the provider refused is sent again;
+    /// [`Self::restore`] with the block removed is how an embedder drops
+    /// it.
     pub async fn turn_with(
         &mut self,
         content: Vec<UserContent>,
         cancel: &CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
         if content.is_empty() {
-            return Err(ContentError::Empty.into());
+            return Err(TurnError::Content(ContentError::Empty));
         }
         for (index, item) in content.iter().enumerate() {
             if let UserContent::Image(image) = item
                 && image.bytes().len() > self.config.max_image_bytes
             {
-                return Err(ContentError::ImageTooLarge {
+                return Err(TurnError::Content(ContentError::ImageTooLarge {
                     index,
                     bytes: image.bytes().len(),
                     max: self.config.max_image_bytes,
-                }
-                .into());
+                }));
             }
         }
         self.transcript

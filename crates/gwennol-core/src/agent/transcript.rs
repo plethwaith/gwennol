@@ -38,10 +38,7 @@ impl Transcript {
     /// offending message's position (the list's length for a trailing
     /// unanswered call) and the rule it breaks.
     ///
-    /// Not checked, because the loop checks neither of what a provider
-    /// sends: that `tool_use` ids are unique across the conversation, and
-    /// that a tool name is one the session offers. Nor that a `tool_result`
-    /// carries `is_error`, which the loop always writes.
+    /// What this does not check is listed on `Session::restore`.
     pub(crate) fn from_messages(messages: Vec<Value>) -> Result<Self, (usize, String)> {
         // The calls the previous assistant message made, awaiting answers.
         let mut owed: Vec<ToolUse> = Vec::new();
@@ -775,6 +772,15 @@ mod tests {
                     b
                 }])],
                 Some((0, "media type the contract does not name: (none)")),
+            ),
+            (
+                "an image source with no data",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("data");
+                    b
+                }])],
+                Some((0, "no non-empty string `data`")),
             ),
             (
                 "an image of a media type the contract does not name",

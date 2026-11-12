@@ -667,9 +667,19 @@ async fn every_offered_action_is_held_to_its_own_schema_and_the_result_shape() {
 async fn a_turn_carries_text_and_images_in_the_order_given() {
     let (kernel, _) = kernel(vec![]);
     let gif = Image::new(b"GIF89a".to_vec()).unwrap();
+    // Twelve bytes that encode to `++//` in the standard alphabet.
+    let mut plus_slash = PNG_SIGNATURE.to_vec();
+    plus_slash.extend([0x00, 0xFB, 0xEF, 0xFF]);
+    let plus_slash = Image::new(plus_slash).unwrap();
     let mut s = Session::new(kernel.clone(), done(), Arc::new(Recorder::default())).unwrap();
     s.turn_with(
-        vec!["compare".into(), png(8).into(), "with".into(), gif.into()],
+        vec![
+            "compare".into(),
+            png(8).into(),
+            "with".into(),
+            gif.into(),
+            plus_slash.into(),
+        ],
         &CancellationToken::new(),
     )
     .await
@@ -682,7 +692,9 @@ async fn a_turn_carries_text_and_images_in_the_order_given() {
                 "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
             {"type": "text", "text": "with"},
             {"type": "image", "source": {
-                "type": "base64", "media_type": "image/gif", "data": "R0lGODlh"}}
+                "type": "base64", "media_type": "image/gif", "data": "R0lGODlh"}},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoA++//"}}
         ]})
     );
     assert_eq!(s.chat_input()["messages"], json!(s.transcript()));
