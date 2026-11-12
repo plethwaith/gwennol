@@ -299,11 +299,11 @@ written, and it must be settled before a provider exists.
   that did not reach `end` is dropped, and so is one whose message is
   empty — nothing to replay, and a vendor refuses an empty assistant
   message anywhere but last; one that did is stored with the answer
-  to every call it made. A turn that fails or is
-  cancelled therefore leaves the transcript ending in a user message,
-  and the next turn's text joins that message after any results in
-  it — the protocol's results-before-text order, and never two user
-  messages in a row.
+  to every call it made. A turn that fails or is cancelled once its
+  content is stored therefore leaves the transcript ending in a user
+  message, and the next turn's content joins that message after any
+  results in it — the protocol's results-first order, and never two
+  user messages in a row.
 - **Settled: provider failures and provider choice.** A `Failure`
   marked `retryable` is retried unchanged with bounded backoff; any
   other ends the turn. A provider step error is fatal and never

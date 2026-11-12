@@ -17,11 +17,11 @@ use crate::content::ImageFormat;
 /// content at the start of the turn, an assistant message once the provider has
 /// finished producing it, the tool results once every call in that
 /// message has been answered. Nothing partial is ever stored, so a turn
-/// that fails or is cancelled leaves the transcript ending in a user
-/// message — the last thing that completed — and the next turn's content
-/// joins that message rather than following it, keeping the roles
-/// alternating and every tool call answered in the message right after
-/// it.
+/// that fails or is cancelled once its content is stored leaves the
+/// transcript ending in a user message — the last thing that completed —
+/// and the next turn's content joins that message rather than following
+/// it, keeping the roles alternating and every tool call answered in the
+/// message right after it.
 #[derive(Debug, Default)]
 pub(crate) struct Transcript {
     messages: Vec<Value>,
@@ -100,7 +100,7 @@ impl Transcript {
         Ok(Self { messages })
     }
 
-    /// Add the user's content, one block per item, in the order given.
+    /// Add the user's content blocks, in the order given.
     /// When the transcript already ends in a user message — the previous
     /// turn did not complete — the blocks become the end of that message,
     /// after any tool results it holds: the protocol wants results before
@@ -746,17 +746,35 @@ mod tests {
             (
                 "an image block with an extra field",
                 vec![user(vec![{ let mut b = img("image/png", "AA"); b["extra"] = json!(1); b }])],
-                Some((0, "does not allow")),
+                Some((0, "user content block carries a field")),
             ),
             (
                 "an image source with an extra field",
                 vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["extra"] = json!(1); b }])],
-                Some((0, "does not allow")),
+                Some((0, "image source carries a field")),
             ),
             (
                 "an image source of type url",
                 vec![user(vec![{ let mut b = img("image/png", "AA"); b["source"]["type"] = json!("url"); b }])],
                 Some((0, "type is not `base64`")),
+            ),
+            (
+                "an image source with no type",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("type");
+                    b
+                }])],
+                Some((0, "type is not `base64`")),
+            ),
+            (
+                "an image source with no media type",
+                vec![user(vec![{
+                    let mut b = img("image/png", "AA");
+                    b["source"].as_object_mut().unwrap().remove("media_type");
+                    b
+                }])],
+                Some((0, "media type the contract does not name: (none)")),
             ),
             (
                 "an image of a media type the contract does not name",

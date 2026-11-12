@@ -235,7 +235,12 @@ mod tests {
         assert_eq!(source["required"], json!(["type", "media_type", "data"]));
         assert_eq!(
             source["properties"]["media_type"]["enum"],
-            json!(ImageFormat::ALL.map(ImageFormat::media_type))
+            json!(
+                ImageFormat::ALL
+                    .iter()
+                    .map(|f| f.media_type())
+                    .collect::<Vec<_>>()
+            )
         );
     }
 

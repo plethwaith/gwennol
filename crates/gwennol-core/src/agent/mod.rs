@@ -34,8 +34,8 @@
 //! - **Tool arguments are validated** against the tool's declared
 //!   schema before dispatch; the kernel validates no payloads.
 //! - **Every tool call is answered** in the immediately following user
-//!   message, in order, results before any text. A tool that reports
-//!   `is_error` is answered with that; a tool that *cannot* answer —
+//!   message, in order, results before any text or image. A tool that
+//!   reports `is_error` is answered with that; a tool that *cannot* answer —
 //!   the model named a tool that does not exist, sent arguments the
 //!   schema refuses, or the call failed as a step (the step refused it,
 //!   the kernel refused, the plugin returned a malformed result) — is
@@ -81,11 +81,12 @@
 //!   that did not reach its `end` event is dropped, and so is a round
 //!   whose message is empty (nothing to replay, and a vendor refuses
 //!   an empty assistant message anywhere but last); a round that did
-//!   is kept together with the answer to every call it made. A failed
-//!   or cancelled turn therefore leaves the transcript ending in a
-//!   user message — the user's content, or the last round's results — and
-//!   the next turn's content joins that message. Nothing that happened is
-//!   lost from the model's view, and nothing half-happened enters it.
+//!   is kept together with the answer to every call it made. A turn
+//!   that fails or is cancelled once its content is stored therefore
+//!   leaves the transcript ending in a user message — the user's
+//!   content, or the last round's results — and the next turn's content
+//!   joins that message. Nothing that happened is lost from the model's
+//!   view, and nothing half-happened enters it.
 //!
 //! What the loop deliberately does not do: choose policy, persist
 //! anything, or manage the
@@ -247,6 +248,7 @@ pub struct TurnOutcome {
 /// Why a turn did not complete. The transcript is left as the module
 /// docs describe: whole exchanges kept, the partial one dropped.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TurnError {
     /// [`Session::turn_with`] refused its content. Nothing was stored,
     /// no event was sent and the provider was not called.
@@ -611,10 +613,10 @@ impl Session {
     /// the model takes images at all are the vendor's to answer, as a
     /// [`TurnError::Provider`].
     ///
-    /// As with any turn, content of a turn that fails stays in the
-    /// transcript and the next turn's content joins it, so a refused image
-    /// is sent again; [`Self::restore`] with the block removed is how an
-    /// embedder drops it.
+    /// Content of a turn that fails after it is stored stays in the
+    /// transcript and the next turn's content joins it, so an image the
+    /// provider refused is sent again; [`Self::restore`] with the block
+    /// removed is how an embedder drops it.
     pub async fn turn_with(
         &mut self,
         content: Vec<UserContent>,
@@ -636,7 +638,7 @@ impl Session {
             }
         }
         self.transcript
-            .push_user_content(content.iter().map(UserContent::block).collect());
+            .push_user_content(content.into_iter().map(|item| item.block()).collect());
         let max_rounds = self.config.max_rounds.max(1);
         let mut usage = Usage::default();
         for round_no in 1..=max_rounds {

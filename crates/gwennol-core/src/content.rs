@@ -75,7 +75,7 @@ pub enum ImageFormat {
 impl ImageFormat {
     /// Every format, in the order the contract's `media_type` enum lists
     /// them.
-    pub const ALL: [ImageFormat; 4] = [Self::Jpeg, Self::Png, Self::Gif, Self::Webp];
+    pub const ALL: &'static [ImageFormat] = &[Self::Jpeg, Self::Png, Self::Gif, Self::Webp];
 
     /// The format's media type, as the contract spells it.
     pub fn media_type(self) -> &'static str {
@@ -151,6 +151,7 @@ impl fmt::Debug for Image {
 
 /// Why [`Image::new`] refused some bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ImageError {
     /// There were no bytes.
     #[error("the image is empty")]
@@ -170,7 +171,7 @@ pub enum ContentError {
     /// An image is larger than the session allows.
     #[error("image at position {index} is {bytes} bytes; the session's max_image_bytes is {max}")]
     ImageTooLarge {
-        /// The image's position in the turn's content.
+        /// The image's position in the turn's content, counting from 0.
         index: usize,
         /// Its size.
         bytes: usize,
@@ -217,6 +218,7 @@ mod tests {
         wave.extend_from_slice(b"WAVE");
         for (name, bytes) in [
             ("a BMP", with_filler(b"BM")),
+            ("a GIF of no known version", with_filler(b"GIF88a")),
             ("RIFF WAVE", with_filler(&wave)),
             ("a cut JPEG signature", vec![0xFF, 0xD8]),
             ("a cut PNG signature", png[..7].to_vec()),

@@ -70,9 +70,10 @@ An `image` block is an image the user shows the model, in its position
 among the message's blocks. Its `source` carries the file's bytes inline,
 as standard base64 with a media type; the schema lists the fields and the
 media types. The loop builds the block from bytes (`Image::new`) and
-transforms nothing: limits on size, dimensions and count are the
-vendor's, and a vendor that will not take the image answers with a
-`Failure`.
+transforms nothing. `Session::turn_with` refuses an image over
+`SessionConfig::max_image_bytes` before storing it; limits on dimensions
+and count are the vendor's, and a vendor that will not take the image
+answers with a `Failure`.
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared

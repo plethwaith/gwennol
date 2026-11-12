@@ -140,7 +140,7 @@ fn config(tool: &str) -> SessionConfig {
     }
 }
 
-/// A config whose provider answers every first round with `first`.
+/// A config whose provider's `answers` hold only `first`.
 fn answering(first: Value) -> SessionConfig {
     SessionConfig {
         provider: Some(PROVIDER.into()),
@@ -720,6 +720,8 @@ async fn content_is_refused_before_anything_is_stored() {
         assert_eq!(provider_requests(&seen), 0);
     };
 
+    assert_eq!(SessionConfig::default().max_image_bytes, 2 << 20);
+
     let err = s.turn_with(vec![], &cancel).await.unwrap_err();
     assert!(
         matches!(err, TurnError::Content(ContentError::Empty)),
@@ -783,5 +785,11 @@ async fn an_image_the_provider_refuses_stays_until_restore_removes_it() {
         .collect();
     s.restore(vec![json!({"role": "user", "content": without})])
         .unwrap();
-    assert!(!s.transcript()[0]["content"].to_string().contains("image"));
+    assert_eq!(
+        s.transcript()[0]["content"],
+        json!([
+            {"type": "text", "text": "look"},
+            {"type": "text", "text": "again"}
+        ])
+    );
 }
