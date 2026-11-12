@@ -278,9 +278,8 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     })
 }
 
-/// Why a turn failed, with the vendor's answer in hand — the contract's
-/// `Failure`, carried either as the buffered `{"error": …}` output or as
-/// the stream's `error` event.
+/// Why a turn failed — the contract's `Failure`, carried either as the
+/// `{"error": …}` output or as the stream's `error` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     /// Human-readable, informational.
@@ -324,7 +323,7 @@ impl Failure {
         Value::Object(fields)
     }
 
-    /// The contract's buffered failed form.
+    /// The contract's failed form, `{"error": …}`.
     pub fn into_buffered_output(self) -> Value {
         json!({ "error": Value::Object(self.fields()) })
     }

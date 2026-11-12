@@ -139,8 +139,8 @@ Settled with the first real provider to inform it ("4. Provider and
 tools" in the roadmap). The buffered form has a third shape,
 `{"error": {"message", "retryable"?, "kind"?}}` — the same three
 fields the stream's `error` event carries — for a turn the vendor
-answered and refused: a non-2xx status, or an error
-document in place of a message. The provider fills `retryable` from
+answered and refused (a non-2xx status, or an error
+document in place of a message), or one the provider declined (below). The provider fills `retryable` from
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
 malformed-request and not-found answers will fail again) and `kind`
@@ -162,8 +162,9 @@ stream was started. It is not retryable.
 
 ### Response, streamed
 
-With `stream: true` the result is instead `{"stream": <handle>}` — an
-integer Gwead stream handle. A handle is an index into the
+With `stream: true` the result is instead `{"stream": <handle>}`, unless the
+provider declined the request before starting a stream (the failed form,
+above): an integer Gwead stream handle. A handle is an index into the
 `StreamRegistry` the caller attached to the execution with
 `.with_streams(…)`, and is meaningless against any other table: each
 table numbers its handles from 1, and an execution run *without* a

@@ -134,7 +134,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    /// Read a `Failure` object — the buffered form's `error` value, or
+    /// Read a `Failure` object — the failed form's `error` value, or
     /// a stream `error` event with its `type` already accounted for.
     fn parse(fields: &Map<String, Value>, allow_type: bool) -> Result<Self, String> {
         let mut failure = Failure {
@@ -431,7 +431,7 @@ pub struct SessionConfig {
     pub tool_plugins: Option<BTreeSet<String>>,
     /// The most bytes one image of a turn may have, checked by
     /// [`Session::turn_with`] before anything is stored. Not applied by
-    /// [`Session::restore`]. Images travel inline and the conversation is
+    /// [`Session::restore`]. An `Image` travels inline and the conversation is
     /// sent again every round, so what the provider's guest can hold bounds
     /// the conversation's images together, not one image: a request that
     /// is too large for the bundled provider's guest fails the turn as
@@ -605,14 +605,15 @@ impl Session {
     }
 
     /// Run one user turn whose content is `content`: text, images and image
-    /// references, in the order given, stored as one run of blocks. Otherwise exactly
-    /// [`Self::turn`].
+    /// references, in the order given, stored as one run of blocks.
+    /// Otherwise exactly [`Self::turn`].
     ///
     /// Refused as [`TurnError::Content`], with the transcript untouched,
     /// no event emitted and no provider call made, when `content` is empty
     /// or an image is larger than [`SessionConfig::max_image_bytes`]; every
     /// item is checked before the first is stored. An image reference is
-    /// not measured. The loop transforms no image and reads no reference.
+    /// not measured. The loop transforms no image and never interprets a
+    /// reference.
     /// Dimensions, how many images a request may carry, whether the model
     /// takes images at all, and whether a reference can be resolved are the
     /// vendor's or the provider's to answer, as a [`TurnError::Provider`].

@@ -71,7 +71,8 @@ const ERROR_BODY_CAP: usize = 4096;
 /// `chat` — the plain action's entry point.
 fn chat(args: Args) -> Result<Value, String> {
     // A provider that declines before dispatching anything answers the
-    // failed form on either path, in place of a stream handle.
+    // failed form on either path (on a streamed request, in place of the
+    // handle).
     if let Some(failure) = wire::unsupported_image_source(args.raw()) {
         return Ok(failure.into_buffered_output());
     }

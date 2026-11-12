@@ -799,12 +799,12 @@ mod tests {
             (
                 "an empty reference",
                 vec![user(vec![img_ref("image/png", "")])],
-                Some((0, "no non-empty string `reference`")),
+                Some((0, "image block has no non-empty string `reference`")),
             ),
             (
                 "a numeric reference",
                 vec![user(vec![{ let mut b = img_ref("image/png", "k"); b["source"]["reference"] = json!(5); b }])],
-                Some((0, "no non-empty string `reference`")),
+                Some((0, "image block has no non-empty string `reference`")),
             ),
             (
                 "a reference source with no reference",
@@ -813,7 +813,7 @@ mod tests {
                     b["source"].as_object_mut().unwrap().remove("reference");
                     b
                 }])],
-                Some((0, "no non-empty string `reference`")),
+                Some((0, "image block has no non-empty string `reference`")),
             ),
             (
                 "a reference of a media type the contract does not name",

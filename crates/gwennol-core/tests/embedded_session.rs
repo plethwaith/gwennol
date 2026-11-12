@@ -856,13 +856,18 @@ async fn a_streamed_round_can_answer_the_failed_form() {
         max_attempts: 1,
         ..RetryPolicy::default()
     };
+    let retrying = RetryPolicy {
+        max_attempts: 2,
+        initial_backoff: std::time::Duration::ZERO,
+        max_backoff: std::time::Duration::ZERO,
+    };
     let cancel = CancellationToken::new();
 
     let (host, seen) = kernel(vec![]);
     let failure = json!({"error": {"message": "cannot resolve", "retryable": false}});
     let mut s = Session::new(
         host,
-        streamed(failure, once.clone()),
+        streamed(failure, retrying.clone()),
         Arc::new(Recorder::default()),
     )
     .unwrap();
@@ -875,11 +880,6 @@ async fn a_streamed_round_can_answer_the_failed_form() {
 
     let (host, seen) = kernel(vec![]);
     let sink = Arc::new(Recorder::default());
-    let retrying = RetryPolicy {
-        max_attempts: 2,
-        initial_backoff: std::time::Duration::ZERO,
-        max_backoff: std::time::Duration::ZERO,
-    };
     let busy = json!({"error": {"message": "busy", "retryable": true}});
     let mut s = Session::new(host, streamed(busy, retrying), sink.clone()).unwrap();
     let err = s.turn("go", &cancel).await.unwrap_err();
@@ -897,12 +897,16 @@ async fn a_streamed_round_can_answer_the_failed_form() {
     for (answer, needle) in [
         (
             json!({"error": {"message": "m"}, "usage": {}}),
-            "fields beside `error`",
+            "the failed form carries fields beside `error`",
         ),
-        (json!({"error": "nope"}), "`error` is not an object"),
+        (json!({"error": "nope"}), "`error` is not an object: "),
+        (
+            json!({"error": {"retryable": false}}),
+            "failure has no `message`",
+        ),
         (
             answer(vec![json!({"type": "text", "text": "hi"})], "end_turn"),
-            "neither",
+            "streamed chat output is neither {\"stream\": handle} nor the failed form: ",
         ),
     ] {
         let (host, _) = kernel(vec![]);
@@ -914,7 +918,7 @@ async fn a_streamed_round_can_answer_the_failed_form() {
         .unwrap();
         let err = s.turn("go", &cancel).await.unwrap_err();
         match &err {
-            TurnError::Contract(text) => assert!(text.contains(needle), "{answer}: {text}"),
+            TurnError::Contract(text) => assert!(text.starts_with(needle), "{answer}: {text}"),
             other => panic!("{answer}: {other:?}"),
         }
     }

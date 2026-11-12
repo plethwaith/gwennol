@@ -29,7 +29,7 @@
   ],
   "actions": {
     "chat": {
-      "description": "One model turn per the LLM_CHAT contract. The guest builds the Messages API request and dispatches stream_turn or fetch_turn; the key never enters the guest.",
+      "description": "One model turn per the LLM_CHAT contract. The guest declines an image source it cannot send, or builds the Messages API request and dispatches stream_turn or fetch_turn; the key never enters the guest.",
       "steps": [
         { "id": "run", "type": "script", "params": { "language": "provider-anthropic", "source": "chat" } }
       ]

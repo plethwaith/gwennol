@@ -92,7 +92,7 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    /// Every format, in the order the contract's `media_type` enum lists
+    /// Every format, in the order the contract's `ImageMediaType` enum lists
     /// them.
     pub const ALL: &'static [ImageFormat] = &[Self::Jpeg, Self::Png, Self::Gif, Self::Webp];
 
@@ -171,7 +171,7 @@ impl fmt::Debug for Image {
 /// An image the provider resolves from `reference`, a string the embedder
 /// chose (a path, a storage key).
 ///
-/// The loop stores the reference and never reads it. The format is the
+/// The loop stores the reference and never interprets it. The format is the
 /// caller's declaration, not checked against anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReference {

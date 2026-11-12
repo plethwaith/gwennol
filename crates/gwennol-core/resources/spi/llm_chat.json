@@ -6,7 +6,7 @@
   "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
-      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`.",
+      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`. A streamed request is instead answered with the failed form when the provider declined it before starting a stream.",
       "input": {
         "type": "object",
         "required": ["messages"],
@@ -69,7 +69,7 @@
             "type": "object",
             "required": ["error"],
             "additionalProperties": false,
-            "description": "The failed form: the provider can say why the turn failed, as data. Either the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve). On a streamed request it comes back in place of the stream handle, and only when no stream was started; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
+            "description": "The failed form: the provider can say why the turn failed, as data. Either the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
             "properties": {
               "error": { "$ref": "#/$defs/Failure" }
             }

@@ -204,7 +204,8 @@ written, and it must be settled before a provider exists.
   buffered form (`LLM_CHAT` since 0.2.0) — the vendor answered and said
   no, with `retryable` filled from its answer. What the provider cannot
   classify without reading error text stays a step error, uniformly
-  fatal.
+  fatal. Since 0.5.0 a provider that declines the request before calling a
+  vendor answers the same form, on either path.
 - **Settled: bundling.** A guest-backed manifest commits its module as
   `{"path": "crates/<name>"}`, a form the kernel refuses; `cargo xtask
   bundle` compiles the crate and fills the slot, the integration suite
