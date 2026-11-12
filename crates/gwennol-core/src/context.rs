@@ -1,12 +1,11 @@
-//! What the host knows about *why* an action is running.
+//! What the loop records about *why* an action is running.
 //!
 //! Gwead threads an opaque [`ExecutionContext`] through every dispatch site
 //! and clones it into child invocations, never introspecting it: the
 //! embedder owns the schema. Gwennol writes one key, [`CONTEXT_KEY`], beside
 //! whatever entries the session's `SessionConfig::context` carries. Its key
-//! names the model's tool call an action serves, so that a `host_*` step
-//! reached through two `dispatch_role` hops can still tell the operator
-//! that the model asked `bash` to run something.
+//! names the model's tool call an action serves, so that a step reached
+//! through two `dispatch_role` hops can still name the call it serves.
 //!
 //! Threading it this way rather than through a task-local is deliberate:
 //! the kernel may run step bodies on tasks the host never sees, and the
@@ -19,7 +18,7 @@
 use gwead::kernel::ExecutionContext;
 use gwead::serde_json::{Map, Value, json};
 
-use crate::operator::ToolCall;
+use crate::events::ToolCall;
 
 /// Top-level key Gwennol's slice of the execution context lives under.
 pub const CONTEXT_KEY: &str = "gwennol";
@@ -27,8 +26,8 @@ pub const CONTEXT_KEY: &str = "gwennol";
 /// Build the execution context for an action run on behalf of `call`.
 ///
 /// This is [`exec_context_with`] with an empty base; the agent loop passes
-/// that function's result to `Kernel::execute(…).with_exec_ctx(…)`; every approval raised underneath
-/// then carries the call as [`ApprovalRequest::cause`](crate::ApprovalRequest).
+/// that function's result to `Kernel::execute(…).with_exec_ctx(…)`; a step
+/// body underneath reads the call back with [`tool_call`].
 pub fn exec_context(call: &ToolCall) -> ExecutionContext {
     exec_context_with(&Map::new(), call)
 }
@@ -62,8 +61,8 @@ pub fn exec_context_with(base: &Map<String, Value>, call: &ToolCall) -> Executio
 ///
 /// `None` for a context Gwennol did not write — an empty one, or an
 /// embedder's own blob. A malformed entry reads as `None` rather than
-/// failing a step: the cause is explanatory, and losing it must never turn
-/// into losing the approval.
+/// failing the reader: the cause is explanatory, and losing it must never
+/// turn into losing what it explains.
 pub fn tool_call(ctx: &ExecutionContext) -> Option<ToolCall> {
     let tc = ctx.as_value().get(CONTEXT_KEY)?.get("toolCall")?;
     Some(ToolCall {

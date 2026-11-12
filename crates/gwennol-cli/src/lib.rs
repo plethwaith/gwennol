@@ -38,7 +38,7 @@ pub mod tui;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
-use gwennol_core::Decision;
+use gwennol_host::Decision;
 
 use policy::{RuleSpec, Source};
 

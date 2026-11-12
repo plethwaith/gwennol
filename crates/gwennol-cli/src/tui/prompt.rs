@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use gwennol_core::{Access, ApprovalRequest, Decision};
+use gwennol_host::{Access, ApprovalRequest, Decision};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -102,7 +102,7 @@ impl Prompt {
 }
 
 /// Removes prompt `id` when dropped: the shape
-/// [`gwennol_core::Operator::approve`]'s drop obligation asks for. Holds
+/// [`gwennol_host::Operator::approve`]'s drop obligation asks for. Holds
 /// no lock across an `await`, so it cannot deadlock the state it
 /// updates.
 pub struct PromptGuard {
@@ -386,8 +386,9 @@ pub fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
 pub(crate) mod tests {
     use std::task::{Context, Poll, Waker};
 
+    use gwennol_core::ToolCall;
     use gwennol_core::gwead::tokio_util::sync::CancellationToken;
-    use gwennol_core::{Operator, ToolCall};
+    use gwennol_host::Operator;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

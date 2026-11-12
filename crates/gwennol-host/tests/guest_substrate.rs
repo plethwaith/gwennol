@@ -28,7 +28,8 @@ use gwead::kernel::streams::{STREAM_IO_ERROR, StreamRegistry, read_async_shared}
 use gwead::kernel::{Kernel, KernelConfig};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{HostConfig, ProcessEnv, spi};
+use gwennol_core::spi;
+use gwennol_host::{HostConfig, ProcessEnv};
 // The guest's own exported names: the manifest and these tests name the
 // plugin, its actions, and its entry points from the one declaration
 // the guest crate carries, instead of retyping string literals that
@@ -111,14 +112,14 @@ fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
-        let mut kernel = gwennol_core::boot_with(HostConfig {
+        let mut kernel = gwennol_host::boot_with(HostConfig {
             operator: Arc::new(Permissive),
             workspace_root: workspace,
             process_env: ProcessEnv::default(),
             // The embedder half of the authorization the manifest's
             // provide: grant asks for.
             trusted_step_type_providers: vec![PLUGIN.to_string()],
-            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
+            action_timeout: gwennol_host::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         kernel

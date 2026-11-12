@@ -254,7 +254,7 @@ name = "api_key"
 file = "anthropic.key"            # or env = "ANTHROPIC_API_KEY"
 
 [process]
-env = "allowlist"                 # or "inherit" (see ProcessEnv in gwennol-core;
+env = "allowlist"                 # or "inherit" (see ProcessEnv in gwennol-host;
 allow = ["CARGO_HOME", "RUSTUP_HOME"]  # `allow` beside inherit is a startup error)
 
 [[rules]]

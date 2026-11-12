@@ -4,14 +4,11 @@
 //! A [`Session`] holds one conversation against one `LLM_CHAT` provider
 //! and the `TOOL` plugins it offers: every one the kernel has, or the
 //! ones [`SessionConfig::tool_plugins`] names. [`Session::turn`] runs one
-//! user turn to completion; [`Session::run`] drives turns from
-//! [`Operator::input`] until the operator ends the session (a session built
-//! with [`Session::with_events`] has no input, and `run` returns at once).
-//! Everything the loop shows a frontend goes through [`Operator::emit`] as
-//! an [`Event`] — or, for a session built with [`Session::with_events`],
-//! through its [`EventSink`]; everything a plugin wants from outside the
-//! sandbox still goes through the two gates, with the tool call that caused
-//! it named in the approval (see [`crate::context`]).
+//! user turn to completion. Everything the loop shows a frontend goes
+//! through the session's [`EventSink`] as an [`Event`]. The tool call
+//! that caused a kernel invocation travels with it as an execution
+//! context, so a step reached several dispatches later can name it (see
+//! [`crate::context`]).
 //!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
@@ -40,17 +37,17 @@
 //!   message, in order, results before any text. A tool that reports
 //!   `is_error` is answered with that; a tool that *cannot* answer —
 //!   the model named a tool that does not exist, sent arguments the
-//!   schema refuses, or the call failed as a step (the operator denied,
+//!   schema refuses, or the call failed as a step (the step refused it,
 //!   the kernel refused, the plugin returned a malformed result) — is
 //!   answered with an `is_error` result carrying the reason verbatim,
 //!   and the frontend is told which case it was ([`Event::ToolFailed`]
 //!   against [`Event::ToolResult`]). The loop branches on none of that
 //!   text. Settled here rather than ending the turn because an
 //!   unanswered call leaves the conversation unreplayable, and the
-//!   operator's refusal in particular is something the model should
+//!   step's refusal in particular is something the model should
 //!   go around, not something the user should have to re-prompt past.
 //!   Calls run one at a time, in the order the model made them, so
-//!   the operator's prompts arrive in that order too. A round the
+//!   their effects happen in that order. A round the
 //!   model ended in a refusal while still asking for tools is stored
 //!   with each call answered as not run: the refusal is not continued,
 //!   and the model keeps the memory of having refused.
@@ -63,28 +60,17 @@
 //! - **Cancellation tears the turn down.** The token handed to
 //!   [`Session::turn`] reaches every kernel invocation the turn makes
 //!   and the loop's own waits: a stream being read is closed (the
-//!   relay sees its reader gone and winds down), a pending approval is
-//!   withdrawn, a running tool step observes the token and stops,
-//!   reported as the kernel's typed cancellation. The turn's own token
-//!   is the authority: once it has fired, whatever a step reports is
-//!   the cut arriving (a step's text goes to the log; a stream
+//!   relay sees its reader gone and winds down), a step that has not
+//!   begun its work can report that it was stopped before it started
+//!   ([`crate::cancel`]), a running tool step observes the token and
+//!   stops, reported as the kernel's typed cancellation. The turn's own
+//!   token is the authority: once it has fired, whatever a step reports
+//!   is the cut arriving (a step's text goes to the log; a stream
 //!   source's failure the cut hid travels on
-//!   [`TurnError::Cancelled`]), and a cancellation
-//!   arriving *without* it is a step failure, reported as such and
-//!   logged. The kernel's action ceiling never produces the typed
-//!   shape — its watchdog reports a step it stopped as
-//!   `ExecutionTimeout` — and produces the structured
-//!   `steps::CANCELLED_CODE` only by withdrawing a held approval,
-//!   which the turn sees as that code when the step unwinds within
-//!   the kernel's drop grace past the deadline and as the timeout
-//!   otherwise; a plugin may throw the code itself; and the typed
-//!   shape arrives without the turn's token only from a step that
-//!   reports cancellation on a token that has not fired, which none
-//!   in this repo does.
-//!   Only a withdrawn approval carries more than the typed variant
-//!   can: nothing ran, which is why, among the host steps' own
-//!   cancellations, it alone stays the structured
-//!   `steps::CANCELLED_CODE`.
+//!   [`TurnError::Cancelled`]), and a cancellation arriving *without*
+//!   it is a step failure, reported as such and logged.
+//!   `reports_cancellation` decides which errors count as a
+//!   cancellation, and [`crate::cancel`] says what a step sends.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as
@@ -101,8 +87,8 @@
 //!   the next turn's text joins that message. Nothing that happened is
 //!   lost from the model's view, and nothing half-happened enters it.
 //!
-//! What the loop deliberately does not do: choose policy (every
-//! approval is the operator's), persist anything, or manage the
+//! What the loop deliberately does not do: choose policy, persist
+//! anything, or manage the
 //! context window — the roadmap's "Beyond the MVP". A frontend that
 //! stores [`Session::transcript`] hands it back with
 //! [`Session::restore`].
@@ -117,7 +103,7 @@ use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
 use crate::context::{CONTEXT_KEY, exec_context_with};
-use crate::operator::{Event, EventSink, Operator, ToolCall};
+use crate::events::{Event, EventSink, ToolCall};
 use crate::spi;
 use crate::spi::HarvestError;
 
@@ -281,7 +267,7 @@ pub enum TurnError {
     #[error("provider refused the turn: {0}")]
     Provider(Failure),
     /// The provider's `chat` action failed as a step: the transport,
-    /// the operator, or the kernel said no before the vendor answered.
+    /// a step, or the kernel said no before the vendor answered.
     /// Uniformly fatal; the message is not for consumers to read.
     #[error("provider step failed: {0}")]
     Step(KernelError),
@@ -320,9 +306,6 @@ pub enum TurnError {
 /// refused a transcript.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    /// [`crate::boot`] has not run in this process.
-    #[error("gwennol host not installed: boot the kernel with gwennol_core::boot first")]
-    NotBooted,
     /// No plugin fulfils `LLM_CHAT`.
     #[error("no LLM_CHAT provider is registered")]
     NoProvider,
@@ -486,21 +469,12 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
 /// One conversation: a provider, the tools, and the transcript so far.
 pub struct Session {
     kernel: Arc<Kernel>,
-    frontend: Frontend,
+    events: Arc<dyn EventSink>,
     config: SessionConfig,
     provider: String,
     tools: ToolTable,
     transcript: Transcript,
     no_config: Value,
-}
-
-/// Where a session's events go, and whether it has an input source.
-enum Frontend {
-    /// The process's installed operator: events, and input for
-    /// [`Session::run`].
-    Operator(Arc<dyn Operator>),
-    /// The embedder's own sink: events only.
-    Events(Arc<dyn EventSink>),
 }
 
 impl std::fmt::Debug for Session {
@@ -529,38 +503,17 @@ enum RoundResult {
 impl Session {
     /// Start a session on a booted kernel — the `Arc` from
     /// [`Kernel::into_arc`], with the SPI contracts, the provider and
-    /// the tools registered. Resolves the provider, harvests the tools
-    /// and compiles their schemas; each can refuse, see
-    /// [`SessionError`].
-    pub fn new(kernel: Arc<Kernel>, config: SessionConfig) -> Result<Self, SessionError> {
-        let operator = crate::host::installed()
-            .ok_or(SessionError::NotBooted)?
-            .operator
-            .clone();
-        Self::build(kernel, config, Frontend::Operator(operator))
-    }
-
-    /// Start a session that sends its events to `events` instead of the
-    /// installed operator.
+    /// the tools registered — that sends its events to `events`.
+    /// Resolves the provider, harvests the tools and compiles their
+    /// schemas; each can refuse, see [`SessionError`].
     ///
-    /// Does not read the process-global host itself, so it never returns
-    /// [`SessionError::NotBooted`]. Several such sessions can
-    /// share a kernel and keep their events apart. There is no input source:
-    /// [`Self::run`] returns at once, and the session is driven with
-    /// [`Self::turn`]. Refuses as [`Self::new`] does, except for
-    /// `NotBooted`.
-    pub fn with_events(
+    /// The session reads no process-global state. Several sessions can
+    /// share a kernel and keep their events apart, each with its own
+    /// sink, and a session is driven with [`Self::turn`].
+    pub fn new(
         kernel: Arc<Kernel>,
         config: SessionConfig,
         events: Arc<dyn EventSink>,
-    ) -> Result<Self, SessionError> {
-        Self::build(kernel, config, Frontend::Events(events))
-    }
-
-    fn build(
-        kernel: Arc<Kernel>,
-        config: SessionConfig,
-        frontend: Frontend,
     ) -> Result<Self, SessionError> {
         if config.context.contains_key(CONTEXT_KEY) {
             return Err(SessionError::ReservedContextKey);
@@ -569,7 +522,7 @@ impl Session {
         let tools = ToolTable::harvest(&kernel, config.tool_plugins.as_ref())?;
         Ok(Self {
             kernel,
-            frontend,
+            events,
             config,
             provider,
             tools,
@@ -601,10 +554,7 @@ impl Session {
 
     /// Send one event to wherever this session's events go.
     fn emit(&self, event: Event) {
-        match &self.frontend {
-            Frontend::Operator(operator) => operator.emit(event),
-            Frontend::Events(events) => events.emit(event),
-        }
+        self.events.emit(event);
     }
 
     /// The provider plugin this session talks to.
@@ -616,30 +566,6 @@ impl Session {
     /// messages, oldest first.
     pub fn transcript(&self) -> &[Value] {
         self.transcript.messages()
-    }
-
-    /// Drive turns from [`Operator::input`] until it returns `None`,
-    /// stopping at the first turn that does not complete. A frontend
-    /// that wants to carry on past a failed turn drives [`Self::turn`]
-    /// itself. On a session built by [`Self::with_events`] there is no
-    /// input and this returns `Ok(())` without a turn.
-    pub async fn run(&mut self, cancel: &CancellationToken) -> Result<(), TurnError> {
-        let Frontend::Operator(operator) = &self.frontend else {
-            // A session built by `with_events` has no input source.
-            return Ok(());
-        };
-        let operator = operator.clone();
-        loop {
-            let turn = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(TurnError::Cancelled { detail: None }),
-                turn = operator.input() => turn,
-            };
-            let Some(turn) = turn else {
-                return Ok(());
-            };
-            self.turn(&turn.text, cancel).await?;
-        }
     }
 
     /// Run one user turn to completion: provider rounds and the tool
@@ -977,14 +903,8 @@ impl Session {
                             return Err(Interrupted(Cut::from_error(&e)));
                         }
                         // A cancellation nobody asked for is a failure
-                        // to report, not a cut. The structured code
-                        // comes from the kernel's action ceiling
-                        // withdrawing a held approval (within the
-                        // kernel's drop grace; past it, the timeout)
-                        // or from a plugin throwing it; the typed
-                        // shape only from a step reporting
-                        // cancellation on a token that has not fired,
-                        // which none here does.
+                        // to report, not a cut; `reports_cancellation`
+                        // decides what counts as one.
                         Err(e) if reports_cancellation(&e) => {
                             warn_if_unrequested(&e);
                             Err(format!(
@@ -1058,7 +978,7 @@ struct Interrupted(Cut);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cut {
     /// Nothing had happened: the loop had not dispatched it, or the
-    /// host step's approval was withdrawn before the operator answered.
+    /// step reported it was stopped before it started.
     BeforeStart,
     /// The step was somewhere in its work, and cannot say how far.
     WhileRunning,
@@ -1066,15 +986,14 @@ enum Cut {
 
 impl Cut {
     /// Read how far the cancelled step got from what it reported. Only
-    /// a withdrawn approval's structured error can say it never
-    /// started; the kernel's typed in-work cancellation, a cancellation
-    /// flattened by a nested invoke, or any other shape, is read as the
-    /// cautious answer.
+    /// a step's structured error can say it never started; the kernel's
+    /// typed in-work cancellation, a cancellation flattened by a nested
+    /// invoke, or any other shape, is read as the cautious answer.
     fn from_error(e: &KernelError) -> Self {
         match e {
             KernelError::PluginError { code, params, .. }
-                if code == crate::steps::CANCELLED_CODE
-                    && params["phase"] == crate::steps::CANCELLED_AT_APPROVAL =>
+                if code == crate::cancel::CANCELLED_CODE
+                    && params["phase"] == crate::cancel::CANCELLED_BEFORE_START =>
             {
                 Cut::BeforeStart
             }
@@ -1095,17 +1014,16 @@ impl Cut {
 }
 
 /// Whether a kernel error carries a cancellation: the kernel's typed
-/// [`KernelError::Cancelled`] — a host step that stopped on its token,
-/// or the kernel's own between-step check — or a host step's
-/// structured `steps::CANCELLED_CODE`, which names a withdrawn
-/// approval. Never on its own a reason to treat a turn as cancelled:
-/// the turn's token is the authority. Without it, the structured
-/// code has two sources: the kernel's action ceiling withdrawing a
-/// held approval, which arrives as the code when the step unwinds
-/// within the kernel's drop grace
-/// (100 ms past the deadline in gwead 0.3.0) and as
-/// [`KernelError::ExecutionTimeout`] otherwise, and a plugin throwing
-/// the code itself. The ceiling never produces the typed shape — its
+/// [`KernelError::Cancelled`] — a step that stopped on its token,
+/// or the kernel's own between-step check — or a step's structured
+/// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a
+/// reason to treat a turn as cancelled: the turn's token is the
+/// authority. Without it, the structured code can come from any step
+/// that sends it, the kernel's action ceiling stopping a step that had
+/// not begun among them: that arrives as the code when the step unwinds
+/// within the kernel's drop grace (100 ms past the deadline in gwead
+/// 0.3.0) and as [`KernelError::ExecutionTimeout`] otherwise. The
+/// ceiling never produces the typed shape — its
 /// watchdog reports a step it stopped as the timeout — so without
 /// the turn's token that shape can only come from a step that
 /// reports cancellation on a token that has not fired, which the
@@ -1115,7 +1033,7 @@ impl Cut {
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
-        KernelError::PluginError { code, .. } => code == crate::steps::CANCELLED_CODE,
+        KernelError::PluginError { code, .. } => code == crate::cancel::CANCELLED_CODE,
         _ => false,
     }
 }
@@ -1123,7 +1041,7 @@ fn reports_cancellation(e: &KernelError) -> bool {
 /// A cancellation the turn did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling withdrew a held approval, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
+        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 
@@ -1369,15 +1287,15 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_is_read_from_the_host_steps_structured_error_only() {
+    fn a_cut_is_read_from_a_steps_structured_error_only() {
         let withdrawn = KernelError::PluginError {
-            code: crate::steps::CANCELLED_CODE.into(),
+            code: crate::cancel::CANCELLED_CODE.into(),
             message: "cancelled".into(),
-            params: json!({"phase": crate::steps::CANCELLED_AT_APPROVAL}),
+            params: json!({"phase": crate::cancel::CANCELLED_BEFORE_START}),
         };
         assert_eq!(Cut::from_error(&withdrawn), Cut::BeforeStart);
         let in_work = KernelError::PluginError {
-            code: crate::steps::CANCELLED_CODE.into(),
+            code: crate::cancel::CANCELLED_CODE.into(),
             message: "cancelled".into(),
             params: Value::Null,
         };

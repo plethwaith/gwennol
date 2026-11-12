@@ -79,8 +79,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
-use gwennol_core::steps::fs::deepest_canonical;
-use gwennol_core::{Access, ApprovalRequest, Decision};
+use gwennol_host::steps::fs::deepest_canonical;
+use gwennol_host::{Access, ApprovalRequest, Decision};
 
 /// What a rule matches against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

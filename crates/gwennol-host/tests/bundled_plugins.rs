@@ -26,9 +26,9 @@ use gwead::kernel::streams::StreamRegistry;
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{
-    Access, ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, Session,
-    SessionConfig, StopReason, Turn, spi,
+use gwennol_core::{Event, Session, SessionConfig, StopReason, spi};
+use gwennol_host::{
+    Access, ApprovalRequest, Decision, HostConfig, Operator, OperatorEvents, ProcessEnv, Turn,
 };
 
 mod common;
@@ -121,6 +121,19 @@ impl Operator for Keyed {
 
 // ------------------------------------------------------------- fixture
 
+/// A session on the fixture's kernel whose events go to the fixture's
+/// operator, as a frontend that booted the host starts one.
+fn new_session(
+    kernel: Arc<Kernel>,
+    config: SessionConfig,
+) -> Result<Session, gwennol_core::SessionError> {
+    Session::new(
+        kernel,
+        config,
+        Arc::new(OperatorEvents(fixture().keyed.clone())),
+    )
+}
+
 struct Fixture {
     kernel: Arc<Kernel>,
     workspace: PathBuf,
@@ -137,12 +150,12 @@ fn fixture() -> &'static Fixture {
         let bundled = xtask::bundle(&xtask::workspace_root())
             .unwrap_or_else(|e| panic!("bundling plugins/ failed: {e}"));
         let keyed = Arc::new(Keyed::default());
-        let mut kernel = gwennol_core::boot_with(HostConfig {
+        let mut kernel = gwennol_host::boot_with(HostConfig {
             operator: keyed.clone(),
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
             trusted_step_type_providers: vec![PROVIDER.to_string(), EDIT.to_string()],
-            action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
+            action_timeout: gwennol_host::DEFAULT_ACTION_TIMEOUT,
         })
         .unwrap();
         for plugin in &bundled {
@@ -1031,7 +1044,7 @@ async fn the_loop_drives_the_bundled_provider_and_tools() {
     let mut configs = std::collections::BTreeMap::new();
     configs.insert(PROVIDER.to_string(), f.config("/loop-round-trip"));
     // Only one LLM_CHAT plugin is registered: resolved by role.
-    let mut session = Session::new(
+    let mut session = new_session(
         f.kernel.clone(),
         SessionConfig {
             system: Some("You are terse.".into()),
@@ -1110,7 +1123,7 @@ async fn cancelling_a_buffered_round_against_the_bundled_provider_is_a_cancel() 
     let f = fixture();
     let mut configs = std::collections::BTreeMap::new();
     configs.insert(PROVIDER.to_string(), f.config("/stall"));
-    let mut session = Session::new(
+    let mut session = new_session(
         f.kernel.clone(),
         SessionConfig {
             stream: false,
@@ -1225,7 +1238,7 @@ async fn the_read_tool_numbers_lines_and_takes_a_range() {
     let ceiling_path = f.workspace.join("range-huge.bin");
     std::fs::File::create(&ceiling_path)
         .unwrap()
-        .set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 2)
+        .set_len(gwennol_host::steps::fs::READ_BYTES_CEILING + 2)
         .unwrap();
     let out = f
         .call_tool("read", json!({"path": "range-huge.bin", "offset": 2}))
@@ -1298,7 +1311,7 @@ fn the_committed_edit_manifest_names_its_guest_and_its_cap() {
         default_limit,
         format!(
             "{{{{$input.limit ?? {}}}}}",
-            gwennol_core::steps::fs::READ_BYTES_CEILING
+            gwennol_host::steps::fs::READ_BYTES_CEILING
         )
     );
 }

@@ -28,11 +28,12 @@ use std::time::Duration;
 use gwead::kernel::Kernel;
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_core::{
-    Access, ApprovalRequest, Decision, Event, EventSink, Operator, Session, SessionConfig,
-    SessionError, StopReason, ToolCall, Turn, TurnError, TurnOutcome, spi,
+    Event, EventSink, Session, SessionConfig, SessionError, StopReason, ToolCall, TurnError,
+    TurnOutcome, spi,
 };
+use gwennol_host::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
+use gwennol_host::{Access, ApprovalRequest, Decision, Operator, OperatorEvents, Turn};
 
 mod common;
 use common::{assert_conforms, contracts};
@@ -86,7 +87,7 @@ impl Sink {
 
 /// Run `fut` with an event sink, returning its output and the events
 /// emitted while it ran.
-async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
+async fn record_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
     let sink = Arc::new(Sink::default());
     let out = EVENTS.scope(sink.clone(), fut).await;
     (out, sink.snapshot())
@@ -162,7 +163,7 @@ impl Wake for Woken {
 
 /// Approves everything except plugins named `denied*`; holds approvals
 /// for plugins named `gated*` until the test releases them; records
-/// every request; feeds `Session::run` from a queue.
+/// every request; feeds `gwennol_host::run` from a queue.
 #[derive(Default)]
 struct Harness {
     requests: Mutex<Vec<ApprovalRequest>>,
@@ -199,8 +200,8 @@ impl Operator for Harness {
         None
     }
     fn emit(&self, event: Event) {
-        // A session driven outside `with_events` (none here) would
-        // simply not be recorded.
+        // A session driven outside `record_events` would simply not be
+        // recorded.
         let _ = EVENTS.try_with(|sink| sink.record(event));
     }
     async fn input(&self) -> Option<Turn> {
@@ -230,7 +231,7 @@ fn fixture() -> &'static Fixture {
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         std::fs::write(workspace.join("hello.txt"), "hello from the workspace\n").unwrap();
         let harness = Arc::new(Harness::default());
-        let mut kernel = gwennol_core::boot(harness.clone(), workspace.clone()).unwrap();
+        let mut kernel = gwennol_host::boot(harness.clone(), workspace.clone()).unwrap();
         for plugin in fixture_plugins() {
             kernel
                 .register_plugin_from_json(&plugin.to_string())
@@ -277,9 +278,19 @@ fn config(route: &str) -> SessionConfig {
     }
 }
 
+/// A session on the fixture's kernel whose events go to the fixture's
+/// operator, as a frontend that booted the host starts one.
+fn new_session(kernel: Arc<Kernel>, config: SessionConfig) -> Result<Session, SessionError> {
+    Session::new(
+        kernel,
+        config,
+        Arc::new(OperatorEvents(fixture().harness.clone())),
+    )
+}
+
 /// A streamed session against one stub route.
 fn session(route: &str) -> Session {
-    Session::new(fixture().kernel.clone(), config(route)).unwrap()
+    new_session(fixture().kernel.clone(), config(route)).unwrap()
 }
 
 /// A buffered session answering from canned responses.
@@ -287,7 +298,7 @@ fn canned(answers: Vec<Value>) -> Session {
     let f = fixture();
     let mut configs = BTreeMap::new();
     configs.insert(CANNED_LLM.to_string(), json!({"answers": answers}));
-    Session::new(
+    new_session(
         f.kernel.clone(),
         SessionConfig {
             provider: Some(CANNED_LLM.into()),
@@ -406,7 +417,7 @@ fn fixture_plugins() -> Vec<Value> {
             "forger",
             &[],
             json!([{"id": "t", "type": "throw_error", "params": {
-                "code": gwennol_core::steps::CANCELLED_CODE, "message": "forged"}}]),
+                "code": gwennol_core::cancel::CANCELLED_CODE, "message": "forged"}}]),
         ),
         tool_plugin(
             "fixture_slow",
@@ -591,7 +602,7 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
         "/always-retryable" | "/always-retryable-saturating" | "/always-retryable-cancelled" => {
             vec![json!({"type": "error", "message": "still overloaded", "retryable": true})]
         }
-        "/fatal" => vec![
+        "/fatal" | "/fatal-in-run" => vec![
             json!({"type": "error", "message": "bad key", "retryable": false, "kind": "authentication_error"}),
         ],
         "/unknown-retryable" => vec![json!({"type": "error", "message": "who knows"})],
@@ -736,14 +747,14 @@ async fn a_session_needs_one_named_or_unambiguous_provider() {
     let f = fixture();
     // Two fulfillers are registered: resolving by role refuses rather
     // than picking silently.
-    let err = Session::new(f.kernel.clone(), SessionConfig::default()).unwrap_err();
+    let err = new_session(f.kernel.clone(), SessionConfig::default()).unwrap_err();
     match err {
         SessionError::AmbiguousProvider(names) => {
             assert_eq!(names, vec![CANNED_LLM.to_string(), STREAM_LLM.to_string()]);
         }
         other => panic!("{other}"),
     }
-    let err = Session::new(
+    let err = new_session(
         f.kernel.clone(),
         SessionConfig {
             provider: Some("fixture_echo".into()),
@@ -765,7 +776,7 @@ async fn a_session_needs_one_named_or_unambiguous_provider() {
 async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
     let f = fixture();
     let mut s = session("/tools");
-    let (outcome, events) = with_events(async { turn(&mut s, "call the tool").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "call the tool").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::EndTurn);
     assert_eq!(outcome.rounds, 2);
@@ -813,7 +824,7 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
 
     // The second turn carries the whole transcript, and the request the
     // provider builds is what the loop was configured with.
-    let (second, events) = with_events(async { turn(&mut s, "and once more").await }).await;
+    let (second, events) = record_events(async { turn(&mut s, "and once more").await }).await;
     assert_eq!(second.unwrap().rounds, 2);
     assert!(events.contains(&Event::TurnComplete));
     let sent = f.stub.requests_for("/tools");
@@ -872,7 +883,7 @@ async fn the_buffered_form_runs_the_same_loop() {
             "usage": {"input_tokens": 3, "output_tokens": 4}
         }),
     ]);
-    let (outcome, events) = with_events(async { turn(&mut s, "go").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "go").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.rounds, 2);
     assert_eq!(outcome.usage.input_tokens, 4);
@@ -938,7 +949,7 @@ async fn the_buffered_failure_and_contract_violations_are_read_fail_closed() {
 async fn the_assistant_message_is_rebuilt_from_the_stream_and_replayed_verbatim() {
     let f = fixture();
     let mut s = session("/opaque");
-    let (outcome, events) = with_events(async { turn(&mut s, "think then call").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "think then call").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     // Text is shown as it streamed, never the opaque block.
     assert_eq!(
@@ -970,7 +981,7 @@ async fn the_assistant_message_is_rebuilt_from_the_stream_and_replayed_verbatim(
     );
 }
 
-/// `Session::run` drives turns from the operator until it has none.
+/// `gwennol_host::run` drives turns from the operator until it has none.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_takes_turns_from_the_operator_until_input_ends() {
     let f = fixture();
@@ -981,10 +992,13 @@ async fn run_takes_turns_from_the_operator_until_input_ends() {
         inputs.push_back("two".into());
     }
     let cancel = CancellationToken::new();
-    let (outcome, events) = with_events(async {
-        tokio::time::timeout(Duration::from_secs(30), s.run(&cancel))
-            .await
-            .unwrap()
+    let (outcome, events) = record_events(async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel),
+        )
+        .await
+        .unwrap()
     })
     .await;
     outcome.unwrap();
@@ -1004,7 +1018,7 @@ async fn run_takes_turns_from_the_operator_until_input_ends() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     let mut s = session("/fail-tool");
-    let (outcome, events) = with_events(async { turn(&mut s, "fail").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "fail").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     let c1 = tool_call("c1", "fail", json!({}));
     assert!(events.contains(&Event::ToolResult {
@@ -1019,7 +1033,7 @@ async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     );
 
     let mut s = session("/cut-tool");
-    let (outcome, events) = with_events(async { turn(&mut s, "cut").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "cut").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     let rendered = format!("abc\n{}", spi::tool::TRUNCATED_MARKER);
     assert!(events.contains(&Event::ToolResult {
@@ -1064,7 +1078,7 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
         ),
     ] {
         let mut s = session(route);
-        let (outcome, events) = with_events(async { turn(&mut s, route).await }).await;
+        let (outcome, events) = record_events(async { turn(&mut s, route).await }).await;
         assert_eq!(outcome.unwrap().rounds, 2, "{route}: the turn continued");
         let failed = events
             .iter()
@@ -1135,7 +1149,7 @@ async fn a_tool_call_names_itself_in_the_approval_it_causes() {
 async fn retryable_failures_are_retried_and_others_end_the_turn() {
     let f = fixture();
     let mut s = session("/retry");
-    let (outcome, events) = with_events(async { turn(&mut s, "flaky").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "flaky").await }).await;
     assert_eq!(outcome.unwrap().rounds, 1, "one round, two attempts");
     assert_eq!(
         events,
@@ -1160,7 +1174,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     assert_eq!(s.transcript()[1]["content"][0]["text"], "recovered");
 
     let mut s = session("/always-retryable");
-    let (outcome, events) = with_events(async { turn(&mut s, "hopeless").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "hopeless").await }).await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Provider(f) if f.retryable == Some(true)));
     assert_eq!(
         events
@@ -1175,7 +1189,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     // The backoff is clamped before the first wait and doubled without
     // overflow: an hour's initial backoff under a millisecond ceiling
     // retries at once, and a maximal one never panics the loop.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1188,7 +1202,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     )
     .unwrap();
     assert_eq!(turn(&mut s, "clamped").await.unwrap().rounds, 1);
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1237,7 +1251,7 @@ async fn off_contract_streams_fail_the_turn_closed() {
     // A stream that ends without `end` is a failed turn, not a short
     // answer — the "hel" it streamed is shown, never stored.
     let mut s = session("/truncated");
-    let (outcome, events) = with_events(async { turn(&mut s, "cut").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "cut").await }).await;
     assert!(matches!(outcome.unwrap_err(), TurnError::StreamEnded));
     assert_eq!(events, vec![Event::Text("hel".into())]);
     assert_eq!(s.transcript(), &[user("cut")]);
@@ -1256,7 +1270,7 @@ async fn off_contract_streams_fail_the_turn_closed() {
 
     // The event cap is the loop's bound on buffering.
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_event_bytes: 4096,
@@ -1279,8 +1293,8 @@ async fn off_contract_streams_fail_the_turn_closed() {
 async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
     let mut cfg = config("/stall");
     cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] = json!(500);
-    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
-    let (outcome, events) = with_events(async { turn(&mut s, "stall").await }).await;
+    let mut s = new_session(fixture().kernel.clone(), cfg).unwrap();
+    let (outcome, events) = record_events(async { turn(&mut s, "stall").await }).await;
     let err = outcome.unwrap_err();
     assert!(
         matches!(&err, TurnError::StreamFailed { detail: Some(d) } if d == "no response data for 500ms"),
@@ -1313,7 +1327,7 @@ async fn a_failure_the_cut_finds_waiting_ends_the_turn_cancelled_with_its_text()
     let mut cfg = config("/hold");
     cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] =
         json!(IDLE.as_millis() as u64);
-    let mut s = Session::new(fixture().kernel.clone(), cfg).unwrap();
+    let mut s = new_session(fixture().kernel.clone(), cfg).unwrap();
     let cancel = CancellationToken::new();
     let sink = Arc::new(Sink::default());
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
@@ -1396,7 +1410,7 @@ async fn refusal_and_max_tokens_end_the_turn() {
     // as not run — the model remembers refusing, and the transcript
     // stays replayable.
     let mut s = session("/refusal-with-call");
-    let (outcome, events) = with_events(async { turn(&mut s, "hm").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "hm").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Refusal);
     assert_eq!(
@@ -1431,7 +1445,7 @@ async fn refusal_and_max_tokens_end_the_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_round_limit_bounds_a_turn() {
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_rounds: 3,
@@ -1447,7 +1461,7 @@ async fn the_round_limit_bounds_a_turn() {
     assert_eq!(s.transcript()[6]["role"], "user");
 
     // Zero is read as one, and reported as what ran.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             max_rounds: 0,
@@ -1469,7 +1483,7 @@ async fn the_round_limit_bounds_a_turn() {
 async fn a_new_turn_joins_the_trailing_user_message_after_a_failed_one() {
     let f = fixture();
     // One attempt only: the first turn fails on the stub's first answer.
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {
@@ -1515,7 +1529,7 @@ impl Recorder {
 /// A streamed session against one stub route, with its own sink.
 fn sink_session(route: &str) -> (Session, Arc<Recorder>) {
     let sink = Arc::new(Recorder::default());
-    let s = Session::with_events(fixture().kernel.clone(), config(route), sink.clone()).unwrap();
+    let s = Session::new(fixture().kernel.clone(), config(route), sink.clone()).unwrap();
     (s, sink)
 }
 
@@ -1526,7 +1540,7 @@ async fn two_sessions_on_one_kernel_emit_to_their_own_sinks() {
     let (mut a, sink_a) = sink_session("/own/text");
     let (mut b, sink_b) = sink_session("/own/text-b");
     let ((ra, rb), installed) =
-        with_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
+        record_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
     ra.unwrap();
     rb.unwrap();
     assert!(installed.is_empty(), "{installed:?}");
@@ -1636,19 +1650,6 @@ async fn every_transcript_the_loop_stores_can_be_restored() {
             .unwrap_or_else(|e| panic!("{route}: {e}: {stored:?}"));
         assert_eq!(fresh.transcript(), &stored[..], "{route}");
     }
-}
-
-/// The loop's own context key is refused from `Session::new` as well.
-#[test]
-fn the_loops_own_context_key_is_refused_by_new() {
-    let config = SessionConfig {
-        context: json!({"gwennol": {}}).as_object().unwrap().clone(),
-        ..config("/text")
-    };
-    assert!(matches!(
-        Session::new(fixture().kernel.clone(), config),
-        Err(SessionError::ReservedContextKey)
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1828,9 +1829,60 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     assert_eq!(buffered.transcript(), &[user("never")]);
 }
 
-/// `Session::run`'s own select — cancelling before it reads the next
+/// An operator that only feeds turns from its own queue.
+struct Queue(Mutex<VecDeque<String>>);
+
+#[async_trait::async_trait]
+impl Operator for Queue {
+    async fn approve(&self, _: ApprovalRequest) -> Decision {
+        Decision::Allow
+    }
+    async fn secret(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+    fn emit(&self, _: Event) {}
+    async fn input(&self) -> Option<Turn> {
+        self.0.lock().unwrap().pop_front().map(|text| Turn { text })
+    }
+}
+
+/// `gwennol_host::run` stops at the first turn that does not complete: it
+/// returns that turn's error, not a cancellation, and leaves the next turn
+/// unread in the operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_stops_at_the_first_turn_that_fails() {
+    let f = fixture();
+    let mut s = session("/fatal-in-run");
+    let operator = Queue(Mutex::new(VecDeque::from([
+        "one".to_string(),
+        "two".to_string(),
+    ])));
+    let before = f.stub.requests_for("/fatal-in-run").len();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        gwennol_host::run(&mut s, &operator, &CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, Err(TurnError::Provider(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        operator.0.lock().unwrap().iter().collect::<Vec<_>>(),
+        ["two"],
+        "the next turn was not taken"
+    );
+    assert_eq!(
+        f.stub.requests_for("/fatal-in-run").len() - before,
+        1,
+        "one provider request"
+    );
+}
+
+/// `gwennol_host::run`'s own select — cancelling before it reads the next
 /// turn from the operator — ends `run` as a plain cancellation, not as
-/// a turn failure: the site the loop itself owns, beside every one
+/// a turn failure: the site `run` itself owns, beside every one
 /// `Session::turn` guards above.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_is_cancelled_before_it_reads_the_next_turn() {
@@ -1842,10 +1894,10 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
     // a random branch and the ready `input()` arm wins half the time, so
     // one run detects a lost `biased` with probability one half; sixteen
     // runs miss it once in 65,536.
-    let (outcomes, events) = with_events(async {
+    let (outcomes, events) = record_events(async {
         let mut outcomes = Vec::new();
         for _ in 0..16 {
-            outcomes.push(s.run(&cancel).await);
+            outcomes.push(gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel).await);
         }
         outcomes
     })
@@ -1871,7 +1923,7 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_during_the_retry_backoff_ends_the_turn_cancelled() {
     let f = fixture();
-    let mut s = Session::new(
+    let mut s = new_session(
         f.kernel.clone(),
         SessionConfig {
             retry: gwennol_core::RetryPolicy {

@@ -2,8 +2,8 @@
 //!
 //! Gwennol defines two roles: [`llm_chat`] for model providers and [`tool`]
 //! for model-callable tools. The contract documents live in the repository
-//! at `plugins/spi/` and are embedded here; [`crate::boot`] registers them
-//! before any plugin can claim a role, because Gwead checks a plugin
+//! at `plugins/spi/` and are embedded here; [`register`] registers them,
+//! and must run before any plugin claims a role, because Gwead checks a plugin
 //! against a role's contract only when the contract is already registered —
 //! a claim on an unknown role loads with nothing but a warning.
 //!
@@ -78,10 +78,9 @@ pub const SPI_DEFINITIONS: [(&str, &str); 2] = [
 ///
 /// Must run before any plugin claims a bundled role: Gwead checks a claim
 /// against a contract only when the contract is already registered — an
-/// unknown role loads with nothing but a warning. [`crate::boot_with`]
-/// (and so [`crate::boot`]) calls this; any other registration path (a
-/// test kernel, a future embedder seam) must call it too rather than
-/// hand-rolling the loop.
+/// unknown role loads with nothing but a warning. `gwennol_host::boot_with`
+/// calls it; any other registration path (a test kernel, an embedder's own
+/// kernel) must call it too rather than hand-rolling the loop.
 pub fn register(kernel: &mut gwead::kernel::Kernel) -> Result<(), gwead::kernel::KernelError> {
     for (role, definition) in SPI_DEFINITIONS {
         kernel.register_spi_from_json(role, definition)?;

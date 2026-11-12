@@ -11,9 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gwennol_core::{
-    HostConfig, Operator, ProcessEnv, Session, SessionConfig, host, resolve_provider,
-};
+use gwennol_core::{Session, SessionConfig, resolve_provider};
+use gwennol_host::{HostConfig, Operator, OperatorEvents, ProcessEnv, host};
 use serde_json::Value;
 
 use crate::config::{Config, EnvMode, Loaded, PolicyFile};
@@ -138,12 +137,12 @@ pub fn start(
 
     // ---- boot, and register.
     let operator = operator(policy, &secrets, &workspace);
-    let mut kernel = gwennol_core::boot_with(HostConfig {
-        operator,
+    let mut kernel = gwennol_host::boot_with(HostConfig {
+        operator: operator.clone(),
         workspace_root: workspace.clone(),
         process_env,
         trusted_step_type_providers: trusted,
-        action_timeout: gwennol_core::DEFAULT_ACTION_TIMEOUT,
+        action_timeout: gwennol_host::DEFAULT_ACTION_TIMEOUT,
     })?;
     for plugin in &manifests {
         kernel
@@ -201,7 +200,7 @@ pub fn start(
     if let Some(rounds) = cli.max_rounds.or(session_file.and_then(|s| s.max_rounds)) {
         session_config.max_rounds = rounds;
     }
-    let session = Session::new(kernel, session_config)?;
+    let session = Session::new(kernel, session_config, Arc::new(OperatorEvents(operator)))?;
     tracing::info!(provider = session.provider(), "session");
     Ok(session)
 }

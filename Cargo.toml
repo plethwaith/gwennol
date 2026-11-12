@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/gwennol-core",
+    "crates/gwennol-host",
     "crates/gwennol-cli",
     "crates/gwennol-guest",
     "crates/sse-guest",

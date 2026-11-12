@@ -6,10 +6,15 @@
 //! operator. Secrets are fetched the same way, so the host never holds a key
 //! it was not handed for a specific plugin.
 //!
-//! A frontend that only needs a session's events implements [`EventSink`]
-//! instead and starts its session with `Session::with_events`.
+//! A frontend starts its session with `Session::new` and hands it an
+//! [`OperatorEvents`], which sends the session's events to its operator. One
+//! that only needs the events implements [`EventSink`] instead and has no
+//! operator.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use gwennol_core::{Event, EventSink, ToolCall};
 
 /// What a native step wants to do outside the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,21 +58,6 @@ pub enum Access {
     },
 }
 
-/// A tool call the model asked for.
-///
-/// Carried through the kernel as an execution context (see
-/// [`crate::context`]) so that a step body reached several dispatches later
-/// can still name the call it serves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCall {
-    /// Provider-assigned id, when the provider issued one.
-    pub id: Option<String>,
-    /// Tool name, as the model asked for it.
-    pub name: String,
-    /// JSON-encoded arguments, as the model produced them.
-    pub arguments: String,
-}
-
 /// An [`Access`], who is asking, and what the model asked for.
 ///
 /// `plugin` is the Gwead plugin whose action is executing — the tool or
@@ -75,7 +65,7 @@ pub struct ToolCall {
 /// wants to run …" and remember decisions per plugin.
 ///
 /// `cause` is the model's tool call that set this in motion, when the
-/// frontend ran the action through [`crate::context::exec_context_with`] or [`crate::context::exec_context`]; with it
+/// frontend ran the action through [`gwennol_core::context::exec_context_with`] or [`gwennol_core::context::exec_context`]; with it
 /// a prompt can say *the model asked `bash` to run `rm -rf build`* rather
 /// than merely *plugin `bash` wants to spawn a process*. It is `None` for an
 /// action the frontend started itself, which is the honest answer: nothing
@@ -101,80 +91,6 @@ pub enum Decision {
     Allow,
     /// Refuse. The step fails and the plugin sees an error.
     Deny,
-}
-
-/// Something the loop wants the frontend to show.
-///
-/// One event per thing that happened, in the order it happened: text as
-/// it streams (or per block, on a buffered turn), each tool call as the
-/// loop dispatches it, and exactly one of [`Event::ToolResult`] or
-/// [`Event::ToolFailed`] per call the model made — including a call the
-/// loop never dispatched, which gets its [`Event::ToolFailed`] with no
-/// [`Event::ToolCall`] before it, so a frontend hears about every
-/// result the model gets. What the model is *told* is the same in both
-/// cases — a `tool_result` block, `is_error` when the tool did not
-/// succeed — but the frontend is told which it was as data, so a tool
-/// that reported a failure and a tool that could not run are never
-/// confused (the boundary `docs/SPI.md` draws).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Event {
-    /// A chunk of model output text.
-    Text(String),
-    /// The loop is about to run a tool the model asked for.
-    ToolCall(ToolCall),
-    /// The tool answered. `content` is what the model sees — rendered
-    /// through the shared truncation convention — and `is_error` is the
-    /// tool's own verdict on it.
-    ToolResult {
-        /// The call this answers.
-        call: ToolCall,
-        /// The result as handed to the model.
-        content: String,
-        /// The tool reported a failure the model should react to.
-        is_error: bool,
-    },
-    /// The tool could not answer, or was never asked. The model named a
-    /// tool that is not registered, sent arguments its schema refuses,
-    /// or the call failed as a step (the operator denied, the kernel
-    /// refused, the plugin returned a malformed result); or the turn
-    /// was cancelled while it ran; or the loop did not run it at all —
-    /// the turn was cancelled before it started, or the model refused
-    /// its own turn after asking — in which case no [`Event::ToolCall`]
-    /// precedes this. The model is told, as an `is_error` result
-    /// carrying `error` verbatim; the loop never branches on the text.
-    ToolFailed {
-        /// The call that got no answer.
-        call: ToolCall,
-        /// Why, as the model is told it.
-        error: String,
-    },
-    /// The provider refused a turn in a way it marked worth repeating,
-    /// and the loop is about to repeat it. Text already shown for the
-    /// failed attempt will be shown again.
-    Retry {
-        /// The attempt about to be made, counting the first as 1.
-        attempt: u32,
-        /// The most the loop will make.
-        max_attempts: u32,
-        /// The provider's reason for the failed attempt.
-        failure: crate::agent::Failure,
-    },
-    /// The current turn is complete.
-    TurnComplete,
-}
-
-/// Where a session's [`Event`]s go.
-///
-/// A session built with `Session::with_events` sends every event here and
-/// none to an [`Operator`]. `emit` is called synchronously from the task
-/// driving the session's turn, in the order the events occur, so it must
-/// not block: a sink that blocks stalls the task driving the turn (a future
-/// joined with it included) and the thread running it, and one that panics
-/// unwinds the turn's task.
-pub trait EventSink: Send + Sync {
-    /// Take one event. Called from the task driving the session's turn.
-    fn emit(&self, event: Event);
 }
 
 /// One user turn handed to the loop.
@@ -210,8 +126,66 @@ pub trait Operator: Send + Sync {
     /// Block for the next user turn. `None` ends the session.
     ///
     /// Like [`Self::approve`], this future can be dropped before it
-    /// resolves: [`crate::agent::Session::run`] stops waiting for input
+    /// resolves: [`crate::run`] stops waiting for input
     /// when its session token is cancelled. An implementation must be
     /// safe to drop at any await point.
     async fn input(&self) -> Option<Turn>;
+}
+
+/// Sends a session's events to an [`Operator`].
+pub struct OperatorEvents(pub Arc<dyn Operator>);
+
+impl EventSink for OperatorEvents {
+    fn emit(&self, event: Event) {
+        self.0.emit(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Keeps the events it is sent; every other method is out of its reach.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Event>>);
+
+    #[async_trait::async_trait]
+    impl Operator for Recorder {
+        async fn approve(&self, _: ApprovalRequest) -> Decision {
+            unreachable!("events never ask for approval")
+        }
+        async fn secret(&self, _: &str, _: &str) -> Option<String> {
+            unreachable!("events never ask for a secret")
+        }
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+        async fn input(&self) -> Option<Turn> {
+            unreachable!("events never ask for input")
+        }
+    }
+
+    #[test]
+    fn operator_events_forwards_each_event_in_order() {
+        let recorder = Arc::new(Recorder::default());
+        let sink = OperatorEvents(recorder.clone());
+        let call = ToolCall {
+            id: Some("c1".into()),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        sink.emit(Event::Text("hello".into()));
+        sink.emit(Event::ToolCall(call.clone()));
+        sink.emit(Event::TurnComplete);
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![
+                Event::Text("hello".into()),
+                Event::ToolCall(call),
+                Event::TurnComplete,
+            ]
+        );
+    }
 }

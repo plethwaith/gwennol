@@ -98,7 +98,8 @@ file, where secrets come from and the exit statuses are in
 ## Layout
 
 ```
-crates/gwennol-core/   host library: kernel config, native host steps, loop, Operator trait
+crates/gwennol-core/   the agent loop, the SPI contracts and the event types; runs on any Gwead kernel
+crates/gwennol-host/   the host: kernel config, native host steps, the host manifests, the Operator trait
 crates/gwennol-cli/    the `gwennol` binary: interactive session or print run; rules, then a prompt
 crates/gwennol-guest/  guest-side helper for plugins written in Rust → wasm32
 crates/sse-guest/      example guest plugin: SSE body in, contract NDJSON out

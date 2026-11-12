@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 /// The subdirectory of a plugin tree that holds role contracts, which
-/// `gwennol-core` registers itself.
+/// the host registers itself, through `gwennol-core`.
 const CONTRACTS_SUBDIR: &str = "spi";
 
 /// One manifest, read but not yet registered.

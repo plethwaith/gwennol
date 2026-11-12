@@ -1,72 +1,44 @@
-//! Gwennol host library.
+//! The Gwennol agent loop and the contracts it consumes.
 //!
 //! Gwennol (Welsh: *shuttle*) is an agentic coding harness built on the
 //! [Gwead](https://docs.rs/gwead) wasm plugin microkernel. This crate is the
-//! host: it configures the kernel, provides the native step types that touch
-//! the outside world, bundles the SPI and plugin manifests, and runs the agent
-//! loop. Frontends (CLI, TUI, web) implement [`Operator`] and own all policy.
+//! loop: a [`Session`] runs a conversation against one `LLM_CHAT` provider
+//! and the `TOOL` plugins it offers, on any Gwead kernel that has the
+//! [`spi`] contracts registered. It links no step bodies of its own: what a
+//! plugin's steps do, and who is asked before they do it, belong to
+//! whoever builds the kernel.
 //!
 //! # Layering
 //!
 //! ```text
-//! frontend (gwennol-cli, …)   implements Operator: approve / secret / emit / input
+//! frontend                    drives a Session, renders its events
 //!         │
-//! gwennol-core                KernelConfig, native steps, loop, bundled manifests
+//! gwennol-core                the loop, the SPI contracts, the event types
 //!         │
 //! gwead                       manifest resolution, sandboxing, step dispatch
 //!         │
-//! plugins                     tools + model providers, composed from host steps
+//! plugins                     tools + model providers, composed from steps
 //! ```
 //!
 //! Everything model-shaped lives in plugins: the `LLM_CHAT` SPI is implemented
-//! by provider plugins using the host's `host_http.post` step, never by
-//! native code.
+//! by provider plugins, never by native code in this crate.
 //!
-//! # The two gates
-//!
-//! A plugin reaches the outside world only through a `host_*` step — the
-//! `host_fs`, `host_process` and `host_http` plugins publish them — and each
-//! such step passes two gates in order:
-//!
-//! 1. **The manifest**, enforced by the kernel: the plugin must hold
-//!    `step_type:host_fs.read` (or whichever step it uses) — and, for HTTP,
-//!    `network:egress:<host>` — or dispatch is refused before any host code
-//!    runs.
-//! 2. **The operator**, asked by the host: [`Operator::approve`] sees the
-//!    concrete path, argv, or URL, the name of the plugin asking, and the
-//!    model's tool call that set it off (see [`context`]).
-//!
-//! The manifest is therefore an accurate statement of what a plugin *can*
-//! reach; the operator decides what it *may* reach right now.
-//!
-//! Both gates apply per *hop*, not per step: an HTTP redirect is a fresh
-//! request to a host the plugin may never have declared, so it is resolved
-//! by the host and run through both gates again rather than followed by the
-//! HTTP client. What a plugin *cannot* do is inherit authority it never
-//! declared — which is also why a spawned process gets the environment
-//! [`ProcessEnv`] describes rather than the one the agent was launched
-//! with.
+//! A session sends each [`Event`] to the [`EventSink`] it was started with
+//! ([`Session::new`]) and reads no process-global state, so several
+//! sessions can share a kernel and keep their events apart.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod agent;
+pub mod cancel;
 pub mod context;
-pub mod host;
-pub mod kernel;
-pub mod operator;
-pub mod secrets;
+pub mod events;
 pub mod spi;
-pub mod steps;
 
 pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
     Usage, resolve_provider,
 };
+pub use events::{Event, EventSink, ToolCall};
 pub use gwead;
-pub use host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv};
-pub use kernel::{
-    BootError, HOST_FS_MANIFEST, HOST_HTTP_MANIFEST, HOST_MANIFESTS, HOST_PROCESS_MANIFEST, boot,
-    boot_with,
-};
-pub use operator::{Access, ApprovalRequest, Decision, Event, EventSink, Operator, ToolCall, Turn};

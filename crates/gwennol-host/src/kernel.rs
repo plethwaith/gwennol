@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use gwead::kernel::native_impls::NativeStepImplTable;
 use gwead::kernel::{Kernel, KernelConfig, KernelError, RuntimeLimits};
+use gwennol_core::spi;
 
 use crate::host::{DEFAULT_ACTION_TIMEOUT, HostConfig, ProcessEnv, install};
 use crate::operator::Operator;
 use crate::secrets::OperatorSecrets;
-use crate::spi;
 use crate::steps;
 
 /// The `host_fs` plugin manifest, as shipped.

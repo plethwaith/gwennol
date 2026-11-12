@@ -1,7 +1,8 @@
-//! A session on a kernel `boot` did not build, in a process where no
-//! host is installed: the embedder's path through the loop.
+//! A session on a kernel this crate did not build: the embedder's path
+//! through the loop.
 //!
-//! This binary never calls `boot` or `boot_with`. Its kernels carry
+//! This crate has no host to boot, and this binary links none of the host's
+//! native step bodies. Its kernels carry
 //! kernel intrinsics (`return`, `ifs`), a buffered provider, and fixture tools;
 //! the provider and each tool declare a secret so the kernel consults the
 //! resolver on every invocation (`gwead::kernel::secrets`: a non-empty declaration is what
@@ -155,14 +156,10 @@ fn one(seen: &Seen, subject: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_sink_session_runs_without_an_installed_host() {
+async fn a_sink_session_receives_its_events_in_order() {
     let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
-    assert!(matches!(
-        Session::new(kernel.clone(), config("alpha")),
-        Err(SessionError::NotBooted)
-    ));
     let sink = Arc::new(Recorder::default());
-    let mut s = Session::with_events(kernel, config("alpha"), sink.clone()).unwrap();
+    let mut s = Session::new(kernel, config("alpha"), sink.clone()).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let call = ToolCall {
         id: Some("c1".into()),
@@ -185,29 +182,27 @@ async fn a_sink_session_runs_without_an_installed_host() {
     );
 }
 
-#[tokio::test]
-async fn new_without_a_host_is_not_booted_before_any_other_refusal() {
-    let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
-    let config = SessionConfig {
-        context: context(json!({"gwennol": {}})),
-        tool_plugins: Some(names(&["nope"])),
-        provider: Some("nope".into()),
-        ..config("alpha")
-    };
-    assert!(matches!(
-        Session::new(kernel, config),
-        Err(SessionError::NotBooted)
-    ));
-}
-
-#[tokio::test]
-async fn run_on_a_sink_session_returns_without_a_turn() {
-    let (kernel, seen) = kernel(vec![tool("tool_a", "alpha")]);
-    let mut s =
-        Session::with_events(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
-    s.run(&CancellationToken::new()).await.unwrap();
-    assert!(seen.lock().unwrap().is_empty(), "no provider call");
-    assert!(s.transcript().is_empty());
+/// Gwead submits two entries of its own to this table,
+/// `gwead.intrinsics.throw_error` and `gwead.intrinsics.let`; the table
+/// holds those two and nothing else, so none of the host's six step bodies
+/// is among them.
+#[test]
+fn the_table_holds_only_the_kernels_own_entries() {
+    let table = NativeStepImplTable::discover().unwrap();
+    for name in ["gwead.intrinsics.throw_error", "gwead.intrinsics.let"] {
+        assert!(table.get(name).is_some(), "{name} is the kernel's own");
+    }
+    assert_eq!(table.len(), 2, "only gwead's own entries");
+    for name in [
+        "gwennol.host_fs.read",
+        "gwennol.host_fs.write",
+        "gwennol.host_fs.list",
+        "gwennol.host_process.run",
+        "gwennol.host_http.get",
+        "gwennol.host_http.post",
+    ] {
+        assert!(table.get(name).is_none(), "{name} is linked");
+    }
 }
 
 #[tokio::test]
@@ -217,7 +212,7 @@ async fn the_embedders_context_reaches_the_provider_and_the_tool() {
         context: context(json!({"principal": "p1"})),
         ..config("alpha")
     };
-    let mut s = Session::with_events(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let seen_provider: Vec<Value> = seen
         .lock()
@@ -235,8 +230,7 @@ async fn the_embedders_context_reaches_the_provider_and_the_tool() {
 #[tokio::test]
 async fn an_empty_context_leaves_the_provider_round_without_one() {
     let (kernel, seen) = kernel(vec![tool("tool_a", "alpha")]);
-    let mut s =
-        Session::with_events(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
+    let mut s = Session::new(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let provider_contexts: Vec<Value> = seen
         .lock()
@@ -259,7 +253,7 @@ async fn the_loops_own_context_key_is_refused() {
         ..config("alpha")
     };
     assert!(matches!(
-        Session::with_events(kernel, config, Arc::new(Recorder::default())),
+        Session::new(kernel, config, Arc::new(Recorder::default())),
         Err(SessionError::ReservedContextKey)
     ));
 }
@@ -276,7 +270,7 @@ async fn a_session_offers_the_tool_plugins_it_selected() {
         decoy(),
     ]);
     let session = |selection: Option<BTreeSet<String>>| {
-        Session::with_events(
+        Session::new(
             kernel.clone(),
             SessionConfig {
                 tool_plugins: selection,
@@ -321,7 +315,7 @@ async fn a_selection_is_offered_sorted_by_tool_name() {
         .collect();
     let (kernel, _) = kernel(plugins.iter().map(|(p, t)| tool(p, t)).collect());
     let selection: BTreeSet<String> = plugins.iter().map(|(p, _)| p.clone()).collect();
-    let session = Session::with_events(
+    let session = Session::new(
         kernel,
         SessionConfig {
             tool_plugins: Some(selection),
@@ -349,7 +343,7 @@ async fn a_duplicate_tool_name_is_refused_only_among_the_selected() {
         tool("tool_a", "alpha"),
     ]);
     let session = |selection: Option<BTreeSet<String>>| {
-        Session::with_events(
+        Session::new(
             kernel.clone(),
             SessionConfig {
                 tool_plugins: selection,
@@ -422,7 +416,7 @@ fn session(
     config: SessionConfig,
     sink: Arc<Recorder>,
 ) -> Result<Session, SessionError> {
-    Session::with_events(kernel.clone(), config, sink)
+    Session::new(kernel.clone(), config, sink)
 }
 
 fn offered(s: &Session) -> Vec<String> {

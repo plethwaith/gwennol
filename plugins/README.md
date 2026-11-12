@@ -1,10 +1,10 @@
 # Plugins
 
-The Gwead documents bundled with Gwennol, registered by `gwennol-core` at
-boot. Each is a single JSON file: Gwead resolves nothing from disk, so a
-manifest carries everything it needs inline, and a plugin never spans
-files. The folders group documents by kind, in registration order — role
-contracts must be registered before the plugins that claim them.
+The Gwead documents bundled with Gwennol. Each is a single JSON file:
+Gwead resolves nothing from disk, so a manifest carries everything it needs
+inline, and a plugin never spans files. The folders group documents by
+kind, in registration order — role contracts must be registered before the
+plugins that claim them.
 
 - `spi/` — role contracts, one document per role: `llm_chat.json`
   (`LLM_CHAT`, streaming) and `tool.json` (`TOOL`). SPI definitions are
@@ -47,7 +47,7 @@ registrable, and no compiled blob is ever committed. `cargo xtask bundle`
 (`crates/xtask`) compiles each named crate to `wasm32-unknown-unknown`
 and writes the manifests with the `path` form replaced by the inline
 `base64` form under `target/bundle/plugins/`, mirroring this layout. The
-integration suite (`crates/gwennol-core/tests/bundled_plugins.rs`)
+integration suite (`crates/gwennol-host/tests/bundled_plugins.rs`)
 bundles through the same library function, so what is tested is the
 committed file plus the compiled crate — never a re-typed copy.
 
@@ -56,7 +56,7 @@ package name, and a manifest's `language` selector is its own plugin
 name.
 
 The host step types these use are *not* here: they are native code in
-`gwennol-core`, published by the `host_fs`, `host_process` and
+`gwennol-host`, published by the `host_fs`, `host_process` and
 `host_http` manifests it ships.
 
 A plugin never touches the filesystem or the network itself. It declares

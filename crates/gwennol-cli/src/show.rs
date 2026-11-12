@@ -13,7 +13,8 @@ use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use gwennol_core::{Access, ApprovalRequest, Failure, ToolCall, TurnError, TurnOutcome};
+use gwennol_core::{Failure, ToolCall, TurnError, TurnOutcome};
+use gwennol_host::{Access, ApprovalRequest};
 
 use crate::policy::Judgement;
 use crate::{EXIT_CANCELLED, EXIT_TURN_FAILED};
@@ -80,7 +81,7 @@ fn http_subject(method: &str, url: &str) -> Option<String> {
     let mut u = url::Url::parse(url).ok()?;
     let had_userinfo = !u.username().is_empty() || u.password().is_some();
     let had_query = u.query().is_some() || u.fragment().is_some();
-    gwennol_core::steps::http::scrub(&mut u);
+    gwennol_host::steps::http::scrub(&mut u);
     let mut out = format!("{method} {u}");
     // Say that something was cut, without saying what.
     if had_query {

@@ -4,12 +4,12 @@
 //! link time, so they cannot capture an [`Operator`]. The operator and the
 //! workspace root are therefore per process, and a `OnceLock` matches their
 //! real lifetime: set once by [`crate::boot`], read by every step
-//! invocation afterwards. A session built with `Session::with_events` sends
-//! its events to its own sink, not to this operator; the `host_*` steps still
-//! read this state.
+//! invocation afterwards. Tests in one binary therefore share a single
+//! host. Tests that inspect what the operator was asked install a
+//! recording operator once.
 //!
-//! Tests in one binary therefore share a single host. The integration tests
-//! install a recording operator once and inspect what it was asked.
+//! A session's events go to the sink it was built with, not to this state;
+//! [`OperatorEvents`](crate::OperatorEvents) makes the operator that sink.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -21,8 +21,8 @@ use gwead::kernel::PluginExecution;
 use gwead::kernel::host_api::StepError;
 use gwead::tokio_util::sync::CancellationToken;
 
-use crate::context::tool_call;
 use crate::operator::{Access, ApprovalRequest, Decision, Operator};
+use gwennol_core::context::tool_call;
 
 /// Variables a spawned child inherits under [`ProcessEnv::AllowList`] by
 /// default: enough to resolve a program, find a home directory and decode
@@ -131,11 +131,6 @@ pub fn install(config: HostConfig) -> Result<(), HostConfig> {
     HOST.set(config)
 }
 
-/// The installed host state, if [`crate::boot`] has run.
-pub(crate) fn installed() -> Option<&'static HostConfig> {
-    HOST.get()
-}
-
 /// The installed host state.
 ///
 /// # Panics
@@ -143,7 +138,7 @@ pub(crate) fn installed() -> Option<&'static HostConfig> {
 /// If nothing was installed ([`crate::boot`] installs it).
 pub fn host() -> &'static HostConfig {
     HOST.get().expect(
-        "gwennol host state not installed — call gwennol_core::boot before executing actions",
+        "gwennol host state not installed — call gwennol_host::boot before executing actions",
     )
 }
 
@@ -228,8 +223,8 @@ fn describe(access: &Access) -> String {
 
 /// Ask the operator. A denial is a plain step failure; a withdrawal is
 /// the one cancellation a host step reports structurally
-/// ([`crate::steps::CANCELLED_CODE`]), marked as withdrawn at the
-/// approval ([`crate::steps::CANCELLED_AT_APPROVAL`]) since nothing
+/// ([`gwennol_core::cancel::CANCELLED_CODE`]), marked as withdrawn at the
+/// approval ([`gwennol_core::cancel::CANCELLED_BEFORE_START`]) since nothing
 /// was done.
 ///
 /// The question is withdrawn when the invocation is cancelled: a turn

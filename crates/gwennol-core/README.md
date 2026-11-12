@@ -1,12 +1,11 @@
 # gwennol-core
 
-The Gwennol host library. It owns the Gwead `KernelConfig`, registers the
-native host step types (`host_fs.read`, `host_fs.write`, `host_fs.list`,
-`host_process.run`, `host_http.get`, `host_http.post`), ships the bundled
-SPI contracts (`LLM_CHAT`, `TOOL`) and the host plugin manifests, runs the
-agent loop (`agent::Session`), and defines the [`Operator`] trait through
-which a frontend supplies approvals, secrets, input, and event rendering.
+The Gwennol agent loop and the contracts it consumes. A `Session` runs a
+conversation against one `LLM_CHAT` provider and the `TOOL` plugins it
+offers, on any Gwead kernel that has the bundled SPI contracts registered
+(`spi::register`). It sends each `Event` to the `EventSink` the session was
+started with, and reads no process-global state.
 
-It makes no policy decisions of its own: every step that reaches outside the
-sandbox asks the `Operator`, shown the concrete path, argv or URL, the
-plugin asking, and the model's tool call behind it.
+The crate links no native step bodies of its own and makes no policy
+decisions: what a plugin's steps do, and who is asked before they do it,
+belong to whoever builds the kernel. `gwennol-host` is one such host.

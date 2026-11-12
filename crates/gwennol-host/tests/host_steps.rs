@@ -15,9 +15,8 @@ use gwead::kernel::streams::{STREAM_EOF, STREAM_IO_ERROR, StreamRegistry, read_a
 use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::{
-    Access, ApprovalRequest, Decision, Event, HostConfig, Operator, ProcessEnv, ToolCall, Turn,
-};
+use gwennol_core::{Event, ToolCall};
+use gwennol_host::{Access, ApprovalRequest, Decision, HostConfig, Operator, ProcessEnv, Turn};
 
 mod common;
 
@@ -109,7 +108,7 @@ fn fixture() -> &'static Fixture {
         // to workspace joins (macOS tempdirs sit behind the /var symlink).
         let workspace = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         let operator = Arc::new(Recorder::default());
-        let mut kernel = gwennol_core::boot_with(HostConfig {
+        let mut kernel = gwennol_host::boot_with(HostConfig {
             operator: operator.clone(),
             workspace_root: workspace.clone(),
             process_env: ProcessEnv::default(),
@@ -572,7 +571,7 @@ async fn fs_read_is_not_truncated_when_the_file_ends_where_the_scan_stops() {
     let path = f.workspace.join("ceiling-end.bin");
     {
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 1)
+        file.set_len(gwennol_host::steps::fs::READ_BYTES_CEILING + 1)
             .unwrap();
     }
     // One line of NUL bytes with no newline: the fixture's default
@@ -591,7 +590,7 @@ async fn fs_read_stops_scanning_for_a_range_at_the_ceiling() {
     let path = f.workspace.join("huge.bin");
     {
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING + 2)
+        file.set_len(gwennol_host::steps::fs::READ_BYTES_CEILING + 2)
             .unwrap();
     }
     let out = run("lines", json!({"path": "huge.bin", "offset": 2}))
@@ -639,7 +638,7 @@ async fn fs_read_is_not_truncated_when_a_range_completes_on_the_chunk_that_cross
         // that reached the ceiling before seeing the range complete
         // would find the file going on and report it truncated.
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(gwennol_core::steps::fs::READ_BYTES_CEILING - 2)
+        file.set_len(gwennol_host::steps::fs::READ_BYTES_CEILING - 2)
             .unwrap();
     }
     {
@@ -1696,8 +1695,8 @@ async fn cancelling_an_invocation_tears_a_running_step_down() {
 /// A host step cancelled inside its work — after its approval, unlike
 /// [`a_cancelled_invocation_withdraws_its_pending_approval`] — surfaces
 /// as the kernel's own typed `KernelError::Cancelled`, not the
-/// structured `steps::CANCELLED_CODE` payload that only a withdrawn
-/// approval still uses.
+/// structured `gwennol_core::cancel::CANCELLED_CODE` payload that only a
+/// withdrawn approval still uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_in_work_cancellation_is_the_kernels_typed_cancellation() {
     let f = fixture();
@@ -2177,7 +2176,7 @@ async fn operator_denial_fails_the_step() {
 #[test]
 fn host_manifests_are_valid_and_nothing_is_freely_usable() {
     let mut names = Vec::new();
-    for manifest in gwennol_core::HOST_MANIFESTS {
+    for manifest in gwennol_host::HOST_MANIFESTS {
         let m: Value = gwead::serde_json::from_str(manifest).unwrap();
         let plugin = m["name"].as_str().unwrap();
         for d in m["stepTypeDefs"].as_array().unwrap() {
@@ -2247,8 +2246,7 @@ async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError
     // its phase says nothing ran.
     assert!(
         matches!(&err, KernelError::PluginError { code, params, .. }
-            if code == gwennol_core::steps::CANCELLED_CODE
-                && params["phase"] == gwennol_core::steps::CANCELLED_AT_APPROVAL),
+            if code == "gwennol.cancelled" && params["phase"] == "approval"),
         "{plugin}: {err}"
     );
     assert_eq!(
@@ -2504,7 +2502,7 @@ async fn fs_write_approves_an_existing_file_as_deepest_canonical_spells_it() {
     let f = fixture();
     std::fs::write(f.workspace.join("Cased.txt"), "before").unwrap();
     let asked_for = f.workspace.join("cased.txt");
-    let spelled = gwennol_core::steps::fs::deepest_canonical(&asked_for).unwrap();
+    let spelled = gwennol_host::steps::fs::deepest_canonical(&asked_for).unwrap();
     let out = run(
         "plain_writer",
         json!({"path": "cased.txt", "content": "after"}),
@@ -2868,17 +2866,17 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 /// no caller cancel involved: `host::approve` races the same token the
 /// watchdog fires, and returns the approval as withdrawn rather than
 /// the step's own typed cancellation, so this arrives as the
-/// structured `steps::CANCELLED_CODE`, not `ExecutionTimeout`.
+/// structured `gwennol_core::cancel::CANCELLED_CODE`, not `ExecutionTimeout`.
 ///
 /// That shape rides the kernel's drop grace: the watchdog only fires
 /// the invocation's token at the deadline; a separate backstop drops a
 /// step still running one `WALLCLOCK_DROP_GRACE` later (gwead 0.3.0)
 /// and reports the timeout, so the code arrives only when the step
 /// unwinds inside the grace. The figure, with the version it holds
-/// for, is in `reports_cancellation`'s doc in `src/agent/mod.rs`. A
-/// parked approval unwinds at once, so the window is not close here; a
+/// for, is in `reports_cancellation`'s doc in
+/// `crates/gwennol-core/src/agent/mod.rs`. A parked approval unwinds at once, so the window is not close here; a
 /// fixture that unwound slower would flip this test's error away from
-/// `steps::CANCELLED_CODE` to `ExecutionTimeout`, which the
+/// `gwennol_core::cancel::CANCELLED_CODE` to `ExecutionTimeout`, which the
 /// `matches!` assertion below would catch — the elapsed-time assertion
 /// allows ten seconds of slack and would not.
 #[tokio::test(flavor = "multi_thread")]
@@ -2909,8 +2907,7 @@ async fn the_ceiling_can_still_withdraw_a_held_approval() {
     );
     assert!(
         matches!(&err, KernelError::PluginError { code, params, .. }
-            if code == gwennol_core::steps::CANCELLED_CODE
-                && params["phase"] == gwennol_core::steps::CANCELLED_AT_APPROVAL),
+            if code == "gwennol.cancelled" && params["phase"] == "approval"),
         "{err}"
     );
 }

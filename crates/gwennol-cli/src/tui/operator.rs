@@ -15,7 +15,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gwennol_core::{ApprovalRequest, Decision, Event, Operator, Turn};
+use gwennol_core::Event;
+use gwennol_host::{ApprovalRequest, Decision, Operator, Turn};
 
 use crate::policy::Policy;
 use crate::secrets::Secrets;
@@ -112,7 +113,7 @@ impl Operator for Interactive {
     }
 
     /// The frontend drives [`gwennol_core::agent::Session::turn`]
-    /// itself and never runs [`gwennol_core::agent::Session::run`], so
+    /// itself and never runs [`gwennol_host::run`], so
     /// the loop never asks; `None` says so honestly.
     async fn input(&self) -> Option<Turn> {
         None

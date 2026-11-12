@@ -1,5 +1,5 @@
 //! The interactive loop, in-process against the stub: one host boot
-//! (`gwennol_core::host`'s `OnceLock`, `kernel.rs`'s
+//! (`gwennol_host::host`'s `OnceLock`, `kernel.rs`'s
 //! `install(host).map_err(|_| BootError::AlreadyInstalled)`) and one
 //! session, so `tests/interactive.rs` runs `drive` several times on
 //! that one session rather than booting a kernel per scenario — the
