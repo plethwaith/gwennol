@@ -1882,7 +1882,7 @@ async fn run_stops_at_the_first_turn_that_fails() {
 
 /// `gwennol_host::run`'s own select — cancelling before it reads the next
 /// turn from the operator — ends `run` as a plain cancellation, not as
-/// a turn failure: the site the loop itself owns, beside every one
+/// a turn failure: the site `run` itself owns, beside every one
 /// `Session::turn` guards above.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_is_cancelled_before_it_reads_the_next_turn() {

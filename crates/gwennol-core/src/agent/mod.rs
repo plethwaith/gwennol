@@ -81,9 +81,6 @@
 //!   shape arrives without the turn's token only from a step that
 //!   reports cancellation on a token that has not fired, which none
 //!   in this repo does.
-//!   Only a step stopped before it began carries more than the typed
-//!   variant can: nothing ran, which is why [`crate::cancel`] gives
-//!   that one a structured code.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as

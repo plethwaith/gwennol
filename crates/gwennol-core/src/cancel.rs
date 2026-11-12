@@ -7,16 +7,12 @@
 /// The error code of a cancelled step, carried by a
 /// `KernelError::PluginError`, so the loop recognises the cancellation as
 /// data and never by reading error text or guessing from a token's state.
-/// On its own the loop reads it as a cancellation somewhere in the step's
-/// work; only with [`CANCELLED_AT_APPROVAL`] as `params.phase` does it say
-/// nothing ran.
 pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 
 /// The `params.phase` value that marks a [`CANCELLED_CODE`] error as
-/// reporting that the step was stopped before it began its work. A cancellation without it
-/// lands somewhere in the work, where the step cannot say how far it got,
-/// and the loop then tells the model the call may have run in part or in
-/// full.
+/// reporting that the step was stopped before it began its work. A
+/// cancellation without it lands somewhere in the work, where the step
+/// cannot say how far it got.
 pub const CANCELLED_AT_APPROVAL: &str = "approval";
 
 #[cfg(test)]
