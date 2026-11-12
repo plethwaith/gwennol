@@ -370,3 +370,258 @@ async fn a_duplicate_tool_name_is_refused_only_among_the_selected() {
         );
     }
 }
+
+/// One action of a [`multi`] plugin: its name, the tool name it declares
+/// (or none, for a helper), its `parameters`, and what its one `return`
+/// step gives.
+struct Action {
+    action: &'static str,
+    tool: Option<&'static str>,
+    parameters: Value,
+    returns: Value,
+}
+
+fn action(action: &'static str, tool: Option<&'static str>, content: &str) -> Action {
+    Action {
+        action,
+        tool,
+        parameters: json!({"type": "object", "additionalProperties": false, "properties": {}}),
+        returns: json!({"content": content, "is_error": false}),
+    }
+}
+
+/// A `TOOL` plugin with one action per entry of `actions`.
+fn multi(plugin: &str, actions: Vec<Action>) -> Value {
+    let actions: Map<String, Value> = actions
+        .into_iter()
+        .map(|a| {
+            let mut body = json!({"steps": [
+                {"id": "out", "type": "return", "params": {"value": a.returns}}
+            ]});
+            if let Some(name) = a.tool {
+                body["tool"] = json!({
+                    "name": name,
+                    "description": format!("The {name} fixture."),
+                    "parameters": a.parameters
+                });
+            }
+            (a.action.to_string(), body)
+        })
+        .collect();
+    json!({
+        "name": plugin, "version": "0.0.0",
+        "description": "test fixture plugin with several actions",
+        "roles": [spi::tool::ROLE],
+        "usesSecrets": ["k"],
+        "actions": actions
+    })
+}
+
+fn session(
+    kernel: &Arc<Kernel>,
+    config: SessionConfig,
+    sink: Arc<Recorder>,
+) -> Result<Session, SessionError> {
+    Session::with_events(kernel.clone(), config, sink)
+}
+
+fn offered(s: &Session) -> Vec<String> {
+    s.chat_input()
+        .get("tools")
+        .map(|tools| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn with_selection(tool: &str, selection: Option<BTreeSet<String>>) -> SessionConfig {
+    SessionConfig {
+        tool_plugins: selection,
+        ..config(tool)
+    }
+}
+
+#[tokio::test]
+async fn a_plugin_offers_one_tool_for_each_action_that_carries_a_tool_block() {
+    let (kernel, _) = kernel(vec![
+        multi(
+            "multi",
+            vec![
+                action("call", Some("mu"), "m"),
+                action("second", Some("alpha"), "s"),
+                action("helper", None, "h"),
+            ],
+        ),
+        tool("tool_a", "kappa"),
+    ]);
+    let offer = |selection| {
+        let s = session(
+            &kernel,
+            with_selection("alpha", selection),
+            Arc::new(Recorder::default()),
+        );
+        offered(&s.unwrap())
+    };
+    assert_eq!(offer(None), ["alpha", "kappa", "mu"]);
+    assert_eq!(offer(Some(names(&["multi"]))), ["alpha", "mu"]);
+    assert_eq!(offer(Some(names(&["tool_a"]))), ["kappa"]);
+}
+
+#[tokio::test]
+async fn a_tool_runs_the_action_that_declared_it() {
+    let (kernel, seen) = kernel(vec![multi(
+        "multi",
+        vec![
+            action("call", Some("mu"), "from call"),
+            action("second", Some("alpha"), "from second"),
+        ],
+    )]);
+    let sink = Arc::new(Recorder::default());
+    let mut s = session(&kernel, config("alpha"), sink.clone()).unwrap();
+    s.turn("go", &CancellationToken::new()).await.unwrap();
+    let call = ToolCall {
+        id: Some("c1".into()),
+        name: "alpha".into(),
+        arguments: "{}".into(),
+    };
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec![
+            Event::Text("calling".into()),
+            Event::ToolCall(call.clone()),
+            Event::ToolResult {
+                call,
+                content: "from second".into(),
+                is_error: false
+            },
+            Event::Text("done".into()),
+            Event::TurnComplete,
+        ]
+    );
+    assert_eq!(one(&seen, "multi")["gwennol"]["toolCall"]["name"], "alpha");
+}
+
+#[tokio::test]
+async fn a_tool_plugin_needs_no_call_action() {
+    let (kernel, _) = kernel(vec![multi(
+        "nocall",
+        vec![action("lookup", Some("gamma"), "found")],
+    )]);
+    let sink = Arc::new(Recorder::default());
+    let mut s = session(&kernel, config("gamma"), sink.clone()).unwrap();
+    assert_eq!(offered(&s), ["gamma"]);
+    s.turn("go", &CancellationToken::new()).await.unwrap();
+    assert!(
+        sink.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            Event::ToolResult { content, is_error: false, .. } if content == "found"
+        )),
+        "{:?}",
+        sink.0.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_tool_plugin_with_no_tool_block_offers_nothing_and_cannot_be_selected() {
+    let hollow = || multi("hollow", vec![action("only", None, "x")]);
+    let (kernel_both, _) = kernel(vec![hollow(), tool("tool_a", "alpha")]);
+    let build = |selection| {
+        session(
+            &kernel_both,
+            with_selection("alpha", selection),
+            Arc::new(Recorder::default()),
+        )
+    };
+    assert_eq!(offered(&build(None).unwrap()), ["alpha"]);
+    for selection in [names(&["hollow"]), names(&["hollow", "tool_a"])] {
+        match build(Some(selection.clone())) {
+            Err(SessionError::Harvest(HarvestError::NoSuchToolPlugin(name))) => {
+                assert_eq!(name, "hollow");
+            }
+            other => panic!("{selection:?}: {other:?}"),
+        }
+    }
+    let (kernel_alone, _) = kernel(vec![hollow()]);
+    let s = session(
+        &kernel_alone,
+        config("alpha"),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    assert!(s.chat_input().get("tools").is_none());
+}
+
+#[tokio::test]
+async fn two_actions_of_one_plugin_cannot_share_a_tool_name() {
+    let (kernel, _) = kernel(vec![
+        multi(
+            "twin",
+            vec![
+                action("a", Some("same"), "a"),
+                action("b", Some("same"), "b"),
+            ],
+        ),
+        tool("tool_a", "alpha"),
+    ]);
+    let build = |selection| {
+        session(
+            &kernel,
+            with_selection("alpha", selection),
+            Arc::new(Recorder::default()),
+        )
+    };
+    for selection in [None, Some(names(&["twin"]))] {
+        assert!(
+            matches!(
+                build(selection.clone()),
+                Err(SessionError::Harvest(HarvestError::DuplicateToolName(n))) if n == "same"
+            ),
+            "{selection:?}"
+        );
+    }
+    build(Some(names(&["tool_a"]))).unwrap();
+}
+
+#[tokio::test]
+async fn every_offered_action_is_held_to_its_own_schema_and_the_result_shape() {
+    let strict = Action {
+        parameters: json!({
+            "type": "object", "required": ["q"],
+            "properties": {"q": {"type": "string"}}
+        }),
+        ..action("strict", Some("strict"), "unreached")
+    };
+    let broken = Action {
+        returns: json!({"content": "x", "extra": 1}),
+        ..action("broken", Some("broken"), "")
+    };
+    let (kernel, _) = kernel(vec![multi("multi", vec![strict, broken])]);
+    for (tool, expected) in [
+        ("strict", "do not match its schema"),
+        ("broken", "returned a malformed result"),
+    ] {
+        let sink = Arc::new(Recorder::default());
+        let mut s = session(&kernel, config(tool), sink.clone()).unwrap();
+        let outcome = s.turn("go", &CancellationToken::new()).await.unwrap();
+        assert_eq!(outcome.rounds, 2, "{tool}");
+        let events = sink.0.lock().unwrap();
+        let failures: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::ToolFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "{tool}: {events:?}");
+        assert!(
+            format!("{:?}", failures[0]).contains(expected),
+            "{tool}: {failures:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ToolResult { .. })),
+            "{tool}: {events:?}"
+        );
+    }
+}

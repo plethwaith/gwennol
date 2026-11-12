@@ -2,34 +2,43 @@
   "formatVersion": 1,
   "name": "TOOL",
   "displayName": "Model-callable tool",
-  "version": "0.2.0",
-  "description": "A tool the model can call. One required action, `call`: the model's arguments in, one uniform result out. The tool's name, description and argument schema are NOT declared here — they live in the `tool` block on the implementing plugin's `call` action, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the action name and the result shape — including how a tool says its output was cut (`truncated`, rendered into `content` for the model by the caller, never by the tool).",
+  "version": "0.3.0",
+  "description": "A plugin offering tools the model can call: one tool for each of its actions that carries a `tool` block. A tool's name, description and argument schema are NOT declared here — they live in that `tool` block, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the result an action offered as a tool returns, `#/$defs/Result` — including how a tool says its output was cut (`truncated`, rendered into `content` for the model by the caller, never by the tool). No action is required. `call` is the name a plugin offering one tool conventionally gives its action; a plugin may offer tools from actions of any name.",
   "actions": {
     "call": {
-      "description": "Execute the tool once with model-supplied arguments.",
+      "optional": true,
+      "description": "Execute a tool once with model-supplied arguments. Every action offered as a tool takes this input and returns this output, whatever it is named.",
       "input": {
         "type": "object",
         "description": "The arguments of one tool call, shaped by the implementing action's own `tool.parameters` schema — which is why this contract cannot close the object. Gwead validates no payloads at dispatch; the caller is responsible for checking model-emitted arguments against the declared schema before dispatching."
       },
       "output": {
-        "type": "object",
-        "required": ["content"],
-        "additionalProperties": false,
-        "properties": {
-          "content": {
-            "type": "string",
-            "description": "The tool result as the model will see it, verbatim."
-          },
-          "is_error": {
-            "type": "boolean",
-            "default": false,
-            "description": "True when `content` describes a failure the model should react to (file not found, command failed). Infrastructure failures are step errors, not `is_error` results."
-          },
-          "truncated": {
-            "type": "boolean",
-            "default": false,
-            "description": "True when `content` is a prefix of what the tool would otherwise have returned — a capped file read, capped process output. Data, not prose: the tool never appends a marker to `content` itself. The caller renders the one shared marker (`gwennol_core::spi::tool::TRUNCATED_MARKER`) before the model sees the result, so every tool signals a cut the same way and no tool has to compose it declaratively."
-          }
+        "$ref": "#/$defs/Result"
+      }
+    }
+  },
+  "$defs": {
+    "Result": {
+      "type": "object",
+      "description": "What an action offered as a tool returns.",
+      "required": [
+        "content"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "The tool result as the model will see it, verbatim."
+        },
+        "is_error": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when `content` describes a failure the model should react to (file not found, command failed). Infrastructure failures are step errors, not `is_error` results."
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when `content` is a prefix of what the tool would otherwise have returned — a capped file read, capped process output. Data, not prose: the tool never appends a marker to `content` itself. The caller renders the one shared marker (`gwennol_core::spi::tool::TRUNCATED_MARKER`) before the model sees the result, so every tool signals a cut the same way and no tool has to compose it declaratively."
         }
       }
     }

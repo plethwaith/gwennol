@@ -116,12 +116,14 @@ implements them.
   provider output to tool input to tool result with no agent loop involved.
 - **Not in scope:** any real provider or tool; the substrate decision below.
 - **Settled: a tool's input schema is derived from the manifest.** The
-  `tool` block on the implementing plugin's `call` action is the single
+  `tool` block on the implementing plugin's action is the single
   declaration of the tool's name, description and argument schema; the
   embedder harvests Gwead's tool descriptors and hands them to the model
   as `chat`'s `tools` input. A second declaration in the contract would
   only be a copy that can drift — the manifest is already the audit
-  surface, so it is also the source of truth. See `docs/SPI.md`.
+  surface, so it is also the source of truth. Since `TOOL` 0.3.0 a `TOOL`
+  plugin offers one tool per action that carries a `tool` block.
+  See `docs/SPI.md`.
 
 ### 3. Plugin substrate
 

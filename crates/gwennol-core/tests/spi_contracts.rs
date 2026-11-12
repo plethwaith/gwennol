@@ -416,11 +416,6 @@ fn a_provider_missing_the_chat_action_is_rejected() {
 }
 
 #[test]
-fn a_tool_missing_the_call_action_is_rejected() {
-    assert_hollow_claim_rejected(spi::tool::ROLE, spi::tool::CALL);
-}
-
-#[test]
 fn the_harvest_sorts_by_name_and_refuses_duplicates() {
     let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
     spi::register(&mut kernel).unwrap();
@@ -463,44 +458,6 @@ fn the_harvest_sorts_by_name_and_refuses_duplicates() {
         matches!(&err, spi::HarvestError::DuplicateToolName(name) if name == "zeta"),
         "{err}"
     );
-}
-
-#[test]
-fn the_harvest_ignores_tool_blocks_on_other_actions_of_a_tool_plugin() {
-    // A bona fide TOOL plugin may carry a second action with its own
-    // tool block; only `call` faced the contract check, so only `call`'s
-    // tool is harvested.
-    let mut kernel = Kernel::boot(gwead::kernel::KernelConfig::default()).unwrap();
-    spi::register(&mut kernel).unwrap();
-    let mut manifest = named_tool("sidecar", "real_tool");
-    manifest["actions"]["extra"] = json!({
-        "tool": {
-            "name": "extra_tool",
-            "description": "A tool block on a non-call action.",
-            "parameters": {"type": "object"}
-        },
-        "steps": [
-            {"id": "out", "type": "return", "params": {"value": {"content": "no"}}}
-        ]
-    });
-    kernel
-        .register_plugin_from_json(&manifest.to_string())
-        .unwrap();
-
-    assert!(
-        kernel
-            .registry()
-            .get_tool_descriptors()
-            .iter()
-            .any(|d| d.tool_name == "extra_tool"),
-        "the raw engine list should contain the non-call tool block"
-    );
-    let names: Vec<String> = spi::harvest_tools(&kernel)
-        .unwrap()
-        .into_iter()
-        .map(|d| d.tool_name)
-        .collect();
-    assert_eq!(names, ["real_tool"]);
 }
 
 // ---------------------------------------------------- dispatch by role

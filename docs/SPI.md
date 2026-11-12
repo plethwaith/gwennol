@@ -25,8 +25,8 @@ and the check is action presence: a plugin claiming `LLM_CHAT` without a
   schemas in the contract documents are documentation and tooling input.
   Whoever dispatches is responsible for conformance — concretely, the
   agent loop (`gwennol_core::agent`) validates model-emitted tool
-  arguments against the tool's declared schema before dispatching a
-  `call`, and reads everything a provider returns fail-closed.
+  arguments against the tool's declared schema before dispatching the
+  tool's action, and reads everything a provider returns fail-closed.
 
 ## `LLM_CHAT`
 
@@ -199,8 +199,11 @@ pattern.
 
 ## `TOOL`
 
-One required action, `call`: the model's arguments in, one uniform result
-out.
+A `TOOL` plugin offers one tool for each of its actions that carries a
+`tool` block. Every such action takes the model's arguments and returns one
+uniform result. The contract requires no action, so Gwead's registration
+check passes any `TOOL` claim; the loop checks the result shape on every
+call.
 
 ```json
 {"content": "what the model sees, verbatim", "is_error": false}
@@ -249,8 +252,9 @@ them was cut.
 ### How a tool's schema reaches the model — settled
 
 Derived from the manifest, not declared separately. The `tool` block on
-the implementing plugin's `call` action is the **single** declaration of
-the tool's name, description, and argument schema:
+the implementing plugin's action, whichever action carries it, is the
+**single** declaration of the tool's name, description, and argument
+schema:
 
 ```json
 "actions": {
@@ -270,9 +274,8 @@ each descriptor to a `tools` entry: `tool.name → name`, `description →
 description`, `parameters → input_schema`. Declaring the schema a second
 time in the role contract would only create a copy that can drift; the
 manifest is already the audit surface, so it is also the source of truth.
-The `TOOL` contract therefore fixes only what every tool shares — the
-action name and the result shape — and deliberately leaves `call`'s input
-schema open.
+The `TOOL` contract therefore fixes only the result shape and
+deliberately leaves every tool's input schema open.
 
 The harvest is not a passthrough. Gwead collects a `tool` block from
 *any* action of *any* plugin, in unspecified order (its own docs say so —
@@ -281,13 +284,13 @@ the model gets. `gwennol_core::spi::harvest_tools` is the one
 implementation of the harvest rules — call it rather than re-deriving
 them:
 
-- **only descriptors whose plugin fulfils the `TOOL` role through its
-  `call` action survive** — anything else never faced the contract check
-  and is not offered to the model;
+- **only descriptors of a plugin that fulfils the `TOOL` role survive**,
+  one for each of its actions that carries a `tool` block; a `tool` block
+  on a plugin outside the role is not offered to the model;
 - **duplicate tool names are refused, not resolved**
-  (`HarvestError::DuplicateToolName`) — two plugins declaring the same
-  `tool.name` make "the descriptor with that name" ambiguous, and real
-  provider APIs reject duplicate tools anyway;
+  (`HarvestError::DuplicateToolName`) — two plugins, or two actions of one,
+  declaring the same `tool.name` make "the descriptor with that name"
+  ambiguous, and real provider APIs reject duplicate tools anyway;
 - **the result is sorted by name** — tool order is model-visible and
   prefix-sensitive, so an unspecified order changes the prompt every
   process start and busts provider-side prompt caching.
@@ -300,23 +303,35 @@ first at the nearest namespace wins, silently — register one) but not for
 tools — a deployment registers many `TOOL` plugins at once. Selection is
 by descriptor: the model names a tool, the loop finds the descriptor
 with that `name`, and its `plugin_key`/`action_name` say exactly what to
-execute. The role still
-earns its keep: it is the registration-time contract check on every tool
-plugin, the uniform calling convention that makes descriptor-driven
-dispatch possible, and the audit handle — `roles: ["TOOL"]` is one grep
-away from "everything the model can call" *because* the harvest rules
-above admit nothing else. The grep is a property of the embedder holding
-that line, not of the engine: Gwead itself would happily harvest a
-`tool` block from a plugin that never claimed the role.
+execute. The role is what the harvest keys on, and the audit handle:
+`roles: ["TOOL"]` finds the plugins, and their `tool` blocks are everything
+the model can call, *because* the harvest rules above admit nothing else.
+That is a property of the embedder holding the line, not of the engine:
+Gwead itself would happily harvest a `tool` block from a plugin that never
+claimed the role.
 
 A session can also offer a chosen subset: `SessionConfig::tool_plugins`
 names `TOOL` plugins (by plugin name, the unit a manifest grants authority
-to), and `spi::harvest_selected` harvests only those. The selection applies
-before the duplicate refusal above, so two plugins that advertise one tool
-name can share a kernel as long as every session on it selects at most one
-of them (a session whose `tool_plugins` is `None` offers both, and is
-refused). A name that is not a registered `TOOL` fulfiller with a `call`
-tool descriptor is refused (`HarvestError::NoSuchToolPlugin`).
+to), and `spi::harvest_selected` harvests only those; a selected plugin
+brings all its tools. The selection applies before the duplicate refusal
+above, so two plugins that advertise one tool name can share a kernel as
+long as every session on it selects at most one of them (a session whose
+`tool_plugins` is `None` offers both, and is refused). A name that offers
+no tool is refused (`HarvestError::NoSuchToolPlugin`).
+
+### A plugin with several tools
+
+- An action without a `tool` block is a helper and is never offered.
+- Tool names are unique across everything a session offers, within one
+  plugin included.
+- Authority is the plugin's. A manifest's `permissions` cover every action
+  of the plugin, and an approval request names the plugin and the model's
+  tool call (`ApprovalRequest`). A frontend that remembers an answer per
+  plugin applies it to every tool that plugin offers; the bundled CLI's
+  session rules are keyed that way (`SessionRule::matches`). A plugin that
+  offers one tool keeps the property that its manifest states what that
+  tool can reach.
+- A session selects plugins, not tools.
 
 ## Evolving a contract
 
