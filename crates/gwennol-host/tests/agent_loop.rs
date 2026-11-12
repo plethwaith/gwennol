@@ -981,7 +981,7 @@ async fn the_assistant_message_is_rebuilt_from_the_stream_and_replayed_verbatim(
     );
 }
 
-/// `Session::run` drives turns from the operator until it has none.
+/// `gwennol_host::run` drives turns from the operator until it has none.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_takes_turns_from_the_operator_until_input_ends() {
     let f = fixture();
@@ -1829,7 +1829,7 @@ async fn a_pre_cancelled_token_ends_the_turn_before_the_provider_answers() {
     assert_eq!(buffered.transcript(), &[user("never")]);
 }
 
-/// `Session::run`'s own select — cancelling before it reads the next
+/// `gwennol_host::run`'s own select — cancelling before it reads the next
 /// turn from the operator — ends `run` as a plain cancellation, not as
 /// a turn failure: the site the loop itself owns, beside every one
 /// `Session::turn` guards above.
