@@ -200,8 +200,8 @@ impl Operator for Harness {
         None
     }
     fn emit(&self, event: Event) {
-        // A session driven outside `with_events` (none here) would
-        // simply not be recorded.
+        // A session driven outside `with_events` would simply not be
+        // recorded.
         let _ = EVENTS.try_with(|sink| sink.record(event));
     }
     async fn input(&self) -> Option<Turn> {

@@ -14,14 +14,3 @@ pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 /// cancellation without it lands somewhere in the work, where the step
 /// cannot say how far it got.
 pub const CANCELLED_AT_APPROVAL: &str = "approval";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_codes_are_what_steps_already_send() {
-        assert_eq!(CANCELLED_CODE, "gwennol.cancelled");
-        assert_eq!(CANCELLED_AT_APPROVAL, "approval");
-    }
-}

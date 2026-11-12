@@ -79,8 +79,7 @@ pub enum Event {
 
 /// Where a session's [`Event`]s go.
 ///
-/// A session built with [`Session::with_events`](crate::Session::with_events)
-/// sends every event here. `emit` is called synchronously from the task
+/// A session sends every event to the sink it was started with. `emit` is called synchronously from the task
 /// driving the session's turn, in the order the events occur, so it must
 /// not block: a sink that blocks stalls the task driving the turn (a future
 /// joined with it included) and the thread running it, and one that panics

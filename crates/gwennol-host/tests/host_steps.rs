@@ -1695,8 +1695,8 @@ async fn cancelling_an_invocation_tears_a_running_step_down() {
 /// A host step cancelled inside its work — after its approval, unlike
 /// [`a_cancelled_invocation_withdraws_its_pending_approval`] — surfaces
 /// as the kernel's own typed `KernelError::Cancelled`, not the
-/// structured `gwennol_core::cancel::CANCELLED_CODE` payload that only a withdrawn
-/// approval still uses.
+/// structured `gwennol_core::cancel::CANCELLED_CODE` payload that only a
+/// withdrawn approval still uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_in_work_cancellation_is_the_kernels_typed_cancellation() {
     let f = fixture();
@@ -2246,8 +2246,7 @@ async fn cancel_at_the_prompt(plugin: &'static str, input: Value) -> KernelError
     // its phase says nothing ran.
     assert!(
         matches!(&err, KernelError::PluginError { code, params, .. }
-            if code == gwennol_core::cancel::CANCELLED_CODE
-                && params["phase"] == gwennol_core::cancel::CANCELLED_AT_APPROVAL),
+            if code == "gwennol.cancelled" && params["phase"] == "approval"),
         "{plugin}: {err}"
     );
     assert_eq!(
@@ -2874,8 +2873,8 @@ async fn the_action_ceiling_is_the_frontends_not_the_kernels() {
 /// step still running one `WALLCLOCK_DROP_GRACE` later (gwead 0.3.0)
 /// and reports the timeout, so the code arrives only when the step
 /// unwinds inside the grace. The figure, with the version it holds
-/// for, is in `reports_cancellation`'s doc in `crates/gwennol-core/src/agent/mod.rs`. A
-/// parked approval unwinds at once, so the window is not close here; a
+/// for, is in `reports_cancellation`'s doc in
+/// `crates/gwennol-core/src/agent/mod.rs`. A parked approval unwinds at once, so the window is not close here; a
 /// fixture that unwound slower would flip this test's error away from
 /// `gwennol_core::cancel::CANCELLED_CODE` to `ExecutionTimeout`, which the
 /// `matches!` assertion below would catch — the elapsed-time assertion
@@ -2908,8 +2907,7 @@ async fn the_ceiling_can_still_withdraw_a_held_approval() {
     );
     assert!(
         matches!(&err, KernelError::PluginError { code, params, .. }
-            if code == gwennol_core::cancel::CANCELLED_CODE
-                && params["phase"] == gwennol_core::cancel::CANCELLED_AT_APPROVAL),
+            if code == "gwennol.cancelled" && params["phase"] == "approval"),
         "{err}"
     );
 }

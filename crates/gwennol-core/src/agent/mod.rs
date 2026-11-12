@@ -62,25 +62,15 @@
 //!   and the loop's own waits: a stream being read is closed (the
 //!   relay sees its reader gone and winds down), a step that has not
 //!   begun its work can report that it was stopped before it started
-//!   ([`crate::cancel`]), a
-//!   running tool step observes the token and stops, reported as the
-//!   kernel's typed cancellation. The turn's own token
-//!   is the authority: once it has fired, whatever a step reports is
-//!   the cut arriving (a step's text goes to the log; a stream
+//!   ([`crate::cancel`]), a running tool step observes the token and
+//!   stops, reported as the kernel's typed cancellation. The turn's own
+//!   token is the authority: once it has fired, whatever a step reports
+//!   is the cut arriving (a step's text goes to the log; a stream
 //!   source's failure the cut hid travels on
-//!   [`TurnError::Cancelled`]), and a cancellation
-//!   arriving *without* it is a step failure, reported as such and
-//!   logged. The kernel's action ceiling never produces the typed
-//!   shape — its watchdog reports a step it stopped as
-//!   `ExecutionTimeout` — and produces the structured
-//!   [`cancel::CANCELLED_CODE`](crate::cancel::CANCELLED_CODE) only
-//!   through a step that had not begun its work, which the turn sees as
-//!   that code when the step unwinds within
-//!   the kernel's drop grace past the deadline and as the timeout
-//!   otherwise; a plugin may throw the code itself; and the typed
-//!   shape arrives without the turn's token only from a step that
-//!   reports cancellation on a token that has not fired, which none
-//!   in this repo does.
+//!   [`TurnError::Cancelled`]), and a cancellation arriving *without*
+//!   it is a step failure, reported as such and logged.
+//!   `reports_cancellation` decides which errors count as a
+//!   cancellation, and [`crate::cancel`] says what a step sends.
 //!   The cut-off call is answered as *interrupted while running* (it
 //!   may have acted) or *interrupted before starting*, the calls after
 //!   it as before starting, and the turn ends as
@@ -913,14 +903,8 @@ impl Session {
                             return Err(Interrupted(Cut::from_error(&e)));
                         }
                         // A cancellation nobody asked for is a failure
-                        // to report, not a cut. The structured code
-                        // comes from the kernel's action ceiling
-                        // stopping a step that had not begun (within
-                        // the kernel's drop grace; past it, the timeout)
-                        // or from a plugin throwing it; the typed
-                        // shape only from a step reporting
-                        // cancellation on a token that has not fired,
-                        // which none here does.
+                        // to report, not a cut; `reports_cancellation`
+                        // decides what counts as one.
                         Err(e) if reports_cancellation(&e) => {
                             warn_if_unrequested(&e);
                             Err(format!(
@@ -1032,14 +1016,14 @@ impl Cut {
 /// Whether a kernel error carries a cancellation: the kernel's typed
 /// [`KernelError::Cancelled`] — a step that stopped on its token,
 /// or the kernel's own between-step check — or a step's structured
-/// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a reason to treat a turn as cancelled:
-/// the turn's token is the authority. Without it, the structured
-/// code has two sources: the kernel's action ceiling stopping a step
-/// that had not begun, which arrives as the code when the step unwinds
-/// within the kernel's drop grace
-/// (100 ms past the deadline in gwead 0.3.0) and as
-/// [`KernelError::ExecutionTimeout`] otherwise, and a plugin throwing
-/// the code itself. The ceiling never produces the typed shape — its
+/// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a
+/// reason to treat a turn as cancelled: the turn's token is the
+/// authority. Without it, the structured code can come from any step
+/// that sends it, the kernel's action ceiling stopping a step that had
+/// not begun among them: that arrives as the code when the step unwinds
+/// within the kernel's drop grace (100 ms past the deadline in gwead
+/// 0.3.0) and as [`KernelError::ExecutionTimeout`] otherwise. The
+/// ceiling never produces the typed shape — its
 /// watchdog reports a step it stopped as the timeout — so without
 /// the turn's token that shape can only come from a step that
 /// reports cancellation on a token that has not fired, which the
