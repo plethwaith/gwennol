@@ -98,10 +98,10 @@ impl Transcript {
     }
 
     /// Add the user's content blocks, in the order given.
-    /// When the transcript already ends in a user message — the previous
-    /// turn did not complete — the blocks become the end of that message,
-    /// after any tool results it holds: the protocol wants results before
-    /// text and images, and a vendor rejects two user messages in a row.
+    /// When the transcript already ends in a user message, the blocks become
+    /// the end of that message, after any tool results it holds: the
+    /// protocol wants results before text and images, and a vendor rejects
+    /// two user messages in a row.
     pub(crate) fn push_user_content(&mut self, blocks: Vec<Value>) {
         if let Some(last) = self.messages.last_mut()
             && last["role"] == "user"
