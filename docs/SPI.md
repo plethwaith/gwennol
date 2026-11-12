@@ -144,7 +144,7 @@ document in place of a message), or one the provider declined (below). The provi
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
 malformed-request and not-found answers will fail again) and `kind`
-with the vendor's own class identifier. Consumers branch on
+with its own class identifier. Consumers branch on
 `retryable` and nothing else: `kind` and `message` are informational.
 
 What stays a step error is exactly what the provider could not classify
@@ -162,9 +162,9 @@ stream was started. It is not retryable.
 
 ### Response, streamed
 
-With `stream: true` the result is instead `{"stream": <handle>}`, unless the
-provider declined the request before starting a stream (the failed form,
-above): an integer Gwead stream handle. A handle is an index into the
+With `stream: true` the result is instead `{"stream": <handle>}` — an integer
+Gwead stream handle — unless the provider declined the request before
+starting a stream (the failed form, above). A handle is an index into the
 `StreamRegistry` the caller attached to the execution with
 `.with_streams(…)`, and is meaningless against any other table: each
 table numbers its handles from 1, and an execution run *without* a

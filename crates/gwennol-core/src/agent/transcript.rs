@@ -316,10 +316,10 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
 }
 
 /// Check an `image` block's `source`: closed, and either inline base64 or
-/// a reference, each of a media type the contract names. The field set is
-/// chosen by `source.type`. Not checked: that `data` is base64, that it
-/// decodes to the format `media_type` names, or that a reference names
-/// anything.
+/// a reference, each of a media type the contract names, with a non-empty
+/// string `data` or `reference`. The field set is chosen by `source.type`.
+/// Not checked: that `data` is base64, that it decodes to the format
+/// `media_type` names, or that a reference names anything.
 fn check_image_source(source: Option<&Value>) -> Result<(), String> {
     let Some(source) = source.and_then(Value::as_object) else {
         return Err("image block has no object `source`".into());
