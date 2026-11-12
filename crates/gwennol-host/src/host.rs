@@ -224,7 +224,7 @@ fn describe(access: &Access) -> String {
 /// Ask the operator. A denial is a plain step failure; a withdrawal is
 /// the one cancellation a host step reports structurally
 /// ([`gwennol_core::cancel::CANCELLED_CODE`]), marked as withdrawn at the
-/// approval ([`gwennol_core::cancel::CANCELLED_AT_APPROVAL`]) since nothing
+/// approval ([`gwennol_core::cancel::CANCELLED_BEFORE_START`]) since nothing
 /// was done.
 ///
 /// The question is withdrawn when the invocation is cancelled: a turn

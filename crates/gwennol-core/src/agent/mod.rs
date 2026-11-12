@@ -443,7 +443,7 @@ impl Default for SessionConfig {
 /// The `LLM_CHAT` plugin a session would talk to: `named` when it is
 /// a registered fulfiller, else the only fulfiller there is. The one
 /// implementation of the rule [`SessionConfig::provider`] states —
-/// [`Session::with_events`] applies it, and a frontend that needs the name
+/// [`Session::new`] applies it, and a frontend that needs the name
 /// before the session exists (to set that plugin's `$config`, say)
 /// asks here rather than re-deriving it.
 pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, SessionError> {
@@ -510,7 +510,7 @@ impl Session {
     /// The session reads no process-global state. Several sessions can
     /// share a kernel and keep their events apart, each with its own
     /// sink, and a session is driven with [`Self::turn`].
-    pub fn with_events(
+    pub fn new(
         kernel: Arc<Kernel>,
         config: SessionConfig,
         events: Arc<dyn EventSink>,
@@ -993,7 +993,7 @@ impl Cut {
         match e {
             KernelError::PluginError { code, params, .. }
                 if code == crate::cancel::CANCELLED_CODE
-                    && params["phase"] == crate::cancel::CANCELLED_AT_APPROVAL =>
+                    && params["phase"] == crate::cancel::CANCELLED_BEFORE_START =>
             {
                 Cut::BeforeStart
             }
@@ -1291,7 +1291,7 @@ mod tests {
         let withdrawn = KernelError::PluginError {
             code: crate::cancel::CANCELLED_CODE.into(),
             message: "cancelled".into(),
-            params: json!({"phase": crate::cancel::CANCELLED_AT_APPROVAL}),
+            params: json!({"phase": crate::cancel::CANCELLED_BEFORE_START}),
         };
         assert_eq!(Cut::from_error(&withdrawn), Cut::BeforeStart);
         let in_work = KernelError::PluginError {

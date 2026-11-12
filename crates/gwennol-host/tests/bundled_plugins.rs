@@ -127,7 +127,7 @@ fn new_session(
     kernel: Arc<Kernel>,
     config: SessionConfig,
 ) -> Result<Session, gwennol_core::SessionError> {
-    Session::with_events(
+    Session::new(
         kernel,
         config,
         Arc::new(OperatorEvents(fixture().keyed.clone())),

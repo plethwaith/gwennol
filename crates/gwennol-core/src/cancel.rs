@@ -13,4 +13,4 @@ pub const CANCELLED_CODE: &str = "gwennol.cancelled";
 /// reporting that the step was stopped before it began its work. A
 /// cancellation without it lands somewhere in the work, where the step
 /// cannot say how far it got.
-pub const CANCELLED_AT_APPROVAL: &str = "approval";
+pub const CANCELLED_BEFORE_START: &str = "approval";

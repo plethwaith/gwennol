@@ -159,7 +159,7 @@ fn one(seen: &Seen, subject: &str) -> Value {
 async fn a_sink_session_receives_its_events_in_order() {
     let (kernel, _) = kernel(vec![tool("tool_a", "alpha")]);
     let sink = Arc::new(Recorder::default());
-    let mut s = Session::with_events(kernel, config("alpha"), sink.clone()).unwrap();
+    let mut s = Session::new(kernel, config("alpha"), sink.clone()).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let call = ToolCall {
         id: Some("c1".into()),
@@ -213,7 +213,7 @@ async fn the_embedders_context_reaches_the_provider_and_the_tool() {
         context: context(json!({"principal": "p1"})),
         ..config("alpha")
     };
-    let mut s = Session::with_events(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let seen_provider: Vec<Value> = seen
         .lock()
@@ -231,8 +231,7 @@ async fn the_embedders_context_reaches_the_provider_and_the_tool() {
 #[tokio::test]
 async fn an_empty_context_leaves_the_provider_round_without_one() {
     let (kernel, seen) = kernel(vec![tool("tool_a", "alpha")]);
-    let mut s =
-        Session::with_events(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
+    let mut s = Session::new(kernel, config("alpha"), Arc::new(Recorder::default())).unwrap();
     s.turn("go", &CancellationToken::new()).await.unwrap();
     let provider_contexts: Vec<Value> = seen
         .lock()
@@ -255,7 +254,7 @@ async fn the_loops_own_context_key_is_refused() {
         ..config("alpha")
     };
     assert!(matches!(
-        Session::with_events(kernel, config, Arc::new(Recorder::default())),
+        Session::new(kernel, config, Arc::new(Recorder::default())),
         Err(SessionError::ReservedContextKey)
     ));
 }
@@ -272,7 +271,7 @@ async fn a_session_offers_the_tool_plugins_it_selected() {
         decoy(),
     ]);
     let session = |selection: Option<BTreeSet<String>>| {
-        Session::with_events(
+        Session::new(
             kernel.clone(),
             SessionConfig {
                 tool_plugins: selection,
@@ -317,7 +316,7 @@ async fn a_selection_is_offered_sorted_by_tool_name() {
         .collect();
     let (kernel, _) = kernel(plugins.iter().map(|(p, t)| tool(p, t)).collect());
     let selection: BTreeSet<String> = plugins.iter().map(|(p, _)| p.clone()).collect();
-    let session = Session::with_events(
+    let session = Session::new(
         kernel,
         SessionConfig {
             tool_plugins: Some(selection),
@@ -345,7 +344,7 @@ async fn a_duplicate_tool_name_is_refused_only_among_the_selected() {
         tool("tool_a", "alpha"),
     ]);
     let session = |selection: Option<BTreeSet<String>>| {
-        Session::with_events(
+        Session::new(
             kernel.clone(),
             SessionConfig {
                 tool_plugins: selection,
@@ -418,7 +417,7 @@ fn session(
     config: SessionConfig,
     sink: Arc<Recorder>,
 ) -> Result<Session, SessionError> {
-    Session::with_events(kernel.clone(), config, sink)
+    Session::new(kernel.clone(), config, sink)
 }
 
 fn offered(s: &Session) -> Vec<String> {

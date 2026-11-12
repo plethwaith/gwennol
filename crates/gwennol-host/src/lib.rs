@@ -26,7 +26,7 @@
 //! native code.
 //!
 //! A frontend names both crates. It starts its session with
-//! `Session::with_events`, handing it an [`OperatorEvents`] over the operator
+//! `Session::new`, handing it an [`OperatorEvents`] over the operator
 //! it gave [`boot`], and drives it with [`run`] or with `Session::turn`.
 //!
 //! # The two gates

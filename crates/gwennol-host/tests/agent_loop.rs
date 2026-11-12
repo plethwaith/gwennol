@@ -87,7 +87,7 @@ impl Sink {
 
 /// Run `fut` with an event sink, returning its output and the events
 /// emitted while it ran.
-async fn with_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
+async fn record_events<T>(fut: impl Future<Output = T>) -> (T, Vec<Event>) {
     let sink = Arc::new(Sink::default());
     let out = EVENTS.scope(sink.clone(), fut).await;
     (out, sink.snapshot())
@@ -200,7 +200,7 @@ impl Operator for Harness {
         None
     }
     fn emit(&self, event: Event) {
-        // A session driven outside `with_events` would simply not be
+        // A session driven outside `record_events` would simply not be
         // recorded.
         let _ = EVENTS.try_with(|sink| sink.record(event));
     }
@@ -281,7 +281,7 @@ fn config(route: &str) -> SessionConfig {
 /// A session on the fixture's kernel whose events go to the fixture's
 /// operator, as a frontend that booted the host starts one.
 fn new_session(kernel: Arc<Kernel>, config: SessionConfig) -> Result<Session, SessionError> {
-    Session::with_events(
+    Session::new(
         kernel,
         config,
         Arc::new(OperatorEvents(fixture().harness.clone())),
@@ -776,7 +776,7 @@ async fn a_session_needs_one_named_or_unambiguous_provider() {
 async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
     let f = fixture();
     let mut s = session("/tools");
-    let (outcome, events) = with_events(async { turn(&mut s, "call the tool").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "call the tool").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::EndTurn);
     assert_eq!(outcome.rounds, 2);
@@ -824,7 +824,7 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
 
     // The second turn carries the whole transcript, and the request the
     // provider builds is what the loop was configured with.
-    let (second, events) = with_events(async { turn(&mut s, "and once more").await }).await;
+    let (second, events) = record_events(async { turn(&mut s, "and once more").await }).await;
     assert_eq!(second.unwrap().rounds, 2);
     assert!(events.contains(&Event::TurnComplete));
     let sent = f.stub.requests_for("/tools");
@@ -883,7 +883,7 @@ async fn the_buffered_form_runs_the_same_loop() {
             "usage": {"input_tokens": 3, "output_tokens": 4}
         }),
     ]);
-    let (outcome, events) = with_events(async { turn(&mut s, "go").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "go").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.rounds, 2);
     assert_eq!(outcome.usage.input_tokens, 4);
@@ -949,7 +949,7 @@ async fn the_buffered_failure_and_contract_violations_are_read_fail_closed() {
 async fn the_assistant_message_is_rebuilt_from_the_stream_and_replayed_verbatim() {
     let f = fixture();
     let mut s = session("/opaque");
-    let (outcome, events) = with_events(async { turn(&mut s, "think then call").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "think then call").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     // Text is shown as it streamed, never the opaque block.
     assert_eq!(
@@ -992,7 +992,7 @@ async fn run_takes_turns_from_the_operator_until_input_ends() {
         inputs.push_back("two".into());
     }
     let cancel = CancellationToken::new();
-    let (outcome, events) = with_events(async {
+    let (outcome, events) = record_events(async {
         tokio::time::timeout(
             Duration::from_secs(30),
             gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel),
@@ -1018,7 +1018,7 @@ async fn run_takes_turns_from_the_operator_until_input_ends() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     let mut s = session("/fail-tool");
-    let (outcome, events) = with_events(async { turn(&mut s, "fail").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "fail").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     let c1 = tool_call("c1", "fail", json!({}));
     assert!(events.contains(&Event::ToolResult {
@@ -1033,7 +1033,7 @@ async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     );
 
     let mut s = session("/cut-tool");
-    let (outcome, events) = with_events(async { turn(&mut s, "cut").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "cut").await }).await;
     assert_eq!(outcome.unwrap().rounds, 2);
     let rendered = format!("abc\n{}", spi::tool::TRUNCATED_MARKER);
     assert!(events.contains(&Event::ToolResult {
@@ -1078,7 +1078,7 @@ async fn a_call_that_cannot_run_is_still_answered_with_the_reason() {
         ),
     ] {
         let mut s = session(route);
-        let (outcome, events) = with_events(async { turn(&mut s, route).await }).await;
+        let (outcome, events) = record_events(async { turn(&mut s, route).await }).await;
         assert_eq!(outcome.unwrap().rounds, 2, "{route}: the turn continued");
         let failed = events
             .iter()
@@ -1149,7 +1149,7 @@ async fn a_tool_call_names_itself_in_the_approval_it_causes() {
 async fn retryable_failures_are_retried_and_others_end_the_turn() {
     let f = fixture();
     let mut s = session("/retry");
-    let (outcome, events) = with_events(async { turn(&mut s, "flaky").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "flaky").await }).await;
     assert_eq!(outcome.unwrap().rounds, 1, "one round, two attempts");
     assert_eq!(
         events,
@@ -1174,7 +1174,7 @@ async fn retryable_failures_are_retried_and_others_end_the_turn() {
     assert_eq!(s.transcript()[1]["content"][0]["text"], "recovered");
 
     let mut s = session("/always-retryable");
-    let (outcome, events) = with_events(async { turn(&mut s, "hopeless").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "hopeless").await }).await;
     assert!(matches!(outcome.unwrap_err(), TurnError::Provider(f) if f.retryable == Some(true)));
     assert_eq!(
         events
@@ -1251,7 +1251,7 @@ async fn off_contract_streams_fail_the_turn_closed() {
     // A stream that ends without `end` is a failed turn, not a short
     // answer — the "hel" it streamed is shown, never stored.
     let mut s = session("/truncated");
-    let (outcome, events) = with_events(async { turn(&mut s, "cut").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "cut").await }).await;
     assert!(matches!(outcome.unwrap_err(), TurnError::StreamEnded));
     assert_eq!(events, vec![Event::Text("hel".into())]);
     assert_eq!(s.transcript(), &[user("cut")]);
@@ -1294,7 +1294,7 @@ async fn a_failing_stream_source_ends_the_turn_with_the_recorded_text() {
     let mut cfg = config("/stall");
     cfg.plugin_configs.get_mut(STREAM_LLM).unwrap()["idle_timeout_ms"] = json!(500);
     let mut s = new_session(fixture().kernel.clone(), cfg).unwrap();
-    let (outcome, events) = with_events(async { turn(&mut s, "stall").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "stall").await }).await;
     let err = outcome.unwrap_err();
     assert!(
         matches!(&err, TurnError::StreamFailed { detail: Some(d) } if d == "no response data for 500ms"),
@@ -1410,7 +1410,7 @@ async fn refusal_and_max_tokens_end_the_turn() {
     // as not run — the model remembers refusing, and the transcript
     // stays replayable.
     let mut s = session("/refusal-with-call");
-    let (outcome, events) = with_events(async { turn(&mut s, "hm").await }).await;
+    let (outcome, events) = record_events(async { turn(&mut s, "hm").await }).await;
     let outcome = outcome.unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Refusal);
     assert_eq!(
@@ -1529,7 +1529,7 @@ impl Recorder {
 /// A streamed session against one stub route, with its own sink.
 fn sink_session(route: &str) -> (Session, Arc<Recorder>) {
     let sink = Arc::new(Recorder::default());
-    let s = Session::with_events(fixture().kernel.clone(), config(route), sink.clone()).unwrap();
+    let s = Session::new(fixture().kernel.clone(), config(route), sink.clone()).unwrap();
     (s, sink)
 }
 
@@ -1540,7 +1540,7 @@ async fn two_sessions_on_one_kernel_emit_to_their_own_sinks() {
     let (mut a, sink_a) = sink_session("/own/text");
     let (mut b, sink_b) = sink_session("/own/text-b");
     let ((ra, rb), installed) =
-        with_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
+        record_events(async { tokio::join!(turn(&mut a, "one"), turn(&mut b, "two")) }).await;
     ra.unwrap();
     rb.unwrap();
     assert!(installed.is_empty(), "{installed:?}");
@@ -1894,7 +1894,7 @@ async fn run_is_cancelled_before_it_reads_the_next_turn() {
     // a random branch and the ready `input()` arm wins half the time, so
     // one run detects a lost `biased` with probability one half; sixteen
     // runs miss it once in 65,536.
-    let (outcomes, events) = with_events(async {
+    let (outcomes, events) = record_events(async {
         let mut outcomes = Vec::new();
         for _ in 0..16 {
             outcomes.push(gwennol_host::run(&mut s, fixture().harness.as_ref(), &cancel).await);

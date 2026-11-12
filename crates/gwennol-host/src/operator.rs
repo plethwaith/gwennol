@@ -6,7 +6,7 @@
 //! operator. Secrets are fetched the same way, so the host never holds a key
 //! it was not handed for a specific plugin.
 //!
-//! A frontend starts its session with `Session::with_events` and hands it an
+//! A frontend starts its session with `Session::new` and hands it an
 //! [`OperatorEvents`], which sends the session's events to its operator. One
 //! that only needs the events implements [`EventSink`] instead and has no
 //! operator.

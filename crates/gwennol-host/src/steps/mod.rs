@@ -36,7 +36,7 @@ use gwead::kernel::host_api::PluginErrorPayload;
 use gwead::kernel::{PluginExecution, StepError, StepOutput};
 use gwead::serde_json::Value;
 use gwead::tokio_util::sync::CancellationToken;
-use gwennol_core::cancel::{CANCELLED_AT_APPROVAL, CANCELLED_CODE};
+use gwennol_core::cancel::{CANCELLED_BEFORE_START, CANCELLED_CODE};
 
 /// The boxed future a native step implementation returns.
 pub(crate) type StepFuture<'a> =
@@ -61,13 +61,13 @@ pub(crate) fn cancelled() -> StepError {
 
 /// The structured error a host step returns when its approval was
 /// withdrawn: [`CANCELLED_CODE`] with `params.phase` set to
-/// [`CANCELLED_AT_APPROVAL`]. Unlike [`cancelled`], this carries one
+/// [`CANCELLED_BEFORE_START`]. Unlike [`cancelled`], this carries one
 /// thing more than the typed variant can: nothing ran.
 pub(crate) fn withdrawn() -> StepError {
     StepError::Thrown(PluginErrorPayload {
         code: CANCELLED_CODE.to_string(),
         message: "cancelled".to_string(),
-        params: gwead::serde_json::json!({"phase": CANCELLED_AT_APPROVAL}),
+        params: gwead::serde_json::json!({"phase": CANCELLED_BEFORE_START}),
     })
 }
 

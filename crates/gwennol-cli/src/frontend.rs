@@ -200,7 +200,7 @@ pub fn start(
     if let Some(rounds) = cli.max_rounds.or(session_file.and_then(|s| s.max_rounds)) {
         session_config.max_rounds = rounds;
     }
-    let session = Session::with_events(kernel, session_config, Arc::new(OperatorEvents(operator)))?;
+    let session = Session::new(kernel, session_config, Arc::new(OperatorEvents(operator)))?;
     tracing::info!(provider = session.provider(), "session");
     Ok(session)
 }

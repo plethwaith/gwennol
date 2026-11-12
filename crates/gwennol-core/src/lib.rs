@@ -24,7 +24,7 @@
 //! by provider plugins, never by native code in this crate.
 //!
 //! A session sends each [`Event`] to the [`EventSink`] it was started with
-//! ([`Session::with_events`]) and reads no process-global state, so several
+//! ([`Session::new`]) and reads no process-global state, so several
 //! sessions can share a kernel and keep their events apart.
 
 #![forbid(unsafe_code)]
