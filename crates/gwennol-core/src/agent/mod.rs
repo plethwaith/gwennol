@@ -614,9 +614,7 @@ impl Session {
     /// [`TurnError::Provider`].
     ///
     /// Content of a turn that fails after it is stored stays in the
-    /// transcript, so an image the provider refused is sent again;
-    /// [`Self::restore`] with the block removed is how an embedder drops
-    /// it.
+    /// transcript, so an image the provider refused is sent again.
     pub async fn turn_with(
         &mut self,
         content: Vec<UserContent>,

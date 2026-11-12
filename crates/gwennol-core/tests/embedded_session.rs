@@ -667,7 +667,7 @@ async fn every_offered_action_is_held_to_its_own_schema_and_the_result_shape() {
 async fn a_turn_carries_text_and_images_in_the_order_given() {
     let (kernel, _) = kernel(vec![]);
     let gif = Image::new(b"GIF89a".to_vec()).unwrap();
-    // Twelve bytes that encode to `++//` in the standard alphabet.
+    // Twelve bytes whose standard base64 ends in `++//`.
     let mut plus_slash = PNG_SIGNATURE.to_vec();
     plus_slash.extend([0x00, 0xFB, 0xEF, 0xFF]);
     let plus_slash = Image::new(plus_slash).unwrap();

@@ -3,8 +3,7 @@
 //! [`Session::turn_with`](crate::Session::turn_with) takes a list of
 //! [`UserContent`] and stores it as one run of blocks, in the order given.
 //! An [`Image`] is built from a file's bytes alone: its format is read
-//! from how the bytes start, so a caller never labels one, and bytes of
-//! no supported format never reach a turn.
+//! from how the bytes start, so a caller never labels one.
 
 use std::fmt;
 
