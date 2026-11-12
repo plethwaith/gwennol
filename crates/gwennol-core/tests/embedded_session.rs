@@ -22,7 +22,7 @@ use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
 use gwennol_core::{
     ContentError, Event, EventSink, Image, ImageFormat, ImageReference, RetryPolicy, Session,
-    SessionConfig, SessionError, ToolCall, TurnError, UserContent, spi,
+    SessionConfig, SessionError, StopReason, ToolCall, TurnError, UserContent, spi,
 };
 
 const PROVIDER: &str = "embed_llm";
@@ -902,15 +902,55 @@ async fn a_turn_completed_with_nothing_stored_can_be_retracted() {
         Arc::new(Recorder::default()),
     )
     .unwrap();
-    s.turn("cut short", &CancellationToken::new())
+    let outcome = s
+        .turn("cut short", &CancellationToken::new())
         .await
         .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
     assert_eq!(s.transcript().len(), 1);
     assert_eq!(
         s.retract_unanswered(),
         vec![json!({"type": "text", "text": "cut short"})]
     );
     assert!(s.transcript().is_empty());
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_can_be_retracted() {
+    let (kernel, _) = kernel(vec![]);
+    let mut s = Session::new(kernel, done(), Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let err = s.turn("stop", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Cancelled { .. }), "{err:?}");
+    assert_eq!(s.transcript().len(), 1);
+    assert_eq!(
+        s.retract_unanswered(),
+        vec![json!({"type": "text", "text": "stop"})]
+    );
+    assert!(s.transcript().is_empty());
+}
+
+#[tokio::test]
+async fn an_image_an_assistant_message_answered_is_not_retracted() {
+    let (kernel, _) = kernel(vec![tool("t_plugin", "t")]);
+    let mut config = config("t");
+    config.plugin_configs.insert(
+        PROVIDER.to_string(),
+        json!({"answers": [
+            answer(
+                vec![json!({"type": "tool_use", "id": "c1", "name": "t", "input": {}})],
+                "tool_use",
+            ),
+            {"error": {"message": "image refused", "retryable": false}},
+        ]}),
+    );
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    let err = s.turn_with(vec![png(8).into()], &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert!(s.retract_unanswered().is_empty());
+    assert_eq!(s.transcript()[0]["content"][0]["type"], "image");
 }
 
 #[tokio::test]
