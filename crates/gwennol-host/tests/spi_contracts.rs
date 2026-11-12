@@ -345,6 +345,30 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
+    // An image block in a user message: one valid block conforms, and each
+    // fault below is the only difference from it.
+    let image_input = |source: Value| {
+        json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": source}
+        ]}]})
+    };
+    let valid = json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="});
+    assert_conforms(c.chat_input, &image_input(valid.clone()));
+    for (fault, key, value) in [
+        ("an unnamed media type", "media_type", json!("image/bmp")),
+        ("an extra field", "extra", json!(1)),
+        ("empty data", "data", json!("")),
+    ] {
+        let mut source = valid.clone();
+        source[key] = value;
+        let bad = image_input(source);
+        assert!(
+            c.schemas.validate(&bad, c.chat_input).is_err(),
+            "schema accepted {fault}: {bad}"
+        );
+    }
+
     // usage is required on the buffered form and the end event — pinned
     // as minimal pairs: each payload is valid until usage alone is
     // removed, so the rejection is attributable to exactly that field.

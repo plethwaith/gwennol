@@ -13,6 +13,8 @@ keywords = ["agent", "llm", "wasm", "gwead"]
 categories = ["development-tools"]
 
 [dependencies]
+# Writes an image block's `data` (standard padded base64).
+base64 = "0.22"
 gwead.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

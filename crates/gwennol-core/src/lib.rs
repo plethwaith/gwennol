@@ -32,6 +32,7 @@
 
 pub mod agent;
 pub mod cancel;
+pub mod content;
 pub mod context;
 pub mod events;
 pub mod spi;
@@ -40,5 +41,6 @@ pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
     Usage, resolve_provider,
 };
+pub use content::{ContentError, Image, ImageError, ImageFormat, UserContent};
 pub use events::{Event, EventSink, ToolCall};
 pub use gwead;

@@ -29,7 +29,7 @@ use gwead::kernel::Kernel;
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    Event, EventSink, Session, SessionConfig, SessionError, StopReason, ToolCall, TurnError,
+    Event, EventSink, Image, Session, SessionConfig, SessionError, StopReason, ToolCall, TurnError,
     TurnOutcome, spi,
 };
 use gwennol_host::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
@@ -904,6 +904,32 @@ async fn the_buffered_form_runs_the_same_loop() {
     );
     assert_eq!(s.transcript().len(), 4);
     assert_eq!(s.transcript()[2]["content"][0]["content"], "echo: buffered");
+}
+
+/// What `turn_with` stores is the contract's user message: the block it
+/// builds is held to the schema, not to the loop's own idea of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_turn_with_an_image_stores_conforms_to_the_contract() {
+    let mut s = canned(vec![json!({
+        "message": {"role": "assistant", "content": [text("seen")]},
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })]);
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(&[7; 32]);
+    let cancel = CancellationToken::new();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        s.turn_with(
+            vec!["look".into(), Image::new(bytes).unwrap().into()],
+            &cancel,
+        ),
+    )
+    .await
+    .expect("the turn finishes within 30s")
+    .unwrap();
+    assert_eq!(s.transcript()[0]["content"][1]["type"], "image");
+    assert_conforms(contracts().chat_input, &s.chat_input());
 }
 
 /// The buffered failed form is the same `Failure` the stream's error

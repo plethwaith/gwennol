@@ -210,6 +210,36 @@ mod tests {
     }
 
     #[test]
+    fn a_user_message_admits_an_image_block() {
+        use crate::content::ImageFormat;
+        use serde_json::json;
+        let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
+        assert_eq!(contract["version"], "0.4.0");
+        let defs = &contract["$defs"];
+        assert_eq!(
+            defs["UserMessage"]["properties"]["content"]["items"]["oneOf"],
+            json!([
+                {"$ref": "#/$defs/TextBlock"},
+                {"$ref": "#/$defs/ToolResultBlock"},
+                {"$ref": "#/$defs/ImageBlock"}
+            ])
+        );
+        assert_eq!(defs["ImageBlock"]["additionalProperties"], false);
+        assert_eq!(defs["ImageBlock"]["required"], json!(["type", "source"]));
+        assert_eq!(
+            defs["ImageBlock"]["properties"]["source"],
+            json!({"$ref": "#/$defs/Base64ImageSource"})
+        );
+        let source = &defs["Base64ImageSource"];
+        assert_eq!(source["additionalProperties"], false);
+        assert_eq!(source["required"], json!(["type", "media_type", "data"]));
+        assert_eq!(
+            source["properties"]["media_type"]["enum"],
+            json!(ImageFormat::ALL.map(ImageFormat::media_type))
+        );
+    }
+
+    #[test]
     fn harvest_refusals_read_as_written() {
         assert_eq!(
             HarvestError::DuplicateToolName("x".into()).to_string(),

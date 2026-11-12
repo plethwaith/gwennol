@@ -1154,6 +1154,7 @@ dependencies = [
 name = "gwennol-core"
 version = "0.1.0-dev"
 dependencies = [
+ "base64",
  "boon",
  "gwead",
  "serde_json",

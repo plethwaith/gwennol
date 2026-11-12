@@ -54,6 +54,7 @@ blocks:
 | `tool_use` | `id`, `name`, `input` | `assistant` |
 | `tool_result` | `tool_use_id`, `content`, `is_error?` | `user` |
 | `opaque` | `provider`, `data` | `assistant` |
+| `image` | `source` | `user` |
 
 An `opaque` block is provider state the consumer carries but never
 reads — a vendor's thinking block, which the vendor requires replayed
@@ -64,6 +65,14 @@ rendered, altered, reordered, or dropped — and assumes nothing about the
 shape of `data`. `provider` names the producing plugin, so a provider
 ignores blocks another produced (a conversation that changes provider
 mid-way loses only what the new provider could not have used).
+
+An `image` block is an image the user shows the model, in its position
+among the message's blocks. Its `source` carries the file's bytes inline,
+as standard base64 with a media type; the schema lists the fields and the
+media types. The loop builds the block from bytes (`Image::new`) and
+transforms nothing: limits on size, dimensions and count are the
+vendor's, and a vendor that will not take the image answers with a
+`Failure`.
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
@@ -84,8 +93,8 @@ are contract here:
   calls), mixed with text. **Every** `tool_use` must be answered, and
   **all** the answers arrive in the immediately following `user` message
   — one `tool_result` per `tool_use`, none deferred to a later turn.
-- In that user message, `tool_result` blocks come before any `text`
-  blocks.
+- In that user message, `tool_result` blocks come before any `text` or
+  `image` blocks.
 - `id` values are opaque and unique within a conversation. The loop
   echoes them; it never parses or fabricates them.
 - The assistant message that asked for the tools is replayed exactly as
@@ -380,6 +389,14 @@ rather than oversights. Each would be a contract change; none blocks
   own implementation — continue or fail; no pause is expressible on this
   wire.
 - **Non-text tool results.** `content` is a UTF-8 string. Binary output
-  is the tool's problem (lossy conversion, or refusing); image results
-  are a later block-type change. Truncation is signalled as data
+  is the tool's problem (lossy conversion, or refusing); the `image`
+  block exists for user content only. Truncation is signalled as data
   (`truncated`, above), never inside `content`.
+- **Image sources other than inline bytes.** An `image` block's `source`
+  has a `type` so that another way of naming the bytes, a reference the
+  provider resolves, can be added beside `base64`; none exists, so every
+  image travels inline.
+- **A provider's declaration of what it accepts.** Whether a model takes
+  images depends on the model a provider's `$config` names, so neither
+  the contract nor a manifest says; a provider that cannot take an image
+  answers `Failure`.

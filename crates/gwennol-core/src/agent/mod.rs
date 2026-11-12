@@ -83,8 +83,8 @@
 //!   an empty assistant message anywhere but last); a round that did
 //!   is kept together with the answer to every call it made. A failed
 //!   or cancelled turn therefore leaves the transcript ending in a
-//!   user message — the user's text, or the last round's results — and
-//!   the next turn's text joins that message. Nothing that happened is
+//!   user message — the user's content, or the last round's results — and
+//!   the next turn's content joins that message. Nothing that happened is
 //!   lost from the model's view, and nothing half-happened enters it.
 //!
 //! What the loop deliberately does not do: choose policy, persist
@@ -102,6 +102,7 @@ use gwead::kernel::{ExecutionContext, Kernel, KernelError};
 use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
+use crate::content::{ContentError, UserContent};
 use crate::context::{CONTEXT_KEY, exec_context_with};
 use crate::events::{Event, EventSink, ToolCall};
 use crate::spi;
@@ -247,6 +248,10 @@ pub struct TurnOutcome {
 /// docs describe: whole exchanges kept, the partial one dropped.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
+    /// [`Session::turn_with`] refused its content. Nothing was stored,
+    /// no event was sent and the provider was not called.
+    #[error("the turn's content was refused: {0}")]
+    Content(#[from] ContentError),
     /// The token was cancelled. `detail` is the text the kernel
     /// recorded for a stream source whose failure the read that met
     /// the cut found waiting: the kernel polls the source before the
@@ -421,6 +426,15 @@ pub struct SessionConfig {
     /// refuses the session ([`SessionError::Harvest`]). `Some` of an empty
     /// set offers no tools.
     pub tool_plugins: Option<BTreeSet<String>>,
+    /// The most bytes one image of a turn may have, checked by
+    /// [`Session::turn_with`] before anything is stored. Not applied by
+    /// [`Session::restore`]. Images travel inline and the conversation is
+    /// sent again every round, so what the provider's guest can hold bounds
+    /// the conversation's images together, not one image: a request that
+    /// is too large for the bundled provider's guest fails the turn as
+    /// [`TurnError::Step`]. An embedder that raises the kernel's memory
+    /// limit can raise this with it.
+    pub max_image_bytes: usize,
 }
 
 impl Default for SessionConfig {
@@ -436,6 +450,7 @@ impl Default for SessionConfig {
             max_event_bytes: 16 << 20,
             context: Map::new(),
             tool_plugins: None,
+            max_image_bytes: 2 << 20,
         }
     }
 }
@@ -538,12 +553,16 @@ impl Session {
     /// ([`SessionError::Transcript`] gives the position). What
     /// [`Self::transcript`] returned, from this session or another, is
     /// accepted. The list may be empty, and may end in a user message
-    /// (the next turn's text joins it).
+    /// (the next turn's content joins it).
     ///
     /// Not checked: that `tool_use` ids are unique across the
     /// conversation and that a tool the list names is one this session
-    /// offers (the loop checks neither of what a provider sends), and that
-    /// a `tool_result` carries `is_error`, which the loop always writes. If
+    /// offers (the loop checks neither of what a provider sends), that
+    /// a `tool_result` carries `is_error`, which the loop always writes,
+    /// that an image block's `data` is base64 or decodes to the format its
+    /// `media_type` names, and that an image is within
+    /// [`SessionConfig::max_image_bytes`] (a transcript another session
+    /// returned is accepted whatever that session's cap was). If
     /// the model calls an unoffered tool again, the loop answers that no
     /// tool by that name is available.
     pub fn restore(&mut self, messages: Vec<Value>) -> Result<(), SessionError> {
@@ -576,7 +595,48 @@ impl Session {
         text: &str,
         cancel: &CancellationToken,
     ) -> Result<TurnOutcome, TurnError> {
-        self.transcript.push_user_text(text);
+        self.turn_with(vec![UserContent::Text(text.to_string())], cancel)
+            .await
+    }
+
+    /// Run one user turn whose content is `content`: text and images, in
+    /// the order given, stored as one run of blocks. Otherwise exactly
+    /// [`Self::turn`].
+    ///
+    /// Refused as [`TurnError::Content`], with the transcript untouched,
+    /// no event emitted and no provider call made, when `content` is empty
+    /// or an image is larger than [`SessionConfig::max_image_bytes`]; every
+    /// item is checked before the first is stored. The loop transforms no
+    /// image. Dimensions, how many images a request may carry, and whether
+    /// the model takes images at all are the vendor's to answer, as a
+    /// [`TurnError::Provider`].
+    ///
+    /// As with any turn, content of a turn that fails stays in the
+    /// transcript and the next turn's content joins it, so a refused image
+    /// is sent again; [`Self::restore`] with the block removed is how an
+    /// embedder drops it.
+    pub async fn turn_with(
+        &mut self,
+        content: Vec<UserContent>,
+        cancel: &CancellationToken,
+    ) -> Result<TurnOutcome, TurnError> {
+        if content.is_empty() {
+            return Err(ContentError::Empty.into());
+        }
+        for (index, item) in content.iter().enumerate() {
+            if let UserContent::Image(image) = item
+                && image.bytes().len() > self.config.max_image_bytes
+            {
+                return Err(ContentError::ImageTooLarge {
+                    index,
+                    bytes: image.bytes().len(),
+                    max: self.config.max_image_bytes,
+                }
+                .into());
+            }
+        }
+        self.transcript
+            .push_user_content(content.iter().map(UserContent::block).collect());
         let max_rounds = self.config.max_rounds.max(1);
         let mut usage = Usage::default();
         for round_no in 1..=max_rounds {
@@ -599,7 +659,7 @@ impl Session {
                 // An empty message — a refusal or a cap hit before any
                 // block completed — is not stored: there is nothing to
                 // replay, and a vendor refuses an empty assistant
-                // message anywhere but last. The next turn's text then
+                // message anywhere but last. The next turn's content then
                 // joins the user message this one left.
                 if is_empty_message(&round.message) {
                     tracing::debug!(stop_reason = ?round.stop_reason, "empty assistant message not stored");
