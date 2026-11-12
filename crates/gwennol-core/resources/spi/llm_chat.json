@@ -6,7 +6,7 @@
   "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
-      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`. A streamed request is instead answered with the failed form when the provider declined it before starting a stream.",
+      "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`, unless the provider declined the request before starting a stream, in which case it is the failed form.",
       "input": {
         "type": "object",
         "required": ["messages"],

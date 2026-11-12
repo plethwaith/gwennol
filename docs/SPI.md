@@ -133,14 +133,15 @@ alike — and open beyond its two required fields: a provider may add its
 own counters (cache reads, say), and consumers must tolerate and may
 ignore them.
 
-### Failure, buffered — settled
+### Failure — settled
 
 Settled with the first real provider to inform it ("4. Provider and
 tools" in the roadmap). The buffered form has a third shape,
 `{"error": {"message", "retryable"?, "kind"?}}` — the same three
 fields the stream's `error` event carries — for a turn the vendor
 answered and refused (a non-2xx status, or an error
-document in place of a message), or one the provider declined (below). The provider fills `retryable` from
+document in place of a message), or one the provider declined (below),
+which answers a streamed request, too. The provider fills `retryable` from
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
 malformed-request and not-found answers will fail again) and `kind`

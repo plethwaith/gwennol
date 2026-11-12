@@ -17,8 +17,8 @@
 //!   handle as `{"stream": n}`, or dispatches [`FETCH_ACTION`] and
 //!   translates the buffered answer into the contract's message — or
 //!   its `Failure`, when the vendor said no. It also declines, as the
-//!   contract's `Failure` on either form and before dispatching
-//!   anything, an image source it cannot send.
+//!   contract's `Failure` on either form and before translating or
+//!   dispatching anything, an image source it cannot send.
 //! - [`ENTRY_RELAY`] runs as the `long_running` step of the dataflow
 //!   action: it reads the Messages API's server-sent events off the
 //!   fetch step's stream handle and writes contract NDJSON events to

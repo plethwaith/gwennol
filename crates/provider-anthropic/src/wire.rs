@@ -12,9 +12,9 @@
 //!   confined to `opaque` blocks: this provider's are unwrapped back
 //!   into the vendor blocks they carry, another provider's are dropped
 //!   with a note. A user message's blocks pass through verbatim and in
-//!   place: an `image` block with a `base64` source with the rest, one
-//!   with any other source is declined before a request is built
-//!   ([`unsupported_image_source`]). What else needs
+//!   place, an `image` block with a `base64` source among them. `chat`
+//!   declines a turn holding an image with any other source before a
+//!   request is built ([`unsupported_image_source`]). What else needs
 //!   code is the defaults and the knobs
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
 //!   exclusions").
