@@ -202,8 +202,8 @@ impl fmt::Debug for Image {
     }
 }
 
-/// An image the provider resolves from `reference`, a string the embedder
-/// chose (a path, a storage key).
+/// An image the provider resolves from `reference`, a string (a path,
+/// a storage key).
 ///
 /// The loop stores the reference and never interprets it. The format is the
 /// caller's declaration, not checked against anything.

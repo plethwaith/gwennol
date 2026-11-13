@@ -73,7 +73,7 @@ mid-way loses only what the new provider could not have used).
 An `image` block is an image shown to the model, in its position among the
 blocks around it: a user message's, or a `tool_result`'s content. Its
 `source` carries the image one of two ways: the file's bytes inline, as
-standard base64, or a `reference` the embedder chose (a path, a storage
+standard base64, or a `reference` (a path, a storage
 key); both name a media type, and the schema lists the fields and the media
 types. The consumer never
 interprets a reference: it stores and replays it, and resolving it is the

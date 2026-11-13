@@ -45,7 +45,7 @@ pub mod tool {
     /// `plugins/spi/tool.json`; see [`super::llm_chat::DEFINITION`].
     pub const DEFINITION: &str = include_str!("../resources/spi/tool.json");
 
-    /// The one line appended to a truncated result's `content` before
+    /// The marker added to a truncated result's `content` before
     /// the model sees it — the shared truncation convention of
     /// `docs/SPI.md`. Tools report `truncated: true` as data and never
     /// compose this themselves; [`render_content`] is where it lands on a

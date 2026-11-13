@@ -407,8 +407,9 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
-    // A tool's result list, in `call`'s output and in a `tool_result`:
-    // one valid list conforms, and each fault is the only difference.
+    // A tool's result list: one valid list conforms in `call`'s output and in a
+    // `tool_result`; `call`'s output refuses each fault below, and a
+    // `tool_result` refuses the empty list.
     let result_text = json!({"type": "text", "text": "shot"});
     let result_inline = json!({"type": "image", "source": valid.clone()});
     let result_reference = json!({"type": "image", "source": reference.clone()});

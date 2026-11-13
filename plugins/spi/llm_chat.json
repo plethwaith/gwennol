@@ -248,7 +248,7 @@
       "properties": {
         "type": { "const": "reference" },
         "media_type": { "$ref": "#/$defs/ImageMediaType" },
-        "reference": { "type": "string", "minLength": 1, "description": "Chosen by the embedder: a path, a storage key." }
+        "reference": { "type": "string", "minLength": 1, "description": "A path, a storage key." }
       }
     },
     "ImageMediaType": {

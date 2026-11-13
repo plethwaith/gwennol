@@ -112,8 +112,9 @@ pub(crate) struct ToolOutput {
 }
 
 /// Read the output of an action run as a tool. Fail-closed like every contract
-/// shape: a result missing `content`, mistyping a field, or carrying
-/// one the closed schema does not allow is not a result. A `content` list is
+/// shape: a result that is not an object, has no `content` or an empty
+/// `content` list, mistypes a field, or carries one the closed schema does
+/// not allow is not a result. A `content` list is
 /// read block by block, by `parse_block`.
 pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     let Some(fields) = output.as_object() else {
