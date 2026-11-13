@@ -1090,7 +1090,9 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
 
 /// What the bundled provider declares it takes agrees with what `chat`
 /// does: for each source type the contract names, declared means `chat`
-/// sends it, and not declared means `chat` declines it before the vendor.
+/// sends it, and not declared means `chat` declines it before the vendor;
+/// for each media type, `chat` reaches the vendor exactly when the type is
+/// declared.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundled_declaration_agrees_with_what_chat_sends() {
     let f = fixture();
@@ -1144,7 +1146,8 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
         }
     }
 
-    // Each media type, carried inline: declared means `chat` sends it.
+    // Each media type, carried inline: `chat` reaches the vendor exactly
+    // when it is declared.
     let media_types: Vec<String> = contract["$defs"]["ImageMediaType"]["enum"]
         .as_array()
         .unwrap()
@@ -1161,17 +1164,25 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
         .output["images"]["media_types"]
         .clone();
     for t in &media_types {
-        let input = json!({"messages": [{"role": "user", "content": [
+        let messages = json!([{"role": "user", "content": [
             {"type": "text", "text": "what is this?"},
             {"type": "image", "source":
                 {"type": "base64", "media_type": t, "data": "iVBORw0KGgo="}}
-        ]}]});
+        ]}]);
         let route = format!("/agree-media-{}", t.replace('/', "-"));
-        let out = f.raw(&route, input, false).await;
-        let sent = f
-            .requested()
+        let out = f
+            .raw(&route, json!({"messages": messages.clone()}), false)
+            .await;
+        let bodies: Vec<Value> = f
+            .stub
+            .requests
+            .lock()
+            .unwrap()
             .iter()
-            .any(|path| *path == format!("{route}/v1/messages"));
+            .filter(|(p, _, _)| *p == format!("{route}/v1/messages"))
+            .map(|(_, _, body)| body["messages"].clone())
+            .collect();
+        let sent = !bodies.is_empty();
         let declares = declared.as_array().unwrap().contains(&json!(t));
         assert_eq!(
             declares, sent,
@@ -1179,6 +1190,12 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
         );
         if declares {
             assert!(out.get("message").is_some(), "{t}: {out}");
+            assert_eq!(bodies, vec![messages], "{t}: the vendor's request body");
+        } else {
+            assert_eq!(
+                out["error"]["kind"], "unsupported_image_source",
+                "{t}: {out}"
+            );
         }
     }
 }

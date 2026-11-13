@@ -107,13 +107,14 @@ fn plain_provider() -> Value {
     plugin
 }
 
-/// `provider()` whose `accepts` names `{{$input.messages}}` as a source
-/// type, which echoes the `messages` field of the action's input.
+/// `provider()` whose `accepts` names `{{$input}}` as a source type.
+/// Gwead resolves `{{$input}}` to its whole resolution context, where
+/// the input's fields sit at the top level.
 fn echoing_provider() -> Value {
     let mut plugin = provider();
     plugin["name"] = json!("embed_llm_echo");
     plugin["actions"]["accepts"] = json!({"steps": [
-        {"id": "a", "type": "return", "params": {"value": {"images": {"media_types": ["image/png"], "sources": ["base64", "{{$input.messages}}"]}}}}
+        {"id": "a", "type": "return", "params": {"value": {"images": {"media_types": ["image/png"], "sources": ["base64", "{{$input}}"]}}}}
     ]});
     plugin
 }
@@ -1211,7 +1212,7 @@ async fn an_accepts_query_sends_an_empty_input() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "provider output violates the LLM_CHAT contract: `images` names a source type the contract does not: \"\""
+        "provider output violates the LLM_CHAT contract: `images` names a source type the contract does not: {\"config\":{},\"secrets\":{},\"steps\":{},\"vars\":{}}"
     );
 }
 
