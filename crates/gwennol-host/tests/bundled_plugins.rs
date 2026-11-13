@@ -1089,10 +1089,7 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
 }
 
 /// What the bundled provider declares it takes agrees with what `chat`
-/// does: for each source type the contract names, declared means `chat`
-/// sends it, and not declared means `chat` declines it before the vendor;
-/// for each media type, `chat` reaches the vendor exactly when the type is
-/// declared.
+/// does, for each source type and each media type the contract names.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundled_declaration_agrees_with_what_chat_sends() {
     let f = fixture();
@@ -1146,8 +1143,7 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
         }
     }
 
-    // Each media type, carried inline: `chat` reaches the vendor exactly
-    // when it is declared.
+    // Each media type, carried inline.
     let media_types: Vec<String> = contract["$defs"]["ImageMediaType"]["enum"]
         .as_array()
         .unwrap()
