@@ -18,6 +18,9 @@ pub mod llm_chat {
     /// The one required action: messages in, assistant message (or stream
     /// handle) out.
     pub const CHAT: &str = "chat";
+    /// The optional action: what the provider takes under its `$config`.
+    /// A provider may omit it.
+    pub const ACCEPTS: &str = "accepts";
     /// The contract document, as shipped. The canonical file is
     /// `plugins/spi/llm_chat.json`; this embeds the crate's byte-identical
     /// copy (`cargo package` cannot reach outside the crate), pinned equal
@@ -214,7 +217,7 @@ mod tests {
         use crate::content::ImageFormat;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.5.0");
+        assert_eq!(contract["version"], "0.6.0");
         let defs = &contract["$defs"];
         assert_eq!(
             defs["UserMessage"]["properties"]["content"]["items"]["oneOf"],
@@ -254,6 +257,57 @@ mod tests {
                 ImageFormat::ALL
                     .iter()
                     .map(|f| f.media_type())
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
+    fn a_provider_may_declare_what_it_accepts() {
+        use crate::accepts::ImageSource;
+        use serde_json::json;
+        let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
+        assert_eq!(contract["version"], "0.6.0");
+        let accepts = &contract["actions"][llm_chat::ACCEPTS];
+        assert_eq!(accepts["optional"], true);
+        assert_eq!(
+            accepts["input"],
+            json!({"type": "object", "additionalProperties": false, "properties": {}})
+        );
+        assert_eq!(accepts["output"]["type"], "object");
+        assert_eq!(accepts["output"]["additionalProperties"], true);
+        assert_eq!(
+            accepts["output"]["properties"]["images"]["oneOf"],
+            json!([{"const": false}, {"$ref": "#/$defs/ImageInput"}])
+        );
+        let defs = &contract["$defs"];
+        let input = &defs["ImageInput"];
+        assert_eq!(input["required"], json!(["media_types", "sources"]));
+        assert_eq!(input["additionalProperties"], true);
+        for field in ["media_types", "sources"] {
+            let array = &input["properties"][field];
+            assert_eq!(array["type"], "array", "{field}");
+            assert_eq!(array["minItems"], 1, "{field}");
+            assert_eq!(array["uniqueItems"], true, "{field}");
+        }
+        assert_eq!(
+            input["properties"]["media_types"]["items"],
+            json!({"$ref": "#/$defs/ImageMediaType"})
+        );
+        let sources = &input["properties"]["sources"]["items"]["enum"];
+        assert_eq!(
+            sources,
+            &json!([
+                defs["Base64ImageSource"]["properties"]["type"]["const"],
+                defs["ReferenceImageSource"]["properties"]["type"]["const"],
+            ])
+        );
+        assert_eq!(
+            sources,
+            &json!(
+                ImageSource::ALL
+                    .iter()
+                    .map(|s| s.source_type())
                     .collect::<Vec<_>>()
             )
         );

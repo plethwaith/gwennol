@@ -407,6 +407,44 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
+    // The `accepts` input is closed and empty; its output is open. Each
+    // fault below but the first changes one field of the valid `images`.
+    assert_conforms(c.accepts_input, &json!({}));
+    assert!(
+        c.schemas
+            .validate(&json!({"x": 1}), c.accepts_input)
+            .is_err(),
+        "accepts input admitted a property"
+    );
+    let valid_images = json!({"media_types": ["image/png"], "sources": ["base64"], "max_bytes": 1});
+    assert_conforms(c.accepts_output, &json!({}));
+    assert_conforms(c.accepts_output, &json!({"images": false}));
+    assert_conforms(
+        c.accepts_output,
+        &json!({"images": valid_images.clone(), "temperature": true}),
+    );
+    let mut no_sources = valid_images.clone();
+    no_sources.as_object_mut().unwrap().remove("sources");
+    let mut empty_types = valid_images.clone();
+    empty_types["media_types"] = json!([]);
+    let mut url_source = valid_images.clone();
+    url_source["sources"] = json!(["url"]);
+    let mut doubled_type = valid_images.clone();
+    doubled_type["media_types"] = json!(["image/png", "image/png"]);
+    for (fault, images) in [
+        ("images true", json!(true)),
+        ("no sources", no_sources),
+        ("an empty media_types", empty_types),
+        ("a source type of url", url_source),
+        ("a media type named twice", doubled_type),
+    ] {
+        let bad = json!({ "images": images });
+        assert!(
+            c.schemas.validate(&bad, c.accepts_output).is_err(),
+            "accepts output admitted {fault}: {bad}"
+        );
+    }
+
     // usage is required on the buffered form and the end event — pinned
     // as minimal pairs: each payload is valid until usage alone is
     // removed, so the rejection is attributable to exactly that field.

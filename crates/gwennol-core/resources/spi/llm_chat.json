@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "name": "LLM_CHAT",
   "displayName": "Chat-model provider",
-  "version": "0.5.0",
-  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
+  "version": "0.6.0",
+  "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. One optional action, `accepts`: what the provider takes under its `$config`, for a caller to ask before a turn. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
       "description": "One model turn. With `stream` unset or false the model's whole reply comes back as `message`; with `stream: true` the result instead carries an integer stream handle yielding newline-delimited JSON events shaped by `streamEventShape`, unless the provider declined the request before starting a stream, in which case it is the failed form.",
@@ -75,6 +75,22 @@
             }
           }
         ]
+      }
+    },
+    "accepts": {
+      "optional": true,
+      "description": "What the provider takes under the `$config` it runs with, for a caller to decide before a turn what to offer. No input beyond `$config`. A provider without this action does not say, which a caller reads as unknown for every kind of input. A caller need not ask, and the answer binds the provider to nothing: a turn it cannot serve still answers with `chat`'s failed form.",
+      "input": { "type": "object", "additionalProperties": false, "properties": {} },
+      "output": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "One key per kind of input. A key that is absent means the provider does not know, which is distinct from `false`: a provider that can only find out from its server, and cannot, leaves the key out. Open on purpose: a later version adds a key for another kind of input, and a caller reads a key it does not know as nothing said. A known key whose value the schema does not admit is a contract violation, not an unknown.",
+        "properties": {
+          "images": {
+            "oneOf": [ { "const": false }, { "$ref": "#/$defs/ImageInput" } ],
+            "description": "Whether a user message may carry `image` blocks: `false` for none, or which ones."
+          }
+        }
       }
     }
   },
@@ -238,6 +254,16 @@
     "ImageMediaType": {
       "description": "The image formats this contract names.",
       "enum": ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    },
+    "ImageInput": {
+      "type": "object",
+      "required": ["media_types", "sources"],
+      "additionalProperties": true,
+      "description": "The images a provider takes. Open like the answer it sits in: a later version may add a field, and a caller ignores one it does not know.",
+      "properties": {
+        "media_types": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/ImageMediaType" }, "description": "The formats it takes." },
+        "sources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["base64", "reference"] }, "description": "The source types it takes: `base64`, the bytes inline, and `reference`, a reference it resolves." }
+      }
     },
     "ToolUseBlock": {
       "type": "object",

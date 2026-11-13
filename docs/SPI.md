@@ -27,10 +27,14 @@ and the check is action presence: a plugin claiming `LLM_CHAT` without a
   agent loop (`gwennol_core::agent`) validates model-emitted tool
   arguments against the tool's declared schema before dispatching the
   tool's action, and reads everything a provider returns fail-closed.
+  `gwennol_core::provider_accepts`, which the loop never calls, reads the
+  `accepts` answer: a key this version knows fail-closed, any other key
+  ignored.
 
 ## `LLM_CHAT`
 
-One required action, `chat`: one model turn.
+One required action, `chat`: one model turn. One optional action, `accepts`:
+what the provider takes (below).
 
 ### Request
 
@@ -73,9 +77,11 @@ embedder chose (a path, a storage key); both name a media type, and the
 schema lists the fields and the media types. The consumer never
 interprets a reference: it stores and replays it, and resolving it is the
 provider's. A provider that cannot resolve a reference, or cannot take an
-image, answers with a `Failure`. The loop builds the inline block from an
-`Image`, whose format it reads from the bytes, and the reference block
-from an `ImageReference`, whose format the caller declares;
+image, answers with a `Failure`. A provider can also say beforehand, through
+`accepts`, which image formats and source types it takes, or that it takes
+none. The loop builds the inline block from an `Image`, whose format it
+reads from the bytes, and the reference block from an `ImageReference`,
+whose format the caller declares;
 `SessionConfig::max_image_bytes` measures images, not references, and
 `Session::turn_with` refuses an image over it before storing anything.
 Limits on dimensions and count are the vendor's.
@@ -220,6 +226,26 @@ table, so a streaming caller resolves the role first
 (`Kernel::role_candidates`) and executes the winner with
 `.with_streams(…)` — the loop and the integration tests show the
 pattern.
+
+### What a provider accepts
+
+`accepts` takes nothing but `$config` and answers per kind of input, so the
+answer can follow the model a config names. A key left out means the
+provider does not know, an answer distinct from `false` (a provider that
+can only ask its server, and cannot, leaves it out). This version defines
+one key, `images`: `false`, or the media types and source types it takes.
+The answer is open: a later version adds a key, a caller ignores one it
+does not know, and a known key with a value the schema does not admit is a
+contract violation.
+
+The action is optional, and Gwead's registration check does not look for
+it: a provider without it reads as one that does not say. The loop never
+asks; `gwennol_core::provider_accepts` asks the provider a session config
+resolves to, under the `$config` that config gives the provider, and its
+context, for an embedder to call when the config changes. The answer binds
+nothing: a turn the provider cannot serve still answers with the failed
+form. The bundled provider declares inline images in every format the
+contract names, from its manifest, without reading the configured model.
 
 ## `TOOL`
 
@@ -410,7 +436,6 @@ rather than oversights. Each would be a contract change; none blocks
 - **How a reference is resolved.** The contract says the provider
   resolves an image reference, not how; no host step exists for it, and
   the bundled provider resolves none.
-- **A provider's declaration of what it accepts.** Whether a model takes
-  images depends on the model a provider's `$config` names, so neither
-  the contract nor a manifest says; a provider that cannot take an image,
-  or resolve its source, answers `Failure`.
+- **Limits in the `accepts` answer.** It says which formats and sources a
+  provider takes, not how large, how many, or of what dimensions; the open
+  `images` object leaves room for them.

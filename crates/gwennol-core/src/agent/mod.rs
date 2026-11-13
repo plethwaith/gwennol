@@ -10,6 +10,10 @@
 //! context, so a step reached several dispatches later can name it (see
 //! [`crate::context`]).
 //!
+//! [`provider_accepts`] asks a provider what input it takes, for a
+//! frontend to decide before a turn; the loop itself never asks. The
+//! answer's type and the ways asking can fail are in [`crate::accepts`].
+//!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
 //!
@@ -98,13 +102,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use gwead::kernel::execute_request::ExecuteActionRequest;
 use gwead::kernel::{ExecutionContext, Kernel, KernelError};
 use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
+use crate::accepts::{self, Accepts, AcceptsError, Support};
 use crate::content::{ContentError, UserContent};
 use crate::context::{CONTEXT_KEY, exec_context_with};
 use crate::events::{Event, EventSink, ToolCall};
@@ -396,12 +402,13 @@ pub struct SessionConfig {
     pub stream: bool,
     /// The `$config` each plugin runs under, by plugin name — a
     /// provider's model and endpoint, say. A plugin not listed runs
-    /// under `{}`. Applies to the action the loop dispatches: Gwead
-    /// hands a caller's config through to the actions it invokes, so
-    /// a plugin that invokes another runs it under its own config. The
-    /// bundled plugins invoke only themselves; re-keying config per
-    /// callee is a dispatch-orchestrator concern that arrives with
-    /// installable plugins.
+    /// under `{}`. Applies to the actions the loop dispatches, and to
+    /// [`provider_accepts`]: Gwead hands a caller's config through to
+    /// the actions it invokes, so a plugin that invokes another runs it
+    /// under its own config. The bundled plugins invoke only
+    /// themselves; re-keying config per callee is a
+    /// dispatch-orchestrator concern that arrives with installable
+    /// plugins.
     pub plugin_configs: BTreeMap<String, Value>,
     /// Most provider calls one turn may make before it is abandoned.
     pub max_rounds: u32,
@@ -415,8 +422,9 @@ pub struct SessionConfig {
     /// native step can tell what the invocation is for.
     ///
     /// A tool call runs under these entries plus [`CONTEXT_KEY`] naming
-    /// the call; a provider round runs under these entries alone, or,
-    /// when the map is empty, under the empty context. A map carrying
+    /// the call; a provider round, and [`provider_accepts`], run under
+    /// these entries alone, or, when the map is empty, under the empty
+    /// context. A map carrying
     /// [`CONTEXT_KEY`] refuses the session
     /// ([`SessionError::ReservedContextKey`]).
     pub context: Map<String, Value>,
@@ -461,6 +469,19 @@ impl Default for SessionConfig {
     }
 }
 
+impl SessionConfig {
+    /// The `$config` `plugin` runs under: its entry in
+    /// [`Self::plugin_configs`], else `{}`. The one lookup every
+    /// dispatch goes through: a provider round, [`provider_accepts`], and
+    /// a tool call.
+    fn plugin_config_for(&self, plugin: &str) -> &Value {
+        static EMPTY: OnceLock<Value> = OnceLock::new();
+        self.plugin_configs
+            .get(plugin)
+            .unwrap_or_else(|| EMPTY.get_or_init(|| json!({})))
+    }
+}
+
 /// The `LLM_CHAT` plugin a session would talk to: `named` when it is
 /// a registered fulfiller, else the only fulfiller there is. The one
 /// implementation of the rule [`SessionConfig::provider`] states —
@@ -487,6 +508,89 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
     }
 }
 
+/// Ask the provider `config` resolves to what input it takes: the `LLM_CHAT`
+/// `accepts` action, run under that provider's [`SessionConfig::plugin_configs`]
+/// entry and [`SessionConfig::context`], as a turn would run it.
+///
+/// Reads those two fields and [`SessionConfig::provider`], and no other;
+/// harvests no tools. A provider without the action is unknown for every
+/// kind of input ([`Support::Unknown`]) and is not called. The loop never
+/// calls this: an embedder asks when a provider's config changes and keeps
+/// the answer.
+///
+/// Refused as [`AcceptsError::Session`] when the provider cannot be
+/// resolved as [`Session::new`] resolves it, or when the context carries
+/// [`CONTEXT_KEY`]. A failed step is [`AcceptsError::Cancelled`] when
+/// `cancel` has fired and [`AcceptsError::Step`] otherwise; a provider
+/// without the action runs no step, so it answers unknown whether or not
+/// `cancel` has fired. An answer the contract does not admit is an
+/// [`AcceptsError`] too.
+pub async fn provider_accepts(
+    kernel: &Kernel,
+    config: &SessionConfig,
+    cancel: &CancellationToken,
+) -> Result<Accepts, AcceptsError> {
+    if config.context.contains_key(CONTEXT_KEY) {
+        return Err(AcceptsError::Session(SessionError::ReservedContextKey));
+    }
+    let provider =
+        resolve_provider(kernel, config.provider.as_deref()).map_err(AcceptsError::Session)?;
+    if !kernel
+        .registry()
+        .action_names(&provider)
+        .iter()
+        .any(|a| a == spi::llm_chat::ACCEPTS)
+    {
+        return Ok(Accepts {
+            images: Support::Unknown,
+        });
+    }
+    let plugin_config = config.plugin_config_for(&provider);
+    let out = provider_execution(
+        kernel,
+        &provider,
+        spi::llm_chat::ACCEPTS,
+        json!({}),
+        plugin_config,
+        &config.context,
+        cancel,
+    )
+    .run()
+    .await
+    .map_err(|e| {
+        if provider_step_cancelled(&e, cancel, "provider query") {
+            AcceptsError::Cancelled
+        } else {
+            AcceptsError::Step(e)
+        }
+    })?
+    .output;
+    accepts::parse(&out).map_err(AcceptsError::Contract)
+}
+
+/// One dispatch to the provider: `plugin_config` as its `$config`, the
+/// embedder's `context` as the execution context when it is not empty, a
+/// child of `cancel`. A provider round and [`provider_accepts`] both build
+/// theirs here, so their config and context rules cannot drift.
+fn provider_execution<'a>(
+    kernel: &'a Kernel,
+    provider: &'a str,
+    action: &'a str,
+    input: Value,
+    plugin_config: &'a Value,
+    context: &Map<String, Value>,
+    cancel: &CancellationToken,
+) -> ExecuteActionRequest<'a> {
+    let mut request = kernel
+        .execute(provider, action, input)
+        .with_config(plugin_config)
+        .with_cancel(cancel.child_token());
+    if !context.is_empty() {
+        request = request.with_exec_ctx(ExecutionContext::new(Value::Object(context.clone())));
+    }
+    request
+}
+
 /// One conversation: a provider, the tools, and the transcript so far.
 pub struct Session {
     kernel: Arc<Kernel>,
@@ -495,7 +599,6 @@ pub struct Session {
     provider: String,
     tools: ToolTable,
     transcript: Transcript,
-    no_config: Value,
 }
 
 impl std::fmt::Debug for Session {
@@ -548,7 +651,6 @@ impl Session {
             provider,
             tools,
             transcript: Transcript::default(),
-            no_config: json!({}),
         })
     }
 
@@ -638,6 +740,8 @@ impl Session {
     /// Dimensions, how many images a request may carry, whether the model
     /// takes images at all, and whether a reference can be resolved are the
     /// vendor's or the provider's to answer, as a [`TurnError::Provider`].
+    /// A provider can say beforehand whether it takes images
+    /// ([`provider_accepts`]); the loop does not ask.
     ///
     /// Content of a turn that fails after it is stored stays in the
     /// transcript, so an image the provider refused is sent again.
@@ -750,10 +854,7 @@ impl Session {
     }
 
     fn config_for(&self, plugin: &str) -> &Value {
-        self.config
-            .plugin_configs
-            .get(plugin)
-            .unwrap_or(&self.no_config)
+        self.config.plugin_config_for(plugin)
     }
 
     /// The `chat` input the next round would send: the conversation as
@@ -821,24 +922,21 @@ impl Session {
     /// One provider call, streamed or buffered per the config.
     async fn round(&self, cancel: &CancellationToken) -> Result<RoundResult, TurnError> {
         let input = self.chat_input();
-        let mut request = self
-            .kernel
-            .execute(&self.provider, spi::llm_chat::CHAT, input)
-            .with_config(self.config_for(&self.provider))
-            .with_cancel(cancel.child_token());
-        if !self.config.context.is_empty() {
-            request = request.with_exec_ctx(ExecutionContext::new(Value::Object(
-                self.config.context.clone(),
-            )));
-        }
+        let request = provider_execution(
+            &self.kernel,
+            &self.provider,
+            spi::llm_chat::CHAT,
+            input,
+            self.config_for(&self.provider),
+            &self.config.context,
+            cancel,
+        );
         // A provider step error is fatal — unless the turn's own token
         // fired, in which case the error is the cancellation arriving.
         let fatal = |e: KernelError| {
-            if cancel.is_cancelled() {
-                tracing::info!(error = %e, "provider round ended by the turn's cancellation");
+            if provider_step_cancelled(&e, cancel, "provider round") {
                 TurnError::Cancelled { detail: None }
             } else {
-                warn_if_unrequested(&e);
                 TurnError::Step(e)
             }
         };
@@ -1111,19 +1209,19 @@ impl Cut {
 /// [`KernelError::Cancelled`] — a step that stopped on its token,
 /// or the kernel's own between-step check — or a step's structured
 /// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a
-/// reason to treat a turn as cancelled: the turn's token is the
-/// authority. Without it, the structured code can come from any step
-/// that sends it, the kernel's action ceiling stopping a step that had
-/// not begun among them: that arrives as the code when the step unwinds
-/// within the kernel's drop grace (100 ms past the deadline in gwead
-/// 0.3.0) and as [`KernelError::ExecutionTimeout`] otherwise. The
-/// ceiling never produces the typed shape — its
-/// watchdog reports a step it stopped as the timeout — so without
-/// the turn's token that shape can only come from a step that
-/// reports cancellation on a token that has not fired, which the
-/// kernel warns about and reports as cancelled all the same,
-/// directly or through a callee. No step in this repo does, and a
-/// guest cannot.
+/// reason to treat a turn as cancelled: the caller's token, a turn's or
+/// the one [`provider_accepts`] is given, is the authority. Without it,
+/// the structured code can come from any step that sends it, the
+/// kernel's action ceiling stopping a step that had not begun among
+/// them: that arrives as the code when the step unwinds within the
+/// kernel's drop grace (100 ms past the deadline in gwead 0.3.0) and as
+/// [`KernelError::ExecutionTimeout`] otherwise. The ceiling never
+/// produces the typed shape — its watchdog reports a step it stopped as
+/// the timeout — so without the caller's token that shape can only come
+/// from a step that reports cancellation on a token that has not fired,
+/// which the kernel warns about and reports as cancelled all the same,
+/// directly or through a callee. No step in this repo does, and a guest
+/// cannot.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,
@@ -1132,10 +1230,22 @@ fn reports_cancellation(e: &KernelError) -> bool {
     }
 }
 
-/// A cancellation the turn did not ask for leaves a footprint.
+/// Whether a failed provider step is `cancel` arriving. When it is not,
+/// a cancellation the caller did not ask for is logged as a footprint.
+fn provider_step_cancelled(e: &KernelError, cancel: &CancellationToken, what: &str) -> bool {
+    if cancel.is_cancelled() {
+        tracing::info!(error = %e, "{what} ended by the caller's cancellation");
+        true
+    } else {
+        warn_if_unrequested(e);
+        false
+    }
+}
+
+/// A cancellation the caller did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
+        tracing::warn!(error = %e, "a cancellation the caller did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 
