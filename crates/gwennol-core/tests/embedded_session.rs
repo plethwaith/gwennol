@@ -22,7 +22,7 @@ use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
 use gwennol_core::{
     ContentError, Event, EventSink, Image, ImageFormat, ImageReference, RetryPolicy, Session,
-    SessionConfig, SessionError, ToolCall, TurnError, UserContent, spi,
+    SessionConfig, SessionError, StopReason, ToolCall, TurnError, UserContent, spi,
 };
 
 const PROVIDER: &str = "embed_llm";
@@ -804,6 +804,155 @@ async fn an_image_the_provider_refuses_stays_until_restore_removes_it() {
             {"type": "text", "text": "again"}
         ])
     );
+}
+
+#[tokio::test]
+async fn a_refused_turn_is_retracted_and_given_back() {
+    let (kernel, _) = kernel(vec![]);
+    let sink = Arc::new(Recorder::default());
+    let mut s = Session::new(kernel.clone(), refusing(), sink.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    let err = s.turn_with(vec![png(8).into()], &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    let err = s.turn("again", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(s.transcript().len(), 1);
+    assert_eq!(s.transcript()[0]["content"].as_array().unwrap().len(), 2);
+    let events = sink.0.lock().unwrap().len();
+
+    assert_eq!(
+        s.retract_unanswered(),
+        vec![
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}),
+            json!({"type": "text", "text": "again"}),
+        ]
+    );
+    assert!(s.transcript().is_empty());
+    assert_eq!(s.chat_input()["messages"], json!([]));
+    assert_eq!(sink.0.lock().unwrap().len(), events);
+    assert!(s.retract_unanswered().is_empty());
+
+    let err = s.turn("plain", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(
+        s.transcript(),
+        [json!({"role": "user", "content": [{"type": "text", "text": "plain"}]})]
+    );
+
+    let mut restored = Session::new(kernel, done(), Arc::new(Recorder::default())).unwrap();
+    restored
+        .restore(vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "kept"}]}),
+        ])
+        .unwrap();
+    assert_eq!(
+        restored.retract_unanswered(),
+        vec![json!({"type": "text", "text": "kept"})]
+    );
+}
+
+#[tokio::test]
+async fn retract_keeps_what_an_assistant_message_answered() {
+    let (kernel, _) = kernel(vec![tool("t_plugin", "t")]);
+    let mut config = config("t");
+    config.plugin_configs.insert(
+        PROVIDER.to_string(),
+        json!({"answers": [
+            answer(
+                vec![
+                    json!({"type": "text", "text": "calling"}),
+                    json!({"type": "tool_use", "id": "c1", "name": "t", "input": {}}),
+                ],
+                "tool_use",
+            ),
+            {"error": {"message": "no", "retryable": false}},
+        ]}),
+    );
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    let err = s.turn("go", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    let snapshot = s.transcript().to_vec();
+    assert_eq!(snapshot.len(), 3);
+    assert_eq!(snapshot[2]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot[2]["content"][0]["type"], "tool_result");
+
+    assert!(s.retract_unanswered().is_empty());
+    assert_eq!(s.transcript(), snapshot.as_slice());
+
+    let err = s.turn("next", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    let last = s.transcript().last().unwrap()["content"].clone();
+    assert_eq!(last.as_array().unwrap().len(), 2);
+    assert_eq!(last[0]["type"], "tool_result");
+    assert_eq!(last[1], json!({"type": "text", "text": "next"}));
+    assert_eq!(
+        s.retract_unanswered(),
+        vec![json!({"type": "text", "text": "next"})]
+    );
+    assert_eq!(s.transcript(), snapshot.as_slice());
+}
+
+#[tokio::test]
+async fn a_turn_whose_empty_answer_was_not_stored_can_be_retracted() {
+    let (kernel, _) = kernel(vec![]);
+    let mut s = Session::new(
+        kernel,
+        answering(answer(vec![], "max_tokens")),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    let outcome = s
+        .turn("cut short", &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+    assert_eq!(s.transcript().len(), 1);
+    assert_eq!(
+        s.retract_unanswered(),
+        vec![json!({"type": "text", "text": "cut short"})]
+    );
+    assert!(s.transcript().is_empty());
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_can_be_retracted() {
+    let (kernel, _) = kernel(vec![]);
+    let mut s = Session::new(kernel, done(), Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let err = s.turn("stop", &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Cancelled { .. }), "{err:?}");
+    assert_eq!(s.transcript().len(), 1);
+    assert_eq!(
+        s.retract_unanswered(),
+        vec![json!({"type": "text", "text": "stop"})]
+    );
+    assert!(s.transcript().is_empty());
+}
+
+#[tokio::test]
+async fn an_image_an_assistant_message_answered_is_not_retracted() {
+    let (kernel, _) = kernel(vec![tool("t_plugin", "t")]);
+    let mut config = config("t");
+    config.plugin_configs.insert(
+        PROVIDER.to_string(),
+        json!({"answers": [
+            answer(
+                vec![json!({"type": "tool_use", "id": "c1", "name": "t", "input": {}})],
+                "tool_use",
+            ),
+            {"error": {"message": "image refused", "retryable": false}},
+        ]}),
+    );
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let cancel = CancellationToken::new();
+    let err = s.turn_with(vec![png(8).into()], &cancel).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    let snapshot = s.transcript().to_vec();
+    assert_eq!(snapshot[0]["content"][0]["type"], "image");
+    assert!(s.retract_unanswered().is_empty());
+    assert_eq!(s.transcript(), snapshot.as_slice());
 }
 
 #[tokio::test]
