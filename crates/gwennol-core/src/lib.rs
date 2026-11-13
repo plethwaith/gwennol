@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod accepts;
 pub mod agent;
 pub mod cancel;
 pub mod content;
@@ -37,9 +38,10 @@ pub mod context;
 pub mod events;
 pub mod spi;
 
+pub use accepts::{Accepts, AcceptsError, ImageInput, ImageSource, Support};
 pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
-    Usage, resolve_provider,
+    Usage, provider_accepts, resolve_provider,
 };
 pub use content::{
     ContentError, Image, ImageError, ImageFormat, ImageReference, ImageReferenceError, UserContent,

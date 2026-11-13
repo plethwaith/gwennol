@@ -27,8 +27,8 @@ use gwead::kernel::{Kernel, KernelError};
 use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
-    Event, ImageFormat, ImageReference, Session, SessionConfig, StopReason, TurnError, UserContent,
-    spi,
+    Event, ImageFormat, ImageReference, ImageSource, Session, SessionConfig, StopReason, Support,
+    TurnError, UserContent, provider_accepts, spi,
 };
 use gwennol_host::{
     Access, ApprovalRequest, Decision, HostConfig, Operator, OperatorEvents, ProcessEnv, Turn,
@@ -616,6 +616,13 @@ fn the_committed_provider_manifest_declares_its_reach_and_needs_bundling() {
         ENTRY_RELAY
     );
     assert!(raw["actions"][FETCH_ACTION].is_object());
+    // `accepts` is declarative: one `return`, so no guest code runs and
+    // nothing reaches the vendor.
+    let accepts_steps = raw["actions"][spi::llm_chat::ACCEPTS]["steps"]
+        .as_array()
+        .expect("the manifest declares `accepts`");
+    assert_eq!(accepts_steps.len(), 1);
+    assert_eq!(accepts_steps[0]["type"], "return");
     // Both turn shapes send the same `anthropic-version`: read from
     // `fetch_turn`'s own header and compared to `stream_turn`'s. The
     // value itself is pinned by provider-anthropic's own tests, against
@@ -1036,6 +1043,106 @@ async fn an_image_reference_is_declined_before_the_vendor_is_called() {
             .all(|path| !path.starts_with("/ref-decline")),
         "{requested:?}"
     );
+}
+
+/// The bundled provider declares inline images in every format the
+/// contract names, from its manifest alone: no request reaches the vendor.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor() {
+    let f = fixture();
+    let config = f.config("/accepts");
+    let out = f
+        .kernel
+        .execute(PROVIDER, spi::llm_chat::ACCEPTS, json!({}))
+        .with_config(&config)
+        .run()
+        .await
+        .expect("the declaration is a step that cannot fail")
+        .output;
+    assert_eq!(
+        out,
+        json!({"images": {
+            "media_types": ["image/jpeg", "image/png", "image/gif", "image/webp"],
+            "sources": ["base64"]
+        }})
+    );
+    assert_conforms(contracts().accepts_output, &out);
+    let requested = f.requested();
+    assert!(
+        requested.iter().all(|path| !path.starts_with("/accepts")),
+        "{requested:?}"
+    );
+
+    let session = SessionConfig {
+        provider: Some(PROVIDER.to_string()),
+        plugin_configs: [(PROVIDER.to_string(), config)].into(),
+        ..SessionConfig::default()
+    };
+    let answer = provider_accepts(&f.kernel, &session, &CancellationToken::new())
+        .await
+        .unwrap();
+    let Support::Yes(images) = answer.images else {
+        panic!("{:?}", answer.images)
+    };
+    assert_eq!(images.formats, ImageFormat::ALL);
+    assert_eq!(images.sources, [ImageSource::Base64]);
+}
+
+/// What the bundled provider declares it takes agrees with what `chat`
+/// does: for each source type the contract names, declared means `chat`
+/// sends it, and not declared means `chat` declines it before the vendor.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_declaration_agrees_with_what_chat_sends() {
+    let f = fixture();
+    let contract: Value = gwead::serde_json::from_str(spi::llm_chat::DEFINITION).unwrap();
+    let source_types: Vec<String> =
+        contract["$defs"]["ImageInput"]["properties"]["sources"]["items"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+    let config = f.config("/accepts");
+    let declared = f
+        .kernel
+        .execute(PROVIDER, spi::llm_chat::ACCEPTS, json!({}))
+        .with_config(&config)
+        .run()
+        .await
+        .unwrap()
+        .output["images"]["sources"]
+        .clone();
+    for t in &source_types {
+        let source = match t.as_str() {
+            "base64" => {
+                json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="})
+            }
+            "reference" => {
+                json!({"type": "reference", "media_type": "image/png", "reference": "shots/a.png"})
+            }
+            other => panic!("no input builder for source type {other:?}"),
+        };
+        let input = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image", "source": source}
+        ]}]});
+        let route = format!("/agree-{t}");
+        let out = f.raw(&route, input, false).await;
+        let sent = f
+            .requested()
+            .iter()
+            .any(|path| *path == format!("{route}/v1/messages"));
+        if declared.as_array().unwrap().contains(&json!(t)) {
+            assert!(out.get("message").is_some(), "{t}: {out}");
+            assert!(sent, "{t}: declared, but nothing reached the vendor");
+        } else {
+            assert_eq!(
+                out["error"]["kind"], "unsupported_image_source",
+                "{t}: {out}"
+            );
+            assert!(!sent, "{t}: not declared, but the vendor was called");
+        }
+    }
 }
 
 /// The vendor saying no is the contract's Failure on both paths — data

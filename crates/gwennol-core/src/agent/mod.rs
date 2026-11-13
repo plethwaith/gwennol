@@ -10,6 +10,9 @@
 //! context, so a step reached several dispatches later can name it (see
 //! [`crate::context`]).
 //!
+//! [`provider_accepts`] asks a provider what input it takes, for a
+//! frontend to decide before a turn; the loop itself never asks.
+//!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
 //!
@@ -101,10 +104,12 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gwead::kernel::execute_request::ExecuteActionRequest;
 use gwead::kernel::{ExecutionContext, Kernel, KernelError};
 use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
+use crate::accepts::{self, Accepts, AcceptsError, Support};
 use crate::content::{ContentError, UserContent};
 use crate::context::{CONTEXT_KEY, exec_context_with};
 use crate::events::{Event, EventSink, ToolCall};
@@ -396,9 +401,10 @@ pub struct SessionConfig {
     pub stream: bool,
     /// The `$config` each plugin runs under, by plugin name — a
     /// provider's model and endpoint, say. A plugin not listed runs
-    /// under `{}`. Applies to the action the loop dispatches: Gwead
-    /// hands a caller's config through to the actions it invokes, so
-    /// a plugin that invokes another runs it under its own config. The
+    /// under `{}`. Applies to the actions the loop dispatches, and to
+    /// [`provider_accepts`]: Gwead hands a caller's config through to
+    /// the actions it invokes, so a plugin that invokes another runs it
+    /// under its own config. The
     /// bundled plugins invoke only themselves; re-keying config per
     /// callee is a dispatch-orchestrator concern that arrives with
     /// installable plugins.
@@ -415,8 +421,9 @@ pub struct SessionConfig {
     /// native step can tell what the invocation is for.
     ///
     /// A tool call runs under these entries plus [`CONTEXT_KEY`] naming
-    /// the call; a provider round runs under these entries alone, or,
-    /// when the map is empty, under the empty context. A map carrying
+    /// the call; a provider round, and [`provider_accepts`], run under
+    /// these entries alone, or, when the map is empty, under the empty
+    /// context. A map carrying
     /// [`CONTEXT_KEY`] refuses the session
     /// ([`SessionError::ReservedContextKey`]).
     pub context: Map<String, Value>,
@@ -485,6 +492,90 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
             }
         },
     }
+}
+
+/// Ask the provider `config` names what input it takes: the `LLM_CHAT`
+/// `accepts` action, run under that provider's [`SessionConfig::plugin_configs`]
+/// entry and [`SessionConfig::context`], as a turn would run it.
+///
+/// Reads those two fields and [`SessionConfig::provider`], and no other;
+/// harvests no tools. A provider without the action is unknown for every
+/// kind of input ([`Support::Unknown`]) and is not called. The loop never
+/// calls this: an embedder asks when a provider's config changes and keeps
+/// the answer. The answer binds the provider to nothing, and a turn it
+/// cannot serve is still a [`TurnError::Provider`].
+///
+/// Refused as [`AcceptsError::Session`] when the provider cannot be
+/// resolved as [`Session::new`] resolves it, or when the context carries
+/// [`CONTEXT_KEY`]. A failed step is [`AcceptsError::Cancelled`] when
+/// `cancel` has fired and [`AcceptsError::Step`] otherwise.
+pub async fn provider_accepts(
+    kernel: &Kernel,
+    config: &SessionConfig,
+    cancel: &CancellationToken,
+) -> Result<Accepts, AcceptsError> {
+    if config.context.contains_key(CONTEXT_KEY) {
+        return Err(AcceptsError::Session(SessionError::ReservedContextKey));
+    }
+    let provider =
+        resolve_provider(kernel, config.provider.as_deref()).map_err(AcceptsError::Session)?;
+    if !kernel
+        .registry()
+        .action_names(&provider)
+        .iter()
+        .any(|a| a == spi::llm_chat::ACCEPTS)
+    {
+        return Ok(Accepts {
+            images: Support::Unknown,
+        });
+    }
+    let no_config = json!({});
+    let plugin_config = config.plugin_configs.get(&provider).unwrap_or(&no_config);
+    let out = provider_execution(
+        kernel,
+        &provider,
+        spi::llm_chat::ACCEPTS,
+        json!({}),
+        plugin_config,
+        &config.context,
+        cancel,
+    )
+    .run()
+    .await
+    .map_err(|e| {
+        if cancel.is_cancelled() {
+            tracing::info!(error = %e, "provider query ended by the caller's cancellation");
+            AcceptsError::Cancelled
+        } else {
+            warn_if_unrequested(&e);
+            AcceptsError::Step(e)
+        }
+    })?
+    .output;
+    accepts::parse(&out).map_err(AcceptsError::Contract)
+}
+
+/// One dispatch to the provider: `plugin_config` as its `$config`, the
+/// embedder's `context` as the execution context when it is not empty, a
+/// child of `cancel`. A provider round and [`provider_accepts`] both build
+/// theirs here, so their config and context rules cannot drift.
+fn provider_execution<'a>(
+    kernel: &'a Kernel,
+    provider: &'a str,
+    action: &'a str,
+    input: Value,
+    plugin_config: &'a Value,
+    context: &Map<String, Value>,
+    cancel: &CancellationToken,
+) -> ExecuteActionRequest<'a> {
+    let mut request = kernel
+        .execute(provider, action, input)
+        .with_config(plugin_config)
+        .with_cancel(cancel.child_token());
+    if !context.is_empty() {
+        request = request.with_exec_ctx(ExecutionContext::new(Value::Object(context.clone())));
+    }
+    request
 }
 
 /// One conversation: a provider, the tools, and the transcript so far.
@@ -638,6 +729,8 @@ impl Session {
     /// Dimensions, how many images a request may carry, whether the model
     /// takes images at all, and whether a reference can be resolved are the
     /// vendor's or the provider's to answer, as a [`TurnError::Provider`].
+    /// A provider can say beforehand whether it takes images
+    /// ([`provider_accepts`]); the loop does not ask.
     ///
     /// Content of a turn that fails after it is stored stays in the
     /// transcript, so an image the provider refused is sent again.
@@ -821,16 +914,15 @@ impl Session {
     /// One provider call, streamed or buffered per the config.
     async fn round(&self, cancel: &CancellationToken) -> Result<RoundResult, TurnError> {
         let input = self.chat_input();
-        let mut request = self
-            .kernel
-            .execute(&self.provider, spi::llm_chat::CHAT, input)
-            .with_config(self.config_for(&self.provider))
-            .with_cancel(cancel.child_token());
-        if !self.config.context.is_empty() {
-            request = request.with_exec_ctx(ExecutionContext::new(Value::Object(
-                self.config.context.clone(),
-            )));
-        }
+        let request = provider_execution(
+            &self.kernel,
+            &self.provider,
+            spi::llm_chat::CHAT,
+            input,
+            self.config_for(&self.provider),
+            &self.config.context,
+            cancel,
+        );
         // A provider step error is fatal — unless the turn's own token
         // fired, in which case the error is the cancellation arriving.
         let fatal = |e: KernelError| {

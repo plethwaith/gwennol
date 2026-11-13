@@ -20,7 +20,8 @@ plugins that claim them.
   ([../docs/SUBSTRATE.md](../docs/SUBSTRATE.md)). The manifest owns
   everything that reaches outside the sandbox — one `host_http.post`
   per turn shape, the egress grant, the `api_key` secret on the
-  `x-api-key` header — and the guest never sees the key.
+  `x-api-key` header — and the guest never sees the key. Its `accepts` action is declarative: one
+  `return` naming the image formats and source types its `chat` sends.
 - `tools/` — plugins implementing `TOOL`: `read.json`, `write.json`,
   `grep.json` and `bash.json` (`tool-read`, `tool-write`, `tool-grep`,
   `tool-bash`) stay declarative: each is one host step — `host_fs.read`,

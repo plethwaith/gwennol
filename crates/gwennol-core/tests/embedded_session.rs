@@ -21,8 +21,9 @@ use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
 use gwennol_core::{
-    ContentError, Event, EventSink, Image, ImageFormat, ImageReference, RetryPolicy, Session,
-    SessionConfig, SessionError, StopReason, ToolCall, TurnError, UserContent, spi,
+    AcceptsError, ContentError, Event, EventSink, Image, ImageFormat, ImageReference, ImageSource,
+    RetryPolicy, Session, SessionConfig, SessionError, StopReason, Support, ToolCall, TurnError,
+    UserContent, provider_accepts, spi,
 };
 
 const PROVIDER: &str = "embed_llm";
@@ -92,8 +93,27 @@ fn provider() -> Value {
                  "then": [{"id": "r1", "type": "return", "params": {"value": "{{$config.answers[1]}}"}}]},
                 {"then": [{"id": "r0", "type": "return", "params": {"value": "{{$config.answers[0]}}"}}]}
             ]}}
+        ]}, "accepts": {"steps": [
+            {"id": "a", "type": "return", "params": {"value": "{{$config.accepts}}"}}
         ]}}
     })
+}
+
+/// `provider()` with no `accepts` action: a provider that does not say.
+fn plain_provider() -> Value {
+    let mut plugin = provider();
+    plugin["name"] = json!("embed_llm_plain");
+    plugin["actions"].as_object_mut().unwrap().remove("accepts");
+    plugin
+}
+
+/// `provider()` whose `accepts` step is one no one provides.
+fn failing_provider() -> Value {
+    let mut plugin = provider();
+    plugin["name"] = json!("embed_llm_failing");
+    plugin["actions"]["accepts"] =
+        json!({"steps": [{"id": "x", "type": "no_such_step", "params": {}}]});
+    plugin
 }
 
 /// A kernel with the contracts, the buffered provider, and `tools`.
@@ -1071,4 +1091,136 @@ async fn a_streamed_round_can_answer_the_failed_form() {
             other => panic!("{answer}: {other:?}"),
         }
     }
+}
+
+/// `done()` with `accepts` added to the provider's `$config`.
+fn accepting(accepts: Value) -> SessionConfig {
+    let mut config = done();
+    config
+        .plugin_configs
+        .get_mut(PROVIDER)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("accepts".into(), accepts);
+    config
+}
+
+#[tokio::test]
+async fn a_provider_declares_what_it_accepts_under_the_sessions_config() {
+    let (kernel, seen) = kernel(vec![]);
+    let token = CancellationToken::new();
+    let png_only = json!({"images": {"media_types": ["image/png"], "sources": ["base64"]}});
+    let mut a = accepting(png_only);
+    a.context = context(json!({"embedder": "settings"}));
+    a.tool_plugins = Some(names(&["nope"]));
+    let answer = provider_accepts(&kernel, &a, &token).await.unwrap();
+    let Support::Yes(images) = answer.images else {
+        panic!("{:?}", answer.images)
+    };
+    assert_eq!(images.formats, [ImageFormat::Png]);
+    assert_eq!(images.sources, [ImageSource::Base64]);
+    assert_eq!(one(&seen, PROVIDER), json!({"embedder": "settings"}));
+
+    let b = accepting(json!({"images": false}));
+    assert_eq!(
+        provider_accepts(&kernel, &b, &token).await.unwrap().images,
+        Support::No
+    );
+
+    let c = accepting(json!({"images": true}));
+    let err = provider_accepts(&kernel, &c, &token).await.unwrap_err();
+    assert!(matches!(err, AcceptsError::Contract(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "provider output violates the LLM_CHAT contract: `images` is neither false nor an object: true"
+    );
+
+    // The loop never asks: a one-round turn is one provider request.
+    a.tool_plugins = None;
+    let before = provider_requests(&seen);
+    let mut session = Session::new(kernel.clone(), a, Arc::new(Recorder::default())).unwrap();
+    session.turn("hi", &token).await.unwrap();
+    assert_eq!(provider_requests(&seen), before + 1);
+}
+
+#[tokio::test]
+async fn a_provider_without_accepts_is_unknown_and_not_called() {
+    let (kernel, seen) = kernel(vec![plain_provider()]);
+    let config = SessionConfig {
+        provider: Some("embed_llm_plain".into()),
+        ..SessionConfig::default()
+    };
+    let answer = provider_accepts(&kernel, &config, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(answer.images, Support::Unknown);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|(subject, _)| subject != "embed_llm_plain"),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_accepts_query_resolves_the_provider_as_a_session_does() {
+    let (kernel, seen) = kernel(vec![plain_provider()]);
+    let token = CancellationToken::new();
+    let err = provider_accepts(&kernel, &SessionConfig::default(), &token)
+        .await
+        .unwrap_err();
+    match err {
+        AcceptsError::Session(SessionError::AmbiguousProvider(v)) => {
+            assert_eq!(v, ["embed_llm", "embed_llm_plain"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let named = SessionConfig {
+        provider: Some("nope".into()),
+        ..SessionConfig::default()
+    };
+    match provider_accepts(&kernel, &named, &token).await.unwrap_err() {
+        AcceptsError::Session(SessionError::NoSuchProvider(name)) => assert_eq!(name, "nope"),
+        other => panic!("{other:?}"),
+    }
+    let mut reserved = done();
+    reserved.context = context(json!({ gwennol_core::context::CONTEXT_KEY: "x" }));
+    assert!(matches!(
+        provider_accepts(&kernel, &reserved, &token)
+            .await
+            .unwrap_err(),
+        AcceptsError::Session(SessionError::ReservedContextKey)
+    ));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_or_cancelled_accepts_is_an_error() {
+    let (kernel, _seen) = kernel(vec![failing_provider()]);
+    let failing = SessionConfig {
+        provider: Some("embed_llm_failing".into()),
+        ..SessionConfig::default()
+    };
+    let err = provider_accepts(&kernel, &failing, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AcceptsError::Step(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(text.starts_with("provider step failed: "), "{text}");
+    assert!(text.contains("no_such_step"), "{text}");
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let png_only = json!({"images": {"media_types": ["image/png"], "sources": ["base64"]}});
+    let err = provider_accepts(&kernel, &accepting(png_only), &cancelled)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AcceptsError::Cancelled), "{err:?}");
 }

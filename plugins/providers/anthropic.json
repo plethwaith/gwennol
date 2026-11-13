@@ -34,6 +34,14 @@
         { "id": "run", "type": "script", "params": { "language": "provider-anthropic", "source": "chat" } }
       ]
     },
+    "accepts": {
+      "description": "What this provider takes, per the LLM_CHAT contract: images inline (base64), in every format the contract names. Declarative: no guest code runs and nothing reaches the vendor. The answer does not read $config.model, so a model that takes no images is found out from the turn's Failure.",
+      "steps": [
+        { "id": "out", "type": "return", "params": { "value": {
+          "images": { "media_types": ["image/jpeg", "image/png", "image/gif", "image/webp"], "sources": ["base64"] }
+        } } }
+      ]
+    },
     "fetch_turn": {
       "description": "A buffered Messages API request. Input: {url, request}, both built by the guest — the URL from $config.base_url with trailing slashes dropped; which host it may reach is the network:egress grant above, not the input. Output: {status, body, truncated} for the guest to translate.",
       "steps": [

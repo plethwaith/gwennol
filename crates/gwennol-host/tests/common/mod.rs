@@ -98,6 +98,8 @@ pub struct Contracts {
     pub schemas: Schemas,
     pub chat_input: SchemaIndex,
     pub chat_output: SchemaIndex,
+    pub accepts_input: SchemaIndex,
+    pub accepts_output: SchemaIndex,
     pub stream_event: SchemaIndex,
     pub call_output: SchemaIndex,
 }
@@ -117,9 +119,18 @@ pub fn contracts() -> &'static Contracts {
                 .add_resource(url, gwead::serde_json::from_str(document).unwrap())
                 .unwrap();
         }
-        let [chat_input, chat_output, stream_event, call_output] = [
+        let [
+            chat_input,
+            chat_output,
+            accepts_input,
+            accepts_output,
+            stream_event,
+            call_output,
+        ] = [
             format!("{LLM}#/actions/chat/input"),
             format!("{LLM}#/actions/chat/output"),
+            format!("{LLM}#/actions/accepts/input"),
+            format!("{LLM}#/actions/accepts/output"),
             format!("{LLM}#/streamEventShape"),
             format!("{TOOL}#/actions/call/output"),
         ]
@@ -132,6 +143,8 @@ pub fn contracts() -> &'static Contracts {
             schemas,
             chat_input,
             chat_output,
+            accepts_input,
+            accepts_output,
             stream_event,
             call_output,
         }
