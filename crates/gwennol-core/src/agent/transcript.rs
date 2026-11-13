@@ -266,7 +266,9 @@ pub(crate) fn check_block(block: &Value) -> Result<Option<ToolUse>, String> {
 ///
 /// Fail-closed like [`check_block`]: only the block types the loop
 /// stores (`text`, `image`, `tool_result`), with no field it does not
-/// store, and results before any text or image.
+/// store, and results before any text or image. A `tool_result`'s `content`
+/// is a string or a non-empty list of text and image blocks; an image there
+/// is part of the result, not content after it.
 pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
     let Some(fields) = message.as_object() else {
         return Err(format!("user message is not an object: {message}"));
@@ -314,9 +316,7 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
                 let Some(Value::String(id)) = block_fields.get("tool_use_id") else {
                     return Err("tool_result block has no string `tool_use_id`".into());
                 };
-                if !matches!(block_fields.get("content"), Some(Value::String(_))) {
-                    return Err(format!("tool_result block {id:?} has no string `content`"));
-                }
+                check_result_content(id, block_fields.get("content"))?;
                 if block_fields
                     .get("is_error")
                     .is_some_and(|flag| !flag.is_boolean())
@@ -342,12 +342,57 @@ pub(crate) fn check_user_message(message: &Value) -> Result<Vec<&str>, String> {
     Ok(ids)
 }
 
+/// Check a `tool_result`'s `content`: a string, or a non-empty list of `text`
+/// blocks and `image` blocks, each closed. Nothing is decoded, sniffed or
+/// measured, as for an image at the top of a user message.
+fn check_result_content(id: &str, content: Option<&Value>) -> Result<(), String> {
+    let items = match content {
+        Some(Value::String(_)) => return Ok(()),
+        Some(Value::Array(items)) if !items.is_empty() => items,
+        _ => {
+            return Err(format!(
+                "tool_result block {id:?} has a `content` that is neither a string nor a non-empty list"
+            ));
+        }
+    };
+    for item in items {
+        let not_a_block =
+            || format!("tool_result block {id:?} holds a block that is not a text or image block");
+        let Some(fields) = item.as_object() else {
+            return Err(not_a_block());
+        };
+        let allowed: &[&str] = match fields.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if !matches!(fields.get("text"), Some(Value::String(_))) {
+                    return Err(format!(
+                        "tool_result block {id:?} holds a text block with no string `text`"
+                    ));
+                }
+                &["type", "text"]
+            }
+            Some("image") => {
+                check_image_source(fields.get("source"))?;
+                &["type", "source"]
+            }
+            _ => return Err(not_a_block()),
+        };
+        for key in fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "tool_result block {id:?} holds a block carrying a field the contract does not allow: {key:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check an `image` block's `source`: closed, and either inline base64 or
 /// a reference, each of a media type the contract names, with a non-empty
 /// string `data` or `reference`. The field set is chosen by `source.type`.
 /// Not checked: that `data` is base64, that it decodes to the format
 /// `media_type` names, or that a reference names anything.
-fn check_image_source(source: Option<&Value>) -> Result<(), String> {
+pub(super) fn check_image_source(source: Option<&Value>) -> Result<(), String> {
     let Some(source) = source.and_then(Value::as_object) else {
         return Err("image block has no object `source`".into());
     };
@@ -544,6 +589,9 @@ mod tests {
     fn tr(id: &str, content: &str) -> Value {
         json!({"type": "tool_result", "tool_use_id": id, "content": content, "is_error": false})
     }
+    fn tr_blocks(id: &str, content: Vec<Value>) -> Value {
+        json!({"type": "tool_result", "tool_use_id": id, "content": content, "is_error": false})
+    }
     fn user(blocks: Vec<Value>) -> Value {
         json!({"role": "user", "content": blocks})
     }
@@ -580,6 +628,12 @@ mod tests {
             img_ref("image/png", "k"),
             txt("again"),
         ]);
+        let mut result_images = exchange();
+        result_images[2] = user(vec![
+            tr_blocks("c1", vec![txt("shot"), img("image/png", "AA")]),
+            tr("c2", "r2"),
+            txt("again"),
+        ]);
         /// A case's name, its messages, the blocks returned, and the
         /// messages left.
         type Case<'a> = (&'a str, Vec<Value>, Vec<Value>, Vec<Value>);
@@ -603,6 +657,19 @@ mod tests {
                 after_results,
                 vec![img_ref("image/png", "k"), txt("again")],
                 exchange(),
+            ),
+            (
+                "a result's images stay with the result",
+                result_images,
+                vec![txt("again")],
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![
+                        tr_blocks("c1", vec![txt("shot"), img("image/png", "AA")]),
+                        tr("c2", "r2"),
+                    ]);
+                    m
+                },
             ),
             (
                 "several turns' content",
@@ -699,6 +766,33 @@ mod tests {
                         tr("c2", "r2"),
                         img("image/gif", "R0lGODlh"),
                         txt("again"),
+                    ]);
+                    m
+                },
+                None,
+            ),
+            (
+                "a result of text and images, both sources",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![
+                        tr_blocks(
+                            "c1",
+                            vec![txt("shot"), img("image/png", "AA"), img_ref("image/jpeg", "k")],
+                        ),
+                        tr("c2", "r2"),
+                    ]);
+                    m
+                },
+                None,
+            ),
+            (
+                "an image-bearing result second, after a plain one",
+                {
+                    let mut m = exchange();
+                    m[2] = user(vec![
+                        tr("c1", "r1"),
+                        tr_blocks("c2", vec![img("image/png", "AA")]),
                     ]);
                     m
                 },
@@ -832,7 +926,101 @@ mod tests {
                         tr("c2", "r2"),
                     ])])
                     .collect(),
-                Some((2, "no string `content`")),
+                Some((
+                    2,
+                    "tool_result block \"c1\" has a `content` that is neither a string nor a non-empty list",
+                )),
+            ),
+            (
+                "a tool_result with an empty content list",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![tr_blocks("c1", vec![]), tr("c2", "r2")])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" has a `content` that is neither a string nor a non-empty list",
+                )),
+            ),
+            (
+                "a tool_result nested in a result",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        tr_blocks("c1", vec![tr("c9", "x")]),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a block that is not a text or image block",
+                )),
+            ),
+            (
+                "a text block nested in a result with no text",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        tr_blocks("c1", vec![json!({"type": "text"})]),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a text block with no string `text`",
+                )),
+            ),
+            (
+                "a text block nested in a result with an extra field",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        tr_blocks("c1", vec![json!({"type": "text", "text": "a", "x": 1})]),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a block carrying a field the contract does not allow: \"x\"",
+                )),
+            ),
+            (
+                "an image nested in a result with an extra field",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        tr_blocks("c1", vec![{
+                            let mut b = img("image/png", "AA");
+                            b["extra"] = json!(1);
+                            b
+                        }]),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a block carrying a field the contract does not allow: \"extra\"",
+                )),
+            ),
+            (
+                "an image nested in a result of a media type the contract does not name",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![
+                        tr_blocks("c1", vec![img("image/bmp", "AA")]),
+                        tr("c2", "r2"),
+                    ])])
+                    .collect(),
+                Some((
+                    2,
+                    "image block has a media type the contract does not name: image/bmp",
+                )),
             ),
             (
                 "text before a tool_result",

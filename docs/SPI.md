@@ -58,7 +58,7 @@ blocks:
 | `tool_use` | `id`, `name`, `input` | `assistant` |
 | `tool_result` | `tool_use_id`, `content`, `is_error?` | `user` |
 | `opaque` | `provider`, `data` | `assistant` |
-| `image` | `source` | `user` |
+| `image` | `source` | `user`, or inside a `tool_result`'s `content` |
 
 An `opaque` block is provider state the consumer carries but never
 reads — a vendor's thinking block, which the vendor requires replayed
@@ -70,27 +70,30 @@ shape of `data`. `provider` names the producing plugin, so a provider
 ignores blocks another produced (a conversation that changes provider
 mid-way loses only what the new provider could not have used).
 
-An `image` block is an image the user shows the model, in its position
-among the message's blocks. Its `source` carries the image one of two
-ways: the file's bytes inline, as standard base64, or a `reference` the
-embedder chose (a path, a storage key); both name a media type, and the
-schema lists the fields and the media types. The consumer never
+An `image` block is an image shown to the model, in its position among the
+blocks around it: a user message's, or a `tool_result`'s content. Its
+`source` carries the image one of two ways: the file's bytes inline, as
+standard base64, or a `reference` the embedder chose (a path, a storage
+key); both name a media type, and the schema lists the fields and the media
+types. The consumer never
 interprets a reference: it stores and replays it, and resolving it is the
 provider's. A provider that cannot resolve a reference, or cannot take an
 image, answers with a `Failure`. A provider can also say beforehand, through
-`accepts`, which image formats and source types it takes, or that it takes
-none. The loop builds the inline block from an `Image`, whose format it
+`accepts`, which image formats and source types it takes, in either place,
+or that it takes none. The loop builds the inline block from an `Image`, whose format it
 reads from the bytes, and the reference block from an `ImageReference`,
 whose format the caller declares;
 `SessionConfig::max_image_bytes` measures images, not references, and
-`Session::turn_with` refuses an image over it before storing anything.
+`Session::turn_with` refuses an image over it before storing anything; a
+tool's image over it answers the call as a failure (see `TOOL`).
 Limits on dimensions and count are the vendor's.
 
 A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
 schema. The caller runs the tool and carries the answer back as a
 `tool_result` block — `tool_use_id` echoing the `id` — in the next `user`
-message.
+message. A `tool_result`'s `content` is a string, or a list of `text` and
+`image` blocks in order.
 
 `tools` is what the model may call this turn, and each entry is a Gwead
 tool descriptor on the wire: `input_schema` is the implementing action's
@@ -106,7 +109,8 @@ are contract here:
   **all** the answers arrive in the immediately following `user` message
   — one `tool_result` per `tool_use`, none deferred to a later turn.
 - In that user message, `tool_result` blocks come before any `text` or
-  `image` blocks.
+  `image` blocks. An image inside a `tool_result`'s content is part of
+  that result.
 - `id` values are opaque and unique within a conversation. The loop
   echoes them; it never parses or fabricates them.
 - The assistant message that asked for the tools is replayed exactly as
@@ -233,7 +237,8 @@ pattern.
 answer can follow the model a config names. A key left out means the
 provider does not know, an answer distinct from `false` (a provider that
 can only ask its server, and cannot, leaves it out). This version defines
-one key, `images`: `false`, or the media types and source types it takes.
+one key, `images`: `false`, or the media types and source types it takes,
+for an image block in a user message or in a tool result.
 The answer is open: a later version adds a key, a caller ignores one it
 does not know, and a known key with a value the schema does not admit is a
 contract violation.
@@ -258,6 +263,18 @@ call.
 ```json
 {"content": "what the model sees, verbatim", "is_error": false}
 ```
+
+A result's `content` is a string or a non-empty list of `text` and `image`
+blocks (the same blocks as `LLM_CHAT`'s, either source), in the order the
+model should see them. The loop checks each inline image before it stores
+the result: its data is standard padded base64, its bytes are a format the
+contract names and the one its `media_type` declares, and it is within
+`SessionConfig::max_image_bytes`. One that fails answers the call as a
+failure the tool could not answer (`Event::ToolFailed`), like a malformed
+result. A reference is passed on and never interpreted; a provider that
+cannot resolve it answers the next round with a `Failure`. A result stays
+in the transcript: an image the provider refuses is sent again every round
+until `Session::restore` replaces the transcript.
 
 `is_error: true` marks a failure the *model* should react to — file not
 found, command exited nonzero. Infrastructure failures (the plugin lacked
@@ -293,8 +310,9 @@ result, with `content` the prefix it kept. The tool never appends a
 marker itself — composing one declaratively would mean a branch per
 truncatable field, and four tools would grow four spellings. The caller
 renders the one shared marker, `gwennol_core::spi::tool::TRUNCATED_MARKER`,
-onto the end of `content` before the model sees it —
-`spi::tool::render_content` is the single implementation — so the model
+before the model sees it: on its own final line of a string, or as a text
+block of its own after the last block of a list. The loop's one rendering,
+`spi::tool::render_content` for text, is the single implementation, so the model
 learns "this is a prefix" in one fixed form whichever tool produced it.
 A tool composed of several capped steps reports `truncated` when any of
 them was cut.
@@ -429,10 +447,10 @@ rather than oversights. Each would be a contract change; none blocks
   (server-side tool use, long-turn pauses) resolves the pause inside its
   own implementation — continue or fail; no pause is expressible on this
   wire.
-- **Non-text tool results.** `content` is a UTF-8 string. Binary output
-  is the tool's problem (lossy conversion, or refusing); the `image`
-  block exists for user content only. Truncation is signalled as data
-  (`truncated`, above), never inside `content`.
+- **Tool results beyond text and images.** `content` is a string or a
+  list of text and image blocks. Other binary output (audio, a PDF) is
+  the tool's problem (lossy conversion, or refusing). Truncation is
+  signalled as data (`truncated`, above), never inside `content`.
 - **How a reference is resolved.** The contract says the provider
   resolves an image reference, not how; no host step exists for it, and
   the bundled provider resolves none.

@@ -407,6 +407,51 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
+    // A tool's result list, in `call`'s output and in a `tool_result`:
+    // one valid list conforms, and each fault is the only difference.
+    let result_text = json!({"type": "text", "text": "shot"});
+    let result_inline = json!({"type": "image", "source": valid.clone()});
+    let result_reference = json!({"type": "image", "source": reference.clone()});
+    let list = json!([result_text, result_inline, result_reference]);
+    assert_conforms(c.call_output, &json!({"content": list.clone()}));
+    let result_input = |content: Value| {
+        json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "img", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": content}
+            ]}
+        ]})
+    };
+    assert_conforms(c.chat_input, &result_input(list.clone()));
+    assert!(
+        c.schemas
+            .validate(&result_input(json!([])), c.chat_input)
+            .is_err(),
+        "chat_input admitted an empty result list"
+    );
+    let mut url_source = result_inline.clone();
+    url_source["source"]["type"] = json!("url");
+    let mut extra_text = result_text.clone();
+    extra_text["extra"] = json!(1);
+    for (fault, content) in [
+        ("an empty list", json!([])),
+        (
+            "a nested tool_result",
+            json!([{"type": "tool_result", "tool_use_id": "c2", "content": "x"}]),
+        ),
+        ("a nested image of source type url", json!([url_source])),
+        ("a nested text with an extra field", json!([extra_text])),
+    ] {
+        let bad = json!({"content": content});
+        assert!(
+            c.schemas.validate(&bad, c.call_output).is_err(),
+            "call_output accepted {fault}: {bad}"
+        );
+    }
+
     // The `accepts` input is closed and empty; its output is open. Each
     // fault below but the first changes one field of the valid `images`.
     assert_conforms(c.accepts_input, &json!({}));

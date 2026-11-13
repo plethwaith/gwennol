@@ -374,7 +374,7 @@ impl Ui {
             } => {
                 self.push(Entry::ToolResult {
                     call,
-                    content,
+                    content: show::tool_content(&content),
                     is_error,
                     expanded: verbosity >= 1,
                 });
@@ -759,7 +759,7 @@ pub fn render(ui: &Ui, frame: &mut Frame) {
 
 #[cfg(test)]
 mod tests {
-    use gwennol_core::{Failure, ToolCall};
+    use gwennol_core::{Failure, ToolCall, ToolContent};
     use gwennol_host::{Access, ApprovalRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -864,7 +864,7 @@ mod tests {
             ui.apply(
                 Event::ToolResult {
                     call: call("toolu_1", "read"),
-                    content: "hi".to_string(),
+                    content: ToolContent::Text("hi".to_string()),
                     is_error: false,
                 },
                 0,
@@ -924,7 +924,7 @@ mod tests {
         buffered.apply(
             Event::ToolResult {
                 call: call("toolu_1", "read"),
-                content: "hi".to_string(),
+                content: ToolContent::Text("hi".to_string()),
                 is_error: false,
             },
             0,
@@ -1397,7 +1397,7 @@ mod tests {
         ui.apply(
             Event::ToolResult {
                 call: c.clone(),
-                content: content.clone(),
+                content: ToolContent::Text(content.clone()),
                 is_error: false,
             },
             1,
@@ -1410,7 +1410,7 @@ mod tests {
         ui0.apply(
             Event::ToolResult {
                 call: c.clone(),
-                content: content.clone(),
+                content: ToolContent::Text(content.clone()),
                 is_error: false,
             },
             0,
@@ -1440,7 +1440,7 @@ mod tests {
         ui.apply(
             Event::ToolResult {
                 call: c.clone(),
-                content: content.clone(),
+                content: ToolContent::Text(content.clone()),
                 is_error: false,
             },
             0,
@@ -1654,7 +1654,7 @@ mod tests {
         ui.apply(
             Event::ToolResult {
                 call: c.clone(),
-                content: "one\ntwo".to_string(),
+                content: ToolContent::Text("one\ntwo".to_string()),
                 is_error: false,
             },
             0,
@@ -1686,7 +1686,7 @@ mod tests {
         verbose.apply(
             Event::ToolResult {
                 call: c.clone(),
-                content: "one\ntwo".to_string(),
+                content: ToolContent::Text("one\ntwo".to_string()),
                 is_error: false,
             },
             1,

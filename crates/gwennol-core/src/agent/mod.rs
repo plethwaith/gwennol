@@ -38,11 +38,17 @@
 //! - **Tool arguments are validated** against the tool's declared
 //!   schema before dispatch; the kernel validates no payloads.
 //! - **Every tool call is answered** in the immediately following user
-//!   message, in order, results before any text or image. A tool that
+//!   message, in order, results before any text or image. A tool's
+//!   result is text or a list of text and image blocks; an image in it is
+//!   checked before it is stored (its data decodes, its bytes are the
+//!   format it declares, it is within [`SessionConfig::max_image_bytes`]),
+//!   and one that fails answers the call as one the tool could not
+//!   answer. A tool that
 //!   reports `is_error` is answered with that; a tool that *cannot* answer —
 //!   the model named a tool that does not exist, sent arguments the
 //!   schema refuses, or the call failed as a step (the step refused it,
-//!   the kernel refused, the plugin returned a malformed result) — is
+//!   the kernel refused, the plugin returned a malformed result, or an
+//!   image larger than [`SessionConfig::max_image_bytes`]) — is
 //!   answered with an `is_error` result carrying the reason verbatim,
 //!   and the frontend is told which case it was ([`Event::ToolFailed`]
 //!   against [`Event::ToolResult`]). The loop branches on none of that
@@ -111,7 +117,7 @@ use gwead::serde_json::{Map, Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 
 use crate::accepts::{self, Accepts, AcceptsError, Support};
-use crate::content::{ContentError, UserContent};
+use crate::content::{ContentError, ToolContent, UserContent};
 use crate::context::{CONTEXT_KEY, exec_context_with};
 use crate::events::{Event, EventSink, ToolCall};
 use crate::spi;
@@ -439,8 +445,11 @@ pub struct SessionConfig {
     /// refuses the session ([`SessionError::Harvest`]). `Some` of an empty
     /// set offers no tools.
     pub tool_plugins: Option<BTreeSet<String>>,
-    /// The most bytes one image of a turn may have, checked by
-    /// [`Session::turn_with`] before anything is stored. Not applied by
+    /// The most bytes one inline image may have: checked by
+    /// [`Session::turn_with`] for the user's before anything is stored, and
+    /// for each image a tool returns before its result is stored, where one
+    /// over the limit answers the call as a failure ([`Event::ToolFailed`]).
+    /// Not applied by
     /// [`Session::restore`]. An `Image` travels inline and the conversation is
     /// sent again every round, so what the provider's guest can hold bounds
     /// the conversation's images together, not one image: a request that
@@ -668,7 +677,7 @@ impl Session {
     /// offers (the loop checks neither of what a provider sends), that
     /// a `tool_result` carries `is_error`, which the loop always writes,
     /// that an image block's `data` is base64 or decodes to the format its
-    /// `media_type` names, that an image reference names anything a
+    /// `media_type` names, in a user message or in a `tool_result`, that an image reference names anything a
     /// provider can resolve, and that an image is within
     /// [`SessionConfig::max_image_bytes`] (a transcript another session
     /// returned is accepted whatever that session's cap was). If
@@ -1080,9 +1089,14 @@ impl Session {
                         .run()
                         .await;
                     match outcome {
-                        Ok(result) => parse_output(&result.output).map_err(|e| {
-                            format!("{:?} returned a malformed result: {e}", call.name)
-                        }),
+                        Ok(result) => parse_output(&result.output)
+                            .map_err(|e| {
+                                format!("{:?} returned a malformed result: {e}", call.name)
+                            })
+                            .and_then(|output| {
+                                self.check_result_images(&call.name, &output.content)?;
+                                Ok(output)
+                            }),
                         // The turn's token is the authority on
                         // cancellation: once it fired, whatever the
                         // step reports is the cut arriving — its text
@@ -1115,13 +1129,13 @@ impl Session {
 
         let (content, is_error) = match answer {
             Ok(output) => {
-                let content = spi::tool::render_content(&output.content, output.truncated);
+                let content = spi::tool::render(output.content, output.truncated);
                 self.emit(Event::ToolResult {
                     call: tool_call,
                     content: content.clone(),
                     is_error: output.is_error,
                 });
-                (content, output.is_error)
+                (content.value(), output.is_error)
             }
             Err(error) => {
                 tracing::warn!(tool = %call.name, id = %call.id, %error, "tool call could not be answered by the tool");
@@ -1129,7 +1143,7 @@ impl Session {
                     call: tool_call,
                     error: error.clone(),
                 });
-                (error, true)
+                (Value::String(error), true)
             }
         };
         Ok(json!({
@@ -1138,6 +1152,28 @@ impl Session {
             "content": content,
             "is_error": is_error,
         }))
+    }
+
+    /// Refuse a tool's result when one of its inline images is over
+    /// [`SessionConfig::max_image_bytes`]: measured as [`Session::turn_with`]
+    /// measures a user's image, by decoded bytes, with a reference not
+    /// measured. The text is the reason the model is told.
+    fn check_result_images(&self, name: &str, content: &ToolContent) -> Result<(), String> {
+        let ToolContent::Blocks(items) = content else {
+            return Ok(());
+        };
+        for (index, item) in items.iter().enumerate() {
+            if let UserContent::Image(image) = item
+                && image.bytes().len() > self.config.max_image_bytes
+            {
+                return Err(format!(
+                    "{name:?} returned an image of {} bytes at block {index}; the session's max_image_bytes is {}",
+                    image.bytes().len(),
+                    self.config.max_image_bytes
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

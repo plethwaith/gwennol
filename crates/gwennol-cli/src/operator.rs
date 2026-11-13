@@ -139,6 +139,7 @@ impl Operator for Headless {
                 content,
                 is_error,
             } => {
+                let content = show::tool_content(&content);
                 self.note(show::tool_result(&call, &content, is_error, self.verbosity));
             }
             Event::ToolFailed { call, error } => {

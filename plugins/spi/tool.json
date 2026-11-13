@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "name": "TOOL",
   "displayName": "Model-callable tool",
-  "version": "0.3.0",
-  "description": "A plugin offering tools the model can call: one tool for each of its actions that carries a `tool` block. A tool's name, description and argument schema are NOT declared here — they live in that `tool` block, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the result an action offered as a tool returns, `#/$defs/Result` — including how a tool says its output was cut (`truncated`, rendered into `content` for the model by the caller, never by the tool). No action is required. `call` is the name a plugin offering one tool conventionally gives its action; a plugin may offer tools from actions of any name.",
+  "version": "0.4.0",
+  "description": "A plugin offering tools the model can call: one tool for each of its actions that carries a `tool` block. A tool's name, description and argument schema are NOT declared here — they live in that `tool` block, the manifest being the single source of truth (see docs/SPI.md). This contract fixes only what every tool has in common: the result an action offered as a tool returns, `#/$defs/Result` — text, or text and image blocks in order — including how a tool says its output was cut (`truncated`, rendered into `content` for the model by the caller, never by the tool). No action is required. `call` is the name a plugin offering one tool conventionally gives its action; a plugin may offer tools from actions of any name.",
   "actions": {
     "call": {
       "optional": true,
@@ -27,8 +27,20 @@
       "additionalProperties": false,
       "properties": {
         "content": {
-          "type": "string",
-          "description": "The tool result as the model will see it, verbatim."
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "oneOf": [
+                  { "$ref": "#/$defs/TextBlock" },
+                  { "$ref": "#/$defs/ImageBlock" }
+                ]
+              }
+            }
+          ],
+          "description": "The tool result as the model will see it: a string, or a non-empty list of text and image blocks in the order the model should see them. An image's bytes are the format its `media_type` names; the caller checks that, and the size, before passing the result on, and answers the call as a failure when they do not hold."
         },
         "is_error": {
           "type": "boolean",
@@ -38,9 +50,54 @@
         "truncated": {
           "type": "boolean",
           "default": false,
-          "description": "True when `content` is a prefix of what the tool would otherwise have returned — a capped file read, capped process output. Data, not prose: the tool never appends a marker to `content` itself. The caller renders the one shared marker (`gwennol_core::spi::tool::TRUNCATED_MARKER`) before the model sees the result, so every tool signals a cut the same way and no tool has to compose it declaratively."
+          "description": "True when `content` is a prefix of what the tool would otherwise have returned — a capped file read, capped process output, the first of several images. Data, not prose: the tool never appends a marker to `content` itself. The caller renders the one shared marker (`gwennol_core::spi::tool::TRUNCATED_MARKER`) before the model sees the result: on its own final line of a string, or as a text block of its own after the last block of a list, so every tool signals a cut the same way and no tool has to compose it declaratively."
         }
       }
+    },
+    "TextBlock": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "text" },
+        "text": { "type": "string" }
+      }
+    },
+    "ImageBlock": {
+      "type": "object",
+      "required": ["type", "source"],
+      "additionalProperties": false,
+      "description": "An image in a tool's result, in its position among the result's blocks. `source.type` says how the image travels: its bytes inline, or a reference the provider resolves.",
+      "properties": {
+        "type": { "const": "image" },
+        "source": { "oneOf": [ { "$ref": "#/$defs/Base64ImageSource" }, { "$ref": "#/$defs/ReferenceImageSource" } ] }
+      }
+    },
+    "Base64ImageSource": {
+      "type": "object",
+      "required": ["type", "media_type", "data"],
+      "additionalProperties": false,
+      "description": "The image's bytes, inline.",
+      "properties": {
+        "type": { "const": "base64" },
+        "media_type": { "$ref": "#/$defs/ImageMediaType" },
+        "data": { "type": "string", "minLength": 1, "description": "The file's bytes in standard padded base64 (RFC 4648 section 4)." }
+      }
+    },
+    "ReferenceImageSource": {
+      "type": "object",
+      "required": ["type", "media_type", "reference"],
+      "additionalProperties": false,
+      "description": "An image named by a reference in place of its bytes. The caller stores and passes on the reference unchanged and never interprets it; resolving it is the provider's. `media_type` is declared by the tool.",
+      "properties": {
+        "type": { "const": "reference" },
+        "media_type": { "$ref": "#/$defs/ImageMediaType" },
+        "reference": { "type": "string", "minLength": 1, "description": "Chosen by the embedder: a path, a storage key." }
+      }
+    },
+    "ImageMediaType": {
+      "description": "The image formats this contract names.",
+      "enum": ["image/jpeg", "image/png", "image/gif", "image/webp"]
     }
   }
 }

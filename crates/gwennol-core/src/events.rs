@@ -36,14 +36,14 @@ pub enum Event {
     Text(String),
     /// The loop is about to run a tool the model asked for.
     ToolCall(ToolCall),
-    /// The tool answered. `content` is what the model sees — rendered
-    /// through the shared truncation convention — and `is_error` is the
-    /// tool's own verdict on it.
+    /// The tool answered. `content` is what the model sees: text, or a list
+    /// of text and images, rendered through the shared truncation
+    /// convention, and `is_error` is the tool's own verdict on it.
     ToolResult {
         /// The call this answers.
         call: ToolCall,
         /// The result as handed to the model.
-        content: String,
+        content: crate::content::ToolContent,
         /// The tool reported a failure the model should react to.
         is_error: bool,
     },

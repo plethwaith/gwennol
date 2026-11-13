@@ -3,12 +3,16 @@
 
 use std::collections::BTreeSet;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use boon::{Compiler, SchemaIndex, Schemas};
 use gwead::kernel::Kernel;
 use gwead::kernel::registry::ToolDescriptor;
 use gwead::serde_json::{Value, json};
 
 use super::SessionError;
+use super::transcript::check_image_source;
+use crate::content::{Image, ImageFormat, ImageReference, ToolContent, UserContent};
 use crate::spi;
 
 /// One tool the model may call.
@@ -102,20 +106,23 @@ impl ToolTable {
 /// A tool's result, as the contract shapes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolOutput {
-    pub content: String,
+    pub content: ToolContent,
     pub is_error: bool,
     pub truncated: bool,
 }
 
 /// Read the output of an action run as a tool. Fail-closed like every contract
 /// shape: a result missing `content`, mistyping a field, or carrying
-/// one the closed schema does not allow is not a result.
+/// one the closed schema does not allow is not a result. A `content` list is
+/// read block by block, and each inline image is checked as far as the loop
+/// can before it is stored: its data is standard padded base64, its bytes
+/// are a format [`ImageFormat`] names, and that format is the declared one.
 pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     let Some(fields) = output.as_object() else {
         return Err(format!("result is not an object: {output}"));
     };
     let mut out = ToolOutput {
-        content: String::new(),
+        content: ToolContent::Text(String::new()),
         is_error: false,
         truncated: false,
     };
@@ -123,7 +130,20 @@ pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     for (key, value) in fields {
         match (key.as_str(), value) {
             ("content", Value::String(s)) => {
-                out.content = s.clone();
+                out.content = ToolContent::Text(s.clone());
+                has_content = true;
+            }
+            ("content", Value::Array(items)) => {
+                if items.is_empty() {
+                    return Err("result `content` is an empty list".into());
+                }
+                out.content = ToolContent::Blocks(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| parse_block(i, item))
+                        .collect::<Result<_, _>>()?,
+                );
                 has_content = true;
             }
             ("is_error", Value::Bool(b)) => out.is_error = *b,
@@ -144,6 +164,63 @@ pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     Ok(out)
 }
 
+/// Read block `i` of a result's `content` list: a `text` block, or an `image`
+/// block whose inline bytes are checked against the format it declares.
+fn parse_block(i: usize, item: &Value) -> Result<UserContent, String> {
+    let fields = item.as_object();
+    let kind = fields.and_then(|f| f.get("type")).and_then(Value::as_str);
+    let (Some(fields), Some(kind @ ("text" | "image"))) = (fields, kind) else {
+        return Err(format!(
+            "result block {i} is not a text or image block: {item}"
+        ));
+    };
+    let allowed: &[&str] = if kind == "text" {
+        &["type", "text"]
+    } else {
+        &["type", "source"]
+    };
+    if let Some(key) = fields.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "result block {i} carries a field the contract does not allow: {key:?}"
+        ));
+    }
+    if kind == "text" {
+        return match fields.get("text") {
+            Some(Value::String(text)) => Ok(UserContent::Text(text.clone())),
+            _ => Err(format!("result block {i} has no string `text`")),
+        };
+    }
+    let source = fields.get("source");
+    check_image_source(source).map_err(|e| format!("result block {i}: {e}"))?;
+    let source = source.and_then(Value::as_object);
+    let field = |name: &str| {
+        source
+            .and_then(|s| s.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    // `check_image_source` has named the media type and the payload field.
+    let declared = ImageFormat::from_media_type(field("media_type"))
+        .ok_or_else(|| format!("result block {i}: unreachable media type"))?;
+    if field("type") == "reference" {
+        return ImageReference::new(declared, field("reference"))
+            .map(UserContent::ImageReference)
+            .map_err(|e| format!("result block {i}: {e}"));
+    }
+    let bytes = STANDARD
+        .decode(field("data"))
+        .map_err(|e| format!("result block {i}: image data is not standard padded base64: {e}"))?;
+    let image = Image::new(bytes).map_err(|e| format!("result block {i}: {e}"))?;
+    if image.format() != declared {
+        return Err(format!(
+            "result block {i}: image declares {} but its bytes are {}",
+            declared.media_type(),
+            image.format().media_type()
+        ));
+    }
+    Ok(UserContent::Image(image))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +230,7 @@ mod tests {
         assert_eq!(
             parse_output(&json!({"content": "c"})).unwrap(),
             ToolOutput {
-                content: "c".into(),
+                content: ToolContent::Text("c".into()),
                 is_error: false,
                 truncated: false
             }
@@ -161,7 +238,7 @@ mod tests {
         assert_eq!(
             parse_output(&json!({"content": "c", "is_error": true, "truncated": true})).unwrap(),
             ToolOutput {
-                content: "c".into(),
+                content: ToolContent::Text("c".into()),
                 is_error: true,
                 truncated: true
             }
@@ -175,6 +252,227 @@ mod tests {
         ] {
             let err = parse_output(&bad).unwrap_err();
             assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+    const PNG: &str = "iVBORw0KGgo=";
+
+    fn text(t: &str) -> Value {
+        json!({"type": "text", "text": t})
+    }
+    fn inline(media_type: &str, data: &str) -> Value {
+        json!({"type": "image", "source": {
+            "type": "base64", "media_type": media_type, "data": data}})
+    }
+    fn reference(media_type: &str, reference: &str) -> Value {
+        json!({"type": "image", "source": {
+            "type": "reference", "media_type": media_type, "reference": reference}})
+    }
+
+    #[test]
+    fn a_result_of_blocks_is_read_in_order() {
+        let read = parse_output(&json!({"content": [
+            text("a"), inline("image/png", PNG), reference("image/jpeg", "k")
+        ]}))
+        .unwrap();
+        let ToolContent::Blocks(items) = read.content else {
+            panic!("a list is read as blocks");
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], UserContent::Text("a".into()));
+        let UserContent::Image(image) = &items[1] else {
+            panic!("{:?}", items[1]);
+        };
+        assert_eq!(image.format(), ImageFormat::Png);
+        assert_eq!(
+            image.bytes(),
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert_eq!(
+            items[2],
+            UserContent::ImageReference(ImageReference::new(ImageFormat::Jpeg, "k").unwrap())
+        );
+
+        let texts = parse_output(&json!({"content": [text("a"), text("b")]})).unwrap();
+        assert_eq!(
+            texts.content,
+            ToolContent::Blocks(vec![
+                UserContent::Text("a".into()),
+                UserContent::Text("b".into())
+            ])
+        );
+
+        let formats = parse_output(&json!({"content": [
+            inline("image/jpeg", "/9j/4A=="),
+            inline("image/png", PNG),
+            inline("image/gif", "R0lGODlh"),
+            inline("image/webp", "UklGRgAAAABXRUJQ"),
+        ]}))
+        .unwrap();
+        let ToolContent::Blocks(items) = formats.content else {
+            panic!("a list is read as blocks");
+        };
+        let read: Vec<ImageFormat> = items
+            .iter()
+            .map(|item| match item {
+                UserContent::Image(image) => image.format(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ImageFormat::Jpeg,
+                ImageFormat::Png,
+                ImageFormat::Gif,
+                ImageFormat::Webp
+            ]
+        );
+
+        let flags =
+            parse_output(&json!({"content": [text("a")], "is_error": true, "truncated": true}))
+                .unwrap();
+        assert!(flags.is_error && flags.truncated);
+    }
+
+    #[test]
+    fn an_off_contract_block_is_refused() {
+        let with = |mutate: &dyn Fn(&mut Value)| {
+            let mut b = inline("image/png", PNG);
+            mutate(&mut b);
+            b
+        };
+        let padding = "result block 0: image data is not standard padded base64: ";
+        let cases: Vec<(&str, Value, String)> = vec![
+            (
+                "an empty list",
+                json!([]),
+                "result `content` is an empty list".into(),
+            ),
+            (
+                "a string item",
+                json!(["a"]),
+                "result block 0 is not a text or image block: \"a\"".into(),
+            ),
+            (
+                "no type",
+                json!([{"text": "a"}]),
+                "result block 0 is not a text or image block: {\"text\":\"a\"}".into(),
+            ),
+            (
+                "an unknown type",
+                json!([{"type": "opaque"}]),
+                "result block 0 is not a text or image block: {\"type\":\"opaque\"}".into(),
+            ),
+            (
+                "a tool_result",
+                json!([{"type": "tool_result"}]),
+                "result block 0 is not a text or image block: {\"type\":\"tool_result\"}".into(),
+            ),
+            (
+                "text with no text",
+                json!([{"type": "text"}]),
+                "result block 0 has no string `text`".into(),
+            ),
+            (
+                "text with a number",
+                json!([{"type": "text", "text": 1}]),
+                "result block 0 has no string `text`".into(),
+            ),
+            (
+                "text with an extra field",
+                json!([{"type": "text", "text": "a", "x": 1}]),
+                "result block 0 carries a field the contract does not allow: \"x\"".into(),
+            ),
+            (
+                "an image with no source",
+                json!([{"type": "image"}]),
+                "result block 0: image block has no object `source`".into(),
+            ),
+            (
+                "an image with an extra field",
+                json!([with(&|b| b["x"] = json!(1))]),
+                "result block 0 carries a field the contract does not allow: \"x\"".into(),
+            ),
+            (
+                "a source of type url",
+                json!([with(&|b| b["source"]["type"] = json!("url"))]),
+                "result block 0: image source type is not `base64` or `reference`".into(),
+            ),
+            (
+                "a source with no media type",
+                json!([with(&|b| {
+                    b["source"].as_object_mut().unwrap().remove("media_type");
+                })]),
+                "result block 0: image block has a media type the contract does not name: (none)"
+                    .into(),
+            ),
+            (
+                "a media type the contract does not name",
+                json!([with(&|b| b["source"]["media_type"] = json!("image/bmp"))]),
+                "result block 0: image block has a media type the contract does not name: image/bmp"
+                    .into(),
+            ),
+            (
+                "base64 with no data",
+                json!([with(&|b| {
+                    b["source"].as_object_mut().unwrap().remove("data");
+                })]),
+                "result block 0: image block has no non-empty string `data`".into(),
+            ),
+            (
+                "empty data",
+                json!([with(&|b| b["source"]["data"] = json!(""))]),
+                "result block 0: image block has no non-empty string `data`".into(),
+            ),
+            (
+                "a reference with no reference",
+                json!([{"type": "image", "source": {
+                    "type": "reference", "media_type": "image/png"}}]),
+                "result block 0: image block has no non-empty string `reference`".into(),
+            ),
+            (
+                "a reference carrying data",
+                json!([{"type": "image", "source": {
+                    "type": "reference", "media_type": "image/png",
+                    "reference": "k", "data": "AA=="}}]),
+                "result block 0: image source carries a field the contract does not allow: \"data\""
+                    .into(),
+            ),
+            (
+                "data missing its padding",
+                json!([inline("image/png", "iVBORw0KGgo")]),
+                padding.into(),
+            ),
+            (
+                "data with a space in it",
+                json!([inline("image/png", "iVBO Rw0KGgo=")]),
+                padding.into(),
+            ),
+            (
+                "bytes no format names",
+                json!([inline("image/png", "Qk0=")]),
+                "result block 0: the image is not a JPEG, PNG, GIF or WebP file".into(),
+            ),
+            (
+                "PNG bytes declared as JPEG",
+                json!([inline("image/jpeg", PNG)]),
+                "result block 0: image declares image/jpeg but its bytes are image/png".into(),
+            ),
+            (
+                "the fault behind a valid block",
+                json!([text("a"), {"type": "text"}]),
+                "result block 1 has no string `text`".into(),
+            ),
+        ];
+        for (name, content, why) in cases {
+            let err = parse_output(&json!({"content": content}))
+                .err()
+                .unwrap_or_else(|| panic!("{name}: the result was accepted"));
+            if why == padding {
+                assert!(err.starts_with(&why), "{name}: {err}");
+            } else {
+                assert_eq!(err, why, "{name}");
+            }
         }
     }
 }

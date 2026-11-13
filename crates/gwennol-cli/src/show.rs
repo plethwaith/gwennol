@@ -13,7 +13,7 @@ use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use gwennol_core::{Failure, ToolCall, TurnError, TurnOutcome};
+use gwennol_core::{Failure, ToolCall, ToolContent, TurnError, TurnOutcome, UserContent};
 use gwennol_host::{Access, ApprovalRequest};
 
 use crate::policy::Judgement;
@@ -228,6 +228,34 @@ pub fn tool_result(call: &ToolCall, content: &str, is_error: bool, verbosity: u8
     out
 }
 
+/// A tool result's content as text: a list's text blocks as they are and each
+/// image as one bracketed line naming its media type and its size or
+/// reference.
+pub fn tool_content(content: &ToolContent) -> String {
+    match content {
+        ToolContent::Text(text) => text.clone(),
+        ToolContent::Blocks(items) => items
+            .iter()
+            .map(|item| match item {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Image(image) => format!(
+                    "[image: {}, {} bytes]",
+                    image.format().media_type(),
+                    image.bytes().len()
+                ),
+                UserContent::ImageReference(image) => format!(
+                    "[image: {}, reference {:?}]",
+                    image.format().media_type(),
+                    image.reference()
+                ),
+                _ => "[a block this frontend cannot show]".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => "[a block this frontend cannot show]".to_string(),
+    }
+}
+
 /// A call that got no answer.
 pub fn tool_failed(call: &ToolCall, error: &str) -> String {
     format!("!! {}: {error}", ShowCall(call))
@@ -269,6 +297,22 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn a_tool_results_images_show_as_bracketed_lines() {
+        use gwennol_core::{Image, ImageFormat, ImageReference};
+        assert_eq!(tool_content(&ToolContent::Text("x".into())), "x");
+        let png = Image::new(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let blocks = ToolContent::Blocks(vec![
+            UserContent::Text("a".into()),
+            UserContent::Image(png),
+            UserContent::ImageReference(ImageReference::new(ImageFormat::Jpeg, "k").unwrap()),
+        ]);
+        assert_eq!(
+            tool_content(&blocks),
+            "a\n[image: image/png, 8 bytes]\n[image: image/jpeg, reference \"k\"]"
+        );
+    }
 
     #[test]
     fn previews_are_one_line_and_bounded() {
