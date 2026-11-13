@@ -1126,7 +1126,9 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
 }
 
 /// What the bundled provider declares it takes agrees with what `chat`
-/// does, for each source type and each media type the contract names.
+/// does, for each source type and each media type the contract names. Each
+/// source type is run through every input the loop over `at_top` and
+/// `in_result` builds.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundled_declaration_agrees_with_what_chat_sends() {
     let f = fixture();

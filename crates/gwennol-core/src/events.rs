@@ -50,9 +50,10 @@ pub enum Event {
     /// The tool could not answer, or was never asked. The model named a
     /// tool that is not registered, sent arguments its schema refuses,
     /// or the call failed as a step (the step refused it, the kernel
-    /// refused, the plugin returned a malformed result, or its result held an inline
-    /// image larger than [`SessionConfig::max_image_bytes`](crate::SessionConfig::max_image_bytes)); or the turn
-    /// was cancelled while it ran; or the loop did not run it at all —
+    /// refused, or the plugin returned a malformed result); or its result
+    /// held an inline image larger than
+    /// [`SessionConfig::max_image_bytes`](crate::SessionConfig::max_image_bytes);
+    /// or the turn was cancelled while it ran; or the loop did not run it at all —
     /// the turn was cancelled before it started, or the model refused
     /// its own turn after asking — in which case no [`Event::ToolCall`]
     /// precedes this. The model is told, as an `is_error` result

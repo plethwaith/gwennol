@@ -190,7 +190,8 @@ mod tests {
     use crate::record::testing::Capture;
 
     /// A tool result of blocks reaches the trace as `show::tool_content`
-    /// renders it. Mutation: render a list as an empty string at the
+    /// renders it, each line indented by `show::tool_result`'s framing at
+    /// verbosity 1. Mutation: render a list as an empty string at the
     /// `ToolResult` arm of `emit`.
     #[test]
     fn a_tool_result_of_blocks_is_traced_as_its_rendered_lines() {

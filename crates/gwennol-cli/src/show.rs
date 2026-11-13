@@ -230,7 +230,8 @@ pub fn tool_result(call: &ToolCall, content: &str, is_error: bool, verbosity: u8
 
 /// A tool result's content as text: a list's text blocks as they are and each
 /// image as one bracketed line naming its media type and its size or
-/// reference.
+/// reference, the blocks joined by `\n`. A block it has no arm for is shown by
+/// the `match`'s fallback arm.
 pub fn tool_content(content: &ToolContent) -> String {
     match content {
         ToolContent::Text(text) => text.clone(),

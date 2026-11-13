@@ -39,16 +39,16 @@
 //!   schema before dispatch; the kernel validates no payloads.
 //! - **Every tool call is answered** in the immediately following user
 //!   message, in order, results before any text or image. A tool's
-//!   result is text or a list of text and image blocks; an inline image in it is
-//!   checked before it is stored (its data decodes, its bytes are the
-//!   format it declares, it is within [`SessionConfig::max_image_bytes`]),
-//!   and one that fails answers the call as one the tool could not
-//!   answer. A tool that
+//!   result is text or a list of text and image blocks; an inline image
+//!   in it is checked before it is stored (its data decodes, its bytes are
+//!   the format it declares, it is within
+//!   [`SessionConfig::max_image_bytes`]), and one that fails answers the
+//!   call as one the tool could not answer. A tool that
 //!   reports `is_error` is answered with that; a tool that *cannot* answer —
 //!   the model named a tool that does not exist, sent arguments the
 //!   schema refuses, or the call failed as a step (the step refused it,
 //!   the kernel refused, the plugin returned a malformed result, or an
-//!   image larger than [`SessionConfig::max_image_bytes`]) — is
+//!   inline image larger than [`SessionConfig::max_image_bytes`]) — is
 //!   answered with an `is_error` result carrying the reason verbatim,
 //!   and the frontend is told which case it was ([`Event::ToolFailed`]
 //!   against [`Event::ToolResult`]). The loop branches on none of that
@@ -677,8 +677,9 @@ impl Session {
     /// offers (the loop checks neither of what a provider sends), that
     /// a `tool_result` carries `is_error`, which the loop always writes,
     /// that an image block's `data` is base64 or decodes to the format its
-    /// `media_type` names, in a user message or in a `tool_result`, that an image reference names anything a
-    /// provider can resolve, and that an image is within
+    /// `media_type` names, in a user message or in a `tool_result`, that an
+    /// image reference names anything a provider can resolve, and that an
+    /// image is within
     /// [`SessionConfig::max_image_bytes`] (a transcript another session
     /// returned is accepted whatever that session's cap was). If
     /// the model calls an unoffered tool again, the loop answers that no
@@ -694,8 +695,8 @@ impl Session {
     ///
     /// A turn that fails or is cancelled once its content is stored leaves
     /// that content in the transcript (see the module docs). This removes
-    /// every text and image block of the last message when that message is
-    /// a user message, whichever turns stored them and however they ended.
+    /// every top-level text and image block of the last message when that
+    /// message is a user message, whichever turns stored them and however they ended.
     /// The blocks come back in stored order, exactly as [`Self::transcript`]
     /// showed them, so a frontend can put the user's text back in its input.
     ///

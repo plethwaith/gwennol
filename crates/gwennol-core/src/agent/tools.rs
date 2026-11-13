@@ -114,8 +114,8 @@ pub(crate) struct ToolOutput {
 /// Read the output of an action run as a tool. Fail-closed like every contract
 /// shape: a result that is not an object, has no `content` or an empty
 /// `content` list, mistypes a field, or carries one the closed schema does
-/// not allow is not a result. A `content` list is
-/// read block by block, by `parse_block`.
+/// not allow is not a result. A `content` list is read block by block, by
+/// `parse_block`.
 pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     let Some(fields) = output.as_object() else {
         return Err(format!("result is not an object: {output}"));
@@ -164,7 +164,8 @@ pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
 }
 
 /// Read block `i` of a result's `content` list: a `text` block, or an `image`
-/// block whose inline bytes are checked against the format it declares.
+/// block whose inline bytes are checked against the format it declares. A
+/// reference block is accepted without bytes: nothing here resolves it.
 fn parse_block(i: usize, item: &Value) -> Result<UserContent, String> {
     let fields = item.as_object();
     let kind = fields.and_then(|f| f.get("type")).and_then(Value::as_str);

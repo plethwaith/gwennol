@@ -1325,6 +1325,17 @@ mod tests {
                 .message
                 .starts_with("message 0: an image block's source type is \"reference\"; ")
         );
+        let nested_then_top = json!({"messages": [
+            result(json!([text.clone(), reference.clone()])),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![source(json!({"type": "url"}))]),
+        ]});
+        assert!(
+            unsupported_image_source(&nested_then_top)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"reference\"; ")
+        );
         let plain = json!({"messages": [result(json!("text only"))]});
         assert_eq!(unsupported_image_source(&plain), None);
         let inline_result = json!({"messages": [result(json!([text.clone(), inline.clone()]))]});

@@ -1384,6 +1384,16 @@ async fn a_tools_image_is_held_to_what_the_loop_can_check() {
             "\"img\" returned an image of 9 bytes at block 1; the session's max_image_bytes is 8",
         ),
         (
+            "over the limit, second of two images, text last",
+            json!({"content": [
+                inline_block("iVBORw0KGgo="),
+                inline_block("iVBORw0KGgoA"),
+                {"type": "text", "text": "a"},
+            ]}),
+            8,
+            "\"img\" returned an image of 9 bytes at block 1; the session's max_image_bytes is 8",
+        ),
+        (
             "bytes of another format than declared",
             json!({"content": [{"type": "image", "source": {
                 "type": "base64", "media_type": "image/jpeg", "data": "iVBORw0KGgo="}}]}),

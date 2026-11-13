@@ -73,16 +73,15 @@ mid-way loses only what the new provider could not have used).
 An `image` block is an image shown to the model, in its position among the
 blocks around it: a user message's, or a `tool_result`'s content. Its
 `source` carries the image one of two ways: the file's bytes inline, as
-standard base64, or a `reference` (a path, a storage
-key); both name a media type, and the schema lists the fields and the media
-types. The consumer never
-interprets a reference: it stores and replays it, and resolving it is the
-provider's. A provider that cannot resolve a reference, or cannot take an
+standard base64, or a `reference` (a path, a storage key); both name a
+media type, and the schema lists the fields and the media types. The
+consumer never interprets a reference: it stores and replays it, and
+resolving it is the provider's. A provider that cannot resolve a reference, or cannot take an
 image, answers with a `Failure`. A provider can also say beforehand, through
 `accepts`, which image formats and source types it takes, in either place,
-or that it takes none. The loop builds the inline block from an `Image`, whose format it
-reads from the bytes, and the reference block from an `ImageReference`,
-whose format the caller declares;
+or that it takes none. The loop builds the inline block from an `Image`,
+whose format it reads from the bytes, and the reference block from an
+`ImageReference`, whose format the caller declares;
 `SessionConfig::max_image_bytes` measures images, not references, and
 `Session::turn_with` refuses an image over it before storing anything; a
 tool's image over it answers the call as a failure (see `TOOL`).
@@ -312,7 +311,7 @@ truncatable field, and four tools would grow four spellings. The caller
 renders the one shared marker, `gwennol_core::spi::tool::TRUNCATED_MARKER`,
 before the model sees it: on its own final line of a string, or as a text
 block of its own after the last block of a list, so the model
-learns "this is a prefix" in one fixed form whichever tool produced it.
+learns "this is a prefix" in one fixed text whichever tool produced it.
 A tool composed of several capped steps reports `truncated` when any of
 them was cut.
 
