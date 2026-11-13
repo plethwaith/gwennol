@@ -894,7 +894,7 @@ async fn retract_keeps_what_an_assistant_message_answered() {
 }
 
 #[tokio::test]
-async fn a_turn_completed_with_nothing_stored_can_be_retracted() {
+async fn a_turn_whose_empty_answer_was_not_stored_can_be_retracted() {
     let (kernel, _) = kernel(vec![]);
     let mut s = Session::new(
         kernel,
@@ -949,8 +949,10 @@ async fn an_image_an_assistant_message_answered_is_not_retracted() {
     let cancel = CancellationToken::new();
     let err = s.turn_with(vec![png(8).into()], &cancel).await.unwrap_err();
     assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    let snapshot = s.transcript().to_vec();
+    assert_eq!(snapshot[0]["content"][0]["type"], "image");
     assert!(s.retract_unanswered().is_empty());
-    assert_eq!(s.transcript()[0]["content"][0]["type"], "image");
+    assert_eq!(s.transcript(), snapshot.as_slice());
 }
 
 #[tokio::test]

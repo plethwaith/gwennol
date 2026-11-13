@@ -88,7 +88,7 @@
 //!   joins that message. Nothing that happened is lost from the model's
 //!   view, and nothing half-happened enters it.
 //!   [`Session::retract_unanswered`] takes back the user's content at
-//!   that end; tool results stay.
+//!   the transcript's end; tool results stay.
 //!
 //! What the loop deliberately does not do: choose policy, persist
 //! anything, or manage the

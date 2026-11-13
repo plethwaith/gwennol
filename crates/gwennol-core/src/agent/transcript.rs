@@ -580,8 +580,6 @@ mod tests {
             img_ref("image/png", "k"),
             txt("again"),
         ]);
-        let mut kept_results = exchange();
-        kept_results[2] = user(vec![tr("c1", "r1"), tr("c2", "r2")]);
         /// A case's name, its messages, the blocks returned, and the
         /// messages left.
         type Case<'a> = (&'a str, Vec<Value>, Vec<Value>, Vec<Value>);
@@ -604,7 +602,7 @@ mod tests {
                 "content after results",
                 after_results,
                 vec![img_ref("image/png", "k"), txt("again")],
-                kept_results,
+                exchange(),
             ),
             (
                 "several turns' content",
