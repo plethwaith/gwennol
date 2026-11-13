@@ -39,7 +39,7 @@
 //!   schema before dispatch; the kernel validates no payloads.
 //! - **Every tool call is answered** in the immediately following user
 //!   message, in order, results before any text or image. A tool's
-//!   result is text or a list of text and image blocks; an image in it is
+//!   result is text or a list of text and image blocks; an inline image in it is
 //!   checked before it is stored (its data decodes, its bytes are the
 //!   format it declares, it is within [`SessionConfig::max_image_bytes`]),
 //!   and one that fails answers the call as one the tool could not

@@ -1314,6 +1314,17 @@ mod tests {
                 kind: Some("unsupported_image_source".into()),
             })
         );
+        let nested_older = json!({"messages": [
+            result(json!([text.clone(), reference.clone()])),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![text.clone()]),
+        ]});
+        assert!(
+            unsupported_image_source(&nested_older)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"reference\"; ")
+        );
         let plain = json!({"messages": [result(json!("text only"))]});
         assert_eq!(unsupported_image_source(&plain), None);
         let inline_result = json!({"messages": [result(json!([text.clone(), inline.clone()]))]});

@@ -177,3 +177,48 @@ impl Operator for Headless {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use gwennol_core::{Image, ToolCall, ToolContent, UserContent};
+
+    use super::*;
+    use crate::record::TraceFile;
+    use crate::record::testing::Capture;
+
+    /// A tool result of blocks reaches the trace as `show::tool_content`
+    /// renders it. Mutation: render a list as an empty string at the
+    /// `ToolResult` arm of `emit`.
+    #[test]
+    fn a_tool_result_of_blocks_is_traced_as_its_rendered_lines() {
+        let capture = Capture::default();
+        let trace: SharedTrace = Arc::new(Mutex::new(TraceFile::from_writer(
+            Path::new("t.log"),
+            Box::new(capture.clone()),
+        )));
+        let policy = Policy::compile(Vec::new(), Path::new("/ws")).unwrap();
+        let operator = Headless::new(policy, Secrets::new(Vec::new()), PathBuf::from("/ws"), 1)
+            .with_trace(Some(trace));
+        let png = Image::new(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        operator.emit(Event::ToolResult {
+            call: ToolCall {
+                id: Some("t1".to_string()),
+                name: "shot".to_string(),
+                arguments: "{}".to_string(),
+            },
+            content: ToolContent::Blocks(vec![
+                UserContent::Text("a".to_string()),
+                UserContent::Image(png),
+            ]),
+            is_error: false,
+        });
+        let traced = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            traced.contains("    a\n    [image: image/png, 8 bytes]\n"),
+            "{traced}"
+        );
+    }
+}

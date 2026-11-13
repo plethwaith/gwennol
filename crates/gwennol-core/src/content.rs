@@ -63,8 +63,8 @@ impl UserContent {
 pub enum ToolContent {
     /// Text alone: the contract's string form.
     Text(String),
-    /// Text, images and image references, in the order the tool gave
-    /// them: the contract's list form. Never empty.
+    /// Text, images and image references, in order: the contract's list
+    /// form.
     Blocks(Vec<UserContent>),
 }
 

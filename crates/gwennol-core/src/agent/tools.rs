@@ -114,9 +114,7 @@ pub(crate) struct ToolOutput {
 /// Read the output of an action run as a tool. Fail-closed like every contract
 /// shape: a result missing `content`, mistyping a field, or carrying
 /// one the closed schema does not allow is not a result. A `content` list is
-/// read block by block, and each inline image is checked as far as the loop
-/// can before it is stored: its data is standard padded base64, its bytes
-/// are a format [`ImageFormat`] names, and that format is the declared one.
+/// read block by block, by `parse_block`.
 pub(crate) fn parse_output(output: &Value) -> Result<ToolOutput, String> {
     let Some(fields) = output.as_object() else {
         return Err(format!("result is not an object: {output}"));
@@ -446,6 +444,11 @@ mod tests {
             (
                 "data with a space in it",
                 json!([inline("image/png", "iVBO Rw0KGgo=")]),
+                padding.into(),
+            ),
+            (
+                "data with non-zero trailing bits",
+                json!([inline("image/png", "iVBORw0KGgp=")]),
                 padding.into(),
             ),
             (

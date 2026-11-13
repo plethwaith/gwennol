@@ -51,7 +51,7 @@ pub enum Entry {
     ToolResult {
         /// The call this is the result of.
         call: ToolCall,
-        /// The tool's own output.
+        /// The result as `show::tool_content` renders it.
         content: String,
         /// Whether the tool reported an error.
         is_error: bool,
@@ -802,6 +802,36 @@ mod tests {
         assert_eq!(
             HELP[5],
             "Tab Shift+Tab focus a tool call or result, newest first; Enter on an empty line expands or collapses it"
+        );
+    }
+
+    /// A tool result of blocks is shown as `show::tool_content` renders
+    /// it. Mutation: render a list as an empty string at the `ToolResult`
+    /// arm of `Ui::apply`.
+    #[test]
+    fn a_tool_result_of_blocks_enters_the_pane_as_its_rendered_lines() {
+        use gwennol_core::{Image, UserContent};
+        let png = Image::new(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let mut ui = Ui::default();
+        ui.apply(
+            Event::ToolResult {
+                call: call("toolu_1", "shot"),
+                content: ToolContent::Blocks(vec![
+                    UserContent::Text("a".to_string()),
+                    UserContent::Image(png),
+                ]),
+                is_error: false,
+            },
+            0,
+        );
+        assert!(
+            matches!(
+                ui.entries.last(),
+                Some(Entry::ToolResult { content, .. })
+                    if content == "a\n[image: image/png, 8 bytes]"
+            ),
+            "{:?}",
+            ui.entries.last()
         );
     }
 

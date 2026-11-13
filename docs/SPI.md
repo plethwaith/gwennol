@@ -92,8 +92,8 @@ A `tool_use` block is the model asking for a tool: `id` names this call,
 `name` names the tool, `input` is arguments per the tool's declared
 schema. The caller runs the tool and carries the answer back as a
 `tool_result` block — `tool_use_id` echoing the `id` — in the next `user`
-message. A `tool_result`'s `content` is a string, or a list of `text` and
-`image` blocks in order.
+message. A `tool_result`'s `content` is a string, or a non-empty list of
+`text` and `image` blocks in order.
 
 `tools` is what the model may call this turn, and each entry is a Gwead
 tool descriptor on the wire: `input_schema` is the implementing action's
@@ -311,8 +311,7 @@ marker itself — composing one declaratively would mean a branch per
 truncatable field, and four tools would grow four spellings. The caller
 renders the one shared marker, `gwennol_core::spi::tool::TRUNCATED_MARKER`,
 before the model sees it: on its own final line of a string, or as a text
-block of its own after the last block of a list. The loop's one rendering,
-`spi::tool::render_content` for text, is the single implementation, so the model
+block of its own after the last block of a list, so the model
 learns "this is a prefix" in one fixed form whichever tool produced it.
 A tool composed of several capped steps reports `truncated` when any of
 them was cut.

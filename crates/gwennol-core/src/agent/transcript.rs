@@ -787,12 +787,12 @@ mod tests {
                 None,
             ),
             (
-                "an image-bearing result second, after a plain one",
+                "an image-only result followed by a plain one",
                 {
                     let mut m = exchange();
                     m[2] = user(vec![
-                        tr("c1", "r1"),
-                        tr_blocks("c2", vec![img("image/png", "AA")]),
+                        tr_blocks("c1", vec![img("image/png", "AA")]),
+                        tr("c2", "r2"),
                     ]);
                     m
                 },
@@ -941,6 +941,54 @@ mod tests {
                 Some((
                     2,
                     "tool_result block \"c1\" has a `content` that is neither a string nor a non-empty list",
+                )),
+            ),
+            (
+                "a tool_result with no content",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![json!({"type": "tool_result", "tool_use_id": "c1", "is_error": false}), tr("c2", "r2")])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" has a `content` that is neither a string nor a non-empty list",
+                )),
+            ),
+            (
+                "a string nested in a result",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![tr_blocks("c1", vec![json!("a")]), tr("c2", "r2")])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a block that is not a text or image block",
+                )),
+            ),
+            (
+                "an untyped block nested in a result",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![tr_blocks("c1", vec![json!({"text": "a"})]), tr("c2", "r2")])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a block that is not a text or image block",
+                )),
+            ),
+            (
+                "a text block nested in a result with a non-string text",
+                with(vec![])
+                    .into_iter()
+                    .take(2)
+                    .chain([user(vec![tr_blocks("c1", vec![json!({"type": "text", "text": 1})]), tr("c2", "r2")])])
+                    .collect(),
+                Some((
+                    2,
+                    "tool_result block \"c1\" holds a text block with no string `text`",
                 )),
             ),
             (

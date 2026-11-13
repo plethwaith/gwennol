@@ -40,7 +40,7 @@
               }
             }
           ],
-          "description": "The tool result as the model will see it: a string, or a non-empty list of text and image blocks in the order the model should see them. An image's bytes are the format its `media_type` names; the caller checks that, and the size, before passing the result on, and answers the call as a failure when they do not hold."
+          "description": "The tool result as the model will see it: a string, or a non-empty list of text and image blocks in the order the model should see them. An inline image's bytes are the format its `media_type` names; the caller checks that, and the size, before passing the result on, and answers the call as a failure when they do not hold."
         },
         "is_error": {
           "type": "boolean",
