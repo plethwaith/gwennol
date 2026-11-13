@@ -407,8 +407,8 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
-    // The `accepts` input is closed and empty; its output is open, and
-    // each fault of `images` below is the only difference from the valid one.
+    // The `accepts` input is closed and empty; its output is open. Each
+    // fault below but the first changes one field of the valid `images`.
     assert_conforms(c.accepts_input, &json!({}));
     assert!(
         c.schemas

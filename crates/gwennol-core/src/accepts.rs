@@ -2,9 +2,7 @@
 //! `accepts` action by [`provider_accepts`](crate::provider_accepts).
 //!
 //! The answer is one [`Support`] per kind of input, of which there is one
-//! so far: images. Unknown is an answer, distinct from no. The loop never
-//! asks, and a turn's `Failure` stays the answer to an input the provider
-//! cannot take.
+//! so far: images. Unknown is an answer, distinct from no.
 
 use gwead::kernel::KernelError;
 use gwead::serde_json::Value;
@@ -77,7 +75,7 @@ impl ImageSource {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AcceptsError {
-    /// The config could not name a provider to ask: one of
+    /// The config is refused before the provider is asked: one of
     /// [`SessionError::NoProvider`], [`SessionError::AmbiguousProvider`],
     /// [`SessionError::NoSuchProvider`] or
     /// [`SessionError::ReservedContextKey`].

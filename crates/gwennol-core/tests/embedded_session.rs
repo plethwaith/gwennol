@@ -107,6 +107,17 @@ fn plain_provider() -> Value {
     plugin
 }
 
+/// `provider()` whose `accepts` answers with the input it was handed
+/// as a source type.
+fn echoing_provider() -> Value {
+    let mut plugin = provider();
+    plugin["name"] = json!("embed_llm_echo");
+    plugin["actions"]["accepts"] = json!({"steps": [
+        {"id": "a", "type": "return", "params": {"value": {"images": {"media_types": ["image/png"], "sources": ["base64", "{{$input}}"]}}}}
+    ]});
+    plugin
+}
+
 /// `provider()` whose `accepts` step is one no one provides.
 fn failing_provider() -> Value {
     let mut plugin = provider();
@@ -1145,8 +1156,8 @@ async fn a_provider_declares_what_it_accepts_under_the_sessions_config() {
 }
 
 #[tokio::test]
-async fn a_provider_without_accepts_is_unknown_and_not_called() {
-    let (kernel, seen) = kernel(vec![plain_provider()]);
+async fn a_provider_without_accepts_is_unknown() {
+    let (kernel, _seen) = kernel(vec![plain_provider()]);
     let config = SessionConfig {
         provider: Some("embed_llm_plain".into()),
         ..SessionConfig::default()
@@ -1155,13 +1166,34 @@ async fn a_provider_without_accepts_is_unknown_and_not_called() {
         .await
         .unwrap();
     assert_eq!(answer.images, Support::Unknown);
-    assert!(
-        seen.lock()
-            .unwrap()
-            .iter()
-            .all(|(subject, _)| subject != "embed_llm_plain"),
-        "{:?}",
-        seen.lock().unwrap()
+}
+
+#[tokio::test]
+async fn an_unnamed_provider_runs_under_its_resolved_names_config() {
+    // `embed_llm` is the only `LLM_CHAT` fulfiller, so `provider: None`
+    // resolves to it; its config entry is keyed by that resolved name.
+    let (kernel, _seen) = kernel(vec![]);
+    let mut config = accepting(json!({"images": false}));
+    config.provider = None;
+    let answer = provider_accepts(&kernel, &config, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(answer.images, Support::No);
+}
+
+#[tokio::test]
+async fn an_accepts_query_sends_an_empty_input() {
+    let (kernel, _seen) = kernel(vec![echoing_provider()]);
+    let config = SessionConfig {
+        provider: Some("embed_llm_echo".into()),
+        ..SessionConfig::default()
+    };
+    let err = provider_accepts(&kernel, &config, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "provider output violates the LLM_CHAT contract: `images` names a source type the contract does not: {\"config\":{},\"secrets\":{},\"steps\":{},\"vars\":{}}"
     );
 }
 

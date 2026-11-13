@@ -26,10 +26,10 @@ and the check is action presence: a plugin claiming `LLM_CHAT` without a
   Whoever dispatches is responsible for conformance — concretely, the
   agent loop (`gwennol_core::agent`) validates model-emitted tool
   arguments against the tool's declared schema before dispatching the
-  tool's action, and reads everything a provider returns fail-closed, apart
-  from the objects the contract leaves open (`usage`, and the `accepts`
-  answer that `gwennol_core::provider_accepts` reads), whose unknown keys it
-  ignores.
+  tool's action, and reads everything a provider returns fail-closed.
+  `gwennol_core::provider_accepts`, which the loop never calls, reads the
+  `accepts` answer: a key this version knows fail-closed, any other key
+  ignored.
 
 ## `LLM_CHAT`
 
@@ -77,7 +77,8 @@ embedder chose (a path, a storage key); both name a media type, and the
 schema lists the fields and the media types. The consumer never
 interprets a reference: it stores and replays it, and resolving it is the
 provider's. A provider that cannot resolve a reference, or cannot take an
-image, answers with a `Failure`. It can also say so beforehand, through `accepts`.
+image, answers with a `Failure`. A provider can also say beforehand, through
+`accepts`, which image formats and source types it takes.
 The loop builds the inline block from an
 `Image`, whose format it reads from the bytes, and the reference block
 from an `ImageReference`, whose format the caller declares;

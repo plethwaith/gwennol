@@ -1057,7 +1057,7 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
         .with_config(&config)
         .run()
         .await
-        .expect("the declaration is a step that cannot fail")
+        .expect("the bundled accepts action ran")
         .output;
     assert_eq!(
         out,

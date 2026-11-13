@@ -11,7 +11,8 @@
 //! [`crate::context`]).
 //!
 //! [`provider_accepts`] asks a provider what input it takes, for a
-//! frontend to decide before a turn; the loop itself never asks.
+//! frontend to decide before a turn; the loop itself never asks. Its
+//! reading rule lives in [`crate::accepts`].
 //!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
@@ -101,7 +102,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gwead::kernel::execute_request::ExecuteActionRequest;
@@ -468,6 +469,18 @@ impl Default for SessionConfig {
     }
 }
 
+impl SessionConfig {
+    /// The `$config` `plugin` runs under: its entry in
+    /// [`Self::plugin_configs`], else `{}`. The one lookup a provider
+    /// round and [`provider_accepts`] both go through.
+    fn plugin_config_for(&self, plugin: &str) -> &Value {
+        static EMPTY: OnceLock<Value> = OnceLock::new();
+        self.plugin_configs
+            .get(plugin)
+            .unwrap_or_else(|| EMPTY.get_or_init(|| json!({})))
+    }
+}
+
 /// The `LLM_CHAT` plugin a session would talk to: `named` when it is
 /// a registered fulfiller, else the only fulfiller there is. The one
 /// implementation of the rule [`SessionConfig::provider`] states —
@@ -502,13 +515,14 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
 /// harvests no tools. A provider without the action is unknown for every
 /// kind of input ([`Support::Unknown`]) and is not called. The loop never
 /// calls this: an embedder asks when a provider's config changes and keeps
-/// the answer. The answer binds the provider to nothing, and a turn it
-/// cannot serve is still a [`TurnError::Provider`].
+/// the answer.
 ///
 /// Refused as [`AcceptsError::Session`] when the provider cannot be
 /// resolved as [`Session::new`] resolves it, or when the context carries
 /// [`CONTEXT_KEY`]. A failed step is [`AcceptsError::Cancelled`] when
-/// `cancel` has fired and [`AcceptsError::Step`] otherwise.
+/// `cancel` has fired and [`AcceptsError::Step`] otherwise; a provider
+/// without the action runs no step, so it answers unknown whether or not
+/// `cancel` has fired.
 pub async fn provider_accepts(
     kernel: &Kernel,
     config: &SessionConfig,
@@ -529,8 +543,7 @@ pub async fn provider_accepts(
             images: Support::Unknown,
         });
     }
-    let no_config = json!({});
-    let plugin_config = config.plugin_configs.get(&provider).unwrap_or(&no_config);
+    let plugin_config = config.plugin_config_for(&provider);
     let out = provider_execution(
         kernel,
         &provider,
@@ -543,11 +556,9 @@ pub async fn provider_accepts(
     .run()
     .await
     .map_err(|e| {
-        if cancel.is_cancelled() {
-            tracing::info!(error = %e, "provider query ended by the caller's cancellation");
+        if provider_step_cancelled(&e, cancel, "provider query") {
             AcceptsError::Cancelled
         } else {
-            warn_if_unrequested(&e);
             AcceptsError::Step(e)
         }
     })?
@@ -586,7 +597,6 @@ pub struct Session {
     provider: String,
     tools: ToolTable,
     transcript: Transcript,
-    no_config: Value,
 }
 
 impl std::fmt::Debug for Session {
@@ -639,7 +649,6 @@ impl Session {
             provider,
             tools,
             transcript: Transcript::default(),
-            no_config: json!({}),
         })
     }
 
@@ -843,10 +852,7 @@ impl Session {
     }
 
     fn config_for(&self, plugin: &str) -> &Value {
-        self.config
-            .plugin_configs
-            .get(plugin)
-            .unwrap_or(&self.no_config)
+        self.config.plugin_config_for(plugin)
     }
 
     /// The `chat` input the next round would send: the conversation as
@@ -926,11 +932,9 @@ impl Session {
         // A provider step error is fatal — unless the turn's own token
         // fired, in which case the error is the cancellation arriving.
         let fatal = |e: KernelError| {
-            if cancel.is_cancelled() {
-                tracing::info!(error = %e, "provider round ended by the turn's cancellation");
+            if provider_step_cancelled(&e, cancel, "provider round") {
                 TurnError::Cancelled { detail: None }
             } else {
-                warn_if_unrequested(&e);
                 TurnError::Step(e)
             }
         };
@@ -1224,10 +1228,22 @@ fn reports_cancellation(e: &KernelError) -> bool {
     }
 }
 
-/// A cancellation the turn did not ask for leaves a footprint.
+/// Whether a failed provider step is `cancel` arriving. When it is not,
+/// a cancellation the caller did not ask for is logged as a footprint.
+fn provider_step_cancelled(e: &KernelError, cancel: &CancellationToken, what: &str) -> bool {
+    if cancel.is_cancelled() {
+        tracing::info!(error = %e, "{what} ended by the caller's cancellation");
+        true
+    } else {
+        warn_if_unrequested(e);
+        false
+    }
+}
+
+/// A cancellation the caller did not ask for leaves a footprint.
 fn warn_if_unrequested(e: &KernelError) {
     if reports_cancellation(e) {
-        tracing::warn!(error = %e, "a cancellation the turn did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
+        tracing::warn!(error = %e, "a cancellation the caller did not request: the kernel's action ceiling stopped a step that had not begun, the plugin reported one itself, or a step reported cancellation on a token that had not fired");
     }
 }
 

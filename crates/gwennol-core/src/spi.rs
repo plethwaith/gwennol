@@ -274,6 +274,7 @@ mod tests {
             accepts["input"],
             json!({"type": "object", "additionalProperties": false, "properties": {}})
         );
+        assert_eq!(accepts["output"]["type"], "object");
         assert_eq!(accepts["output"]["additionalProperties"], true);
         assert_eq!(
             accepts["output"]["properties"]["images"]["oneOf"],
