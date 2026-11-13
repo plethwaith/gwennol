@@ -405,10 +405,10 @@ pub struct SessionConfig {
     /// under `{}`. Applies to the actions the loop dispatches, and to
     /// [`provider_accepts`]: Gwead hands a caller's config through to
     /// the actions it invokes, so a plugin that invokes another runs it
-    /// under its own config. The
-    /// bundled plugins invoke only themselves; re-keying config per
-    /// callee is a dispatch-orchestrator concern that arrives with
-    /// installable plugins.
+    /// under its own config. The bundled plugins invoke only
+    /// themselves; re-keying config per callee is a
+    /// dispatch-orchestrator concern that arrives with installable
+    /// plugins.
     pub plugin_configs: BTreeMap<String, Value>,
     /// Most provider calls one turn may make before it is abandoned.
     pub max_rounds: u32,
@@ -1209,19 +1209,19 @@ impl Cut {
 /// [`KernelError::Cancelled`] — a step that stopped on its token,
 /// or the kernel's own between-step check — or a step's structured
 /// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a
-/// reason to treat a turn as cancelled: the caller's token, a turn's
-/// or the one [`provider_accepts`] is given, is the authority. Without it, the structured code can come from any
-/// step that sends it, the kernel's action ceiling stopping a step that
-/// had not begun among them: that arrives as the code when the step unwinds
-/// within the kernel's drop grace (100 ms past the deadline in gwead
-/// 0.3.0) and as [`KernelError::ExecutionTimeout`] otherwise. The
-/// ceiling never produces the typed shape — its
-/// watchdog reports a step it stopped as the timeout — so without
-/// the caller's token that shape can only come from a step that
-/// reports cancellation on a token that has not fired, which the
-/// kernel warns about and reports as cancelled all the same,
-/// directly or through a callee. No step in this repo does, and a
-/// guest cannot.
+/// reason to treat a turn as cancelled: the caller's token, a turn's or
+/// the one [`provider_accepts`] is given, is the authority. Without it,
+/// the structured code can come from any step that sends it, the
+/// kernel's action ceiling stopping a step that had not begun among
+/// them: that arrives as the code when the step unwinds within the
+/// kernel's drop grace (100 ms past the deadline in gwead 0.3.0) and as
+/// [`KernelError::ExecutionTimeout`] otherwise. The ceiling never
+/// produces the typed shape — its watchdog reports a step it stopped as
+/// the timeout — so without the caller's token that shape can only come
+/// from a step that reports cancellation on a token that has not fired,
+/// which the kernel warns about and reports as cancelled all the same,
+/// directly or through a callee. No step in this repo does, and a guest
+/// cannot.
 fn reports_cancellation(e: &KernelError) -> bool {
     match e {
         KernelError::Cancelled { .. } => true,

@@ -241,11 +241,11 @@ contract violation.
 The action is optional, and Gwead's registration check does not look for
 it: a provider without it reads as one that does not say. The loop never
 asks; `gwennol_core::provider_accepts` asks the provider a session config
-resolves to, under that config's `$config` and context, for an embedder
-to call when the config changes. The answer binds nothing: a turn the
-provider cannot serve still answers with the failed form. The bundled
-provider declares inline images in every format the contract names, from
-its manifest, without reading the configured model.
+resolves to, under the `$config` that config gives the provider, and its
+context, for an embedder to call when the config changes. The answer binds
+nothing: a turn the provider cannot serve still answers with the failed
+form. The bundled provider declares inline images in every format the
+contract names, from its manifest, without reading the configured model.
 
 ## `TOOL`
 
