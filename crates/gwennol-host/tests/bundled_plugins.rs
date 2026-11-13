@@ -1143,6 +1143,44 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
             assert!(!sent, "{t}: not declared, but the vendor was called");
         }
     }
+
+    // Each media type, carried inline: declared means `chat` sends it.
+    let media_types: Vec<String> = contract["$defs"]["ImageMediaType"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    let declared = f
+        .kernel
+        .execute(PROVIDER, spi::llm_chat::ACCEPTS, json!({}))
+        .with_config(&config)
+        .run()
+        .await
+        .unwrap()
+        .output["images"]["media_types"]
+        .clone();
+    for t in &media_types {
+        let input = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image", "source":
+                {"type": "base64", "media_type": t, "data": "iVBORw0KGgo="}}
+        ]}]});
+        let route = format!("/agree-media-{}", t.replace('/', "-"));
+        let out = f.raw(&route, input, false).await;
+        let sent = f
+            .requested()
+            .iter()
+            .any(|path| *path == format!("{route}/v1/messages"));
+        let declares = declared.as_array().unwrap().contains(&json!(t));
+        assert_eq!(
+            declares, sent,
+            "{t}: declared {declares}, sent {sent}: {out}"
+        );
+        if declares {
+            assert!(out.get("message").is_some(), "{t}: {out}");
+        }
+    }
 }
 
 /// The vendor saying no is the contract's Failure on both paths — data

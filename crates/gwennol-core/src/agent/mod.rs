@@ -11,8 +11,8 @@
 //! [`crate::context`]).
 //!
 //! [`provider_accepts`] asks a provider what input it takes, for a
-//! frontend to decide before a turn; the loop itself never asks. Its
-//! reading rule lives in [`crate::accepts`].
+//! frontend to decide before a turn; the loop itself never asks. The
+//! answer's type and the ways asking can fail are in [`crate::accepts`].
 //!
 //! The loop is the first consumer of both contracts, so it is where
 //! their consumer-side rules are implemented, once:
@@ -471,8 +471,9 @@ impl Default for SessionConfig {
 
 impl SessionConfig {
     /// The `$config` `plugin` runs under: its entry in
-    /// [`Self::plugin_configs`], else `{}`. The one lookup a provider
-    /// round and [`provider_accepts`] both go through.
+    /// [`Self::plugin_configs`], else `{}`. The one lookup every
+    /// dispatch goes through: a provider round, [`provider_accepts`], and
+    /// a tool call.
     fn plugin_config_for(&self, plugin: &str) -> &Value {
         static EMPTY: OnceLock<Value> = OnceLock::new();
         self.plugin_configs
@@ -507,7 +508,7 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
     }
 }
 
-/// Ask the provider `config` names what input it takes: the `LLM_CHAT`
+/// Ask the provider `config` resolves to what input it takes: the `LLM_CHAT`
 /// `accepts` action, run under that provider's [`SessionConfig::plugin_configs`]
 /// entry and [`SessionConfig::context`], as a turn would run it.
 ///
@@ -522,7 +523,8 @@ pub fn resolve_provider(kernel: &Kernel, named: Option<&str>) -> Result<String, 
 /// [`CONTEXT_KEY`]. A failed step is [`AcceptsError::Cancelled`] when
 /// `cancel` has fired and [`AcceptsError::Step`] otherwise; a provider
 /// without the action runs no step, so it answers unknown whether or not
-/// `cancel` has fired.
+/// `cancel` has fired. An answer the contract does not admit is an
+/// [`AcceptsError`] too.
 pub async fn provider_accepts(
     kernel: &Kernel,
     config: &SessionConfig,
@@ -1207,15 +1209,15 @@ impl Cut {
 /// [`KernelError::Cancelled`] — a step that stopped on its token,
 /// or the kernel's own between-step check — or a step's structured
 /// [`CANCELLED_CODE`](crate::cancel::CANCELLED_CODE). Never on its own a
-/// reason to treat a turn as cancelled: the turn's token is the
-/// authority. Without it, the structured code can come from any step
-/// that sends it, the kernel's action ceiling stopping a step that had
-/// not begun among them: that arrives as the code when the step unwinds
+/// reason to treat a turn as cancelled: the caller's token, a turn's
+/// or the one [`provider_accepts`] is given, is the authority. Without it, the structured code can come from any
+/// step that sends it, the kernel's action ceiling stopping a step that
+/// had not begun among them: that arrives as the code when the step unwinds
 /// within the kernel's drop grace (100 ms past the deadline in gwead
 /// 0.3.0) and as [`KernelError::ExecutionTimeout`] otherwise. The
 /// ceiling never produces the typed shape — its
 /// watchdog reports a step it stopped as the timeout — so without
-/// the turn's token that shape can only come from a step that
+/// the caller's token that shape can only come from a step that
 /// reports cancellation on a token that has not fired, which the
 /// kernel warns about and reports as cancelled all the same,
 /// directly or through a callee. No step in this repo does, and a

@@ -107,14 +107,13 @@ fn plain_provider() -> Value {
     plugin
 }
 
-/// `provider()` whose `accepts` names `{{$input}}` as a source type.
-/// Gwead resolves `{{$input}}` to its whole resolution context, where
-/// the input's fields sit at the top level.
+/// `provider()` whose `accepts` names `{{$input.messages}}` as a source
+/// type, which echoes the `messages` field of the action's input.
 fn echoing_provider() -> Value {
     let mut plugin = provider();
     plugin["name"] = json!("embed_llm_echo");
     plugin["actions"]["accepts"] = json!({"steps": [
-        {"id": "a", "type": "return", "params": {"value": {"images": {"media_types": ["image/png"], "sources": ["base64", "{{$input}}"]}}}}
+        {"id": "a", "type": "return", "params": {"value": {"images": {"media_types": ["image/png"], "sources": ["base64", "{{$input.messages}}"]}}}}
     ]});
     plugin
 }
@@ -1182,6 +1181,24 @@ async fn an_unnamed_provider_runs_under_its_resolved_names_config() {
     assert_eq!(answer.images, Support::No);
 }
 
+/// `Support` is `#[non_exhaustive]`: a caller outside the crate must
+/// keep a wildcard arm, so that a later variant is not a breaking change.
+/// With the attribute gone the wildcard below is unreachable and this
+/// file does not compile.
+#[test]
+fn a_caller_keeps_a_wildcard_arm_for_a_later_support_variant() {
+    #[deny(unreachable_patterns)]
+    fn read(answer: &Support<()>) -> &'static str {
+        match answer {
+            Support::Unknown => "unknown",
+            Support::No => "no",
+            Support::Yes(()) => "yes",
+            _ => "a variant this caller does not know",
+        }
+    }
+    assert_eq!(read(&Support::No), "no");
+}
+
 #[tokio::test]
 async fn an_accepts_query_sends_an_empty_input() {
     let (kernel, _seen) = kernel(vec![echoing_provider()]);
@@ -1194,7 +1211,7 @@ async fn an_accepts_query_sends_an_empty_input() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "provider output violates the LLM_CHAT contract: `images` names a source type the contract does not: {\"config\":{},\"secrets\":{},\"steps\":{},\"vars\":{}}"
+        "provider output violates the LLM_CHAT contract: `images` names a source type the contract does not: \"\""
     );
 }
 

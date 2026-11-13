@@ -78,10 +78,10 @@ schema lists the fields and the media types. The consumer never
 interprets a reference: it stores and replays it, and resolving it is the
 provider's. A provider that cannot resolve a reference, or cannot take an
 image, answers with a `Failure`. A provider can also say beforehand, through
-`accepts`, which image formats and source types it takes.
-The loop builds the inline block from an
-`Image`, whose format it reads from the bytes, and the reference block
-from an `ImageReference`, whose format the caller declares;
+`accepts`, which image formats and source types it takes, or that it takes
+none. The loop builds the inline block from an `Image`, whose format it
+reads from the bytes, and the reference block from an `ImageReference`,
+whose format the caller declares;
 `SessionConfig::max_image_bytes` measures images, not references, and
 `Session::turn_with` refuses an image over it before storing anything.
 Limits on dimensions and count are the vendor's.
@@ -241,11 +241,11 @@ contract violation.
 The action is optional, and Gwead's registration check does not look for
 it: a provider without it reads as one that does not say. The loop never
 asks; `gwennol_core::provider_accepts` asks the provider a session config
-names, under that config's `$config` and context, for an embedder to call
-when the config changes. The answer binds nothing: a turn the provider
-cannot serve still answers with the failed form. The bundled provider
-declares inline images in every format the contract names, from its
-manifest, without reading the configured model.
+resolves to, under that config's `$config` and context, for an embedder
+to call when the config changes. The answer binds nothing: a turn the
+provider cannot serve still answers with the failed form. The bundled
+provider declares inline images in every format the contract names, from
+its manifest, without reading the configured model.
 
 ## `TOOL`
 

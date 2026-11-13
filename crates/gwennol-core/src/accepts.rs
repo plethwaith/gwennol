@@ -23,6 +23,7 @@ pub struct Accepts {
 
 /// A provider's answer about one kind of input.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Support<T> {
     /// The provider does not say: it has no `accepts` action, or its
     /// answer has no key for this kind of input.
