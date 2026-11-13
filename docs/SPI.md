@@ -26,9 +26,10 @@ and the check is action presence: a plugin claiming `LLM_CHAT` without a
   Whoever dispatches is responsible for conformance — concretely, the
   agent loop (`gwennol_core::agent`) validates model-emitted tool
   arguments against the tool's declared schema before dispatching the
-  tool's action, and reads everything a provider returns fail-closed, apart from the objects
-  the contract leaves open (`usage`, the `accepts` answer), whose unknown keys
-  it ignores.
+  tool's action, and reads everything a provider returns fail-closed, apart
+  from the objects the contract leaves open (`usage`, and the `accepts`
+  answer that `gwennol_core::provider_accepts` reads), whose unknown keys it
+  ignores.
 
 ## `LLM_CHAT`
 
