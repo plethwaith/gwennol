@@ -107,8 +107,9 @@ fn plain_provider() -> Value {
     plugin
 }
 
-/// `provider()` whose `accepts` answers with the input it was handed
-/// as a source type.
+/// `provider()` whose `accepts` names `{{$input}}` as a source type.
+/// Gwead resolves `{{$input}}` to its whole resolution context, where
+/// the input's fields sit at the top level.
 fn echoing_provider() -> Value {
     let mut plugin = provider();
     plugin["name"] = json!("embed_llm_echo");
