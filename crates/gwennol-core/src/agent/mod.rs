@@ -47,8 +47,7 @@
 //!   reports `is_error` is answered with that; a tool that *cannot* answer —
 //!   the model named a tool that does not exist, sent arguments the
 //!   schema refuses, or the call failed as a step (the step refused it,
-//!   the kernel refused, the plugin returned a malformed result, or an
-//!   inline image larger than [`SessionConfig::max_image_bytes`]) — is
+//!   the kernel refused, or the plugin returned a malformed result) — is
 //!   answered with an `is_error` result carrying the reason verbatim,
 //!   and the frontend is told which case it was ([`Event::ToolFailed`]
 //!   against [`Event::ToolResult`]). The loop branches on none of that
