@@ -1,5 +1,5 @@
-//! What a user turn can carry: text, images, and references to images the
-//! provider resolves.
+//! What a user turn, and a tool's result, can carry: text, images, and
+//! references to images the provider resolves.
 //!
 //! [`Session::turn_with`](crate::Session::turn_with) takes a list of
 //! [`UserContent`] and stores it as one run of blocks, in the order given.
@@ -7,6 +7,9 @@
 //! from how the bytes start, so a caller never labels one. An
 //! [`ImageReference`] is the exception: there are no bytes to read a
 //! format from, so the caller declares it.
+//!
+//! A tool's result is a [`ToolContent`]: text alone, or a list of the same
+//! items.
 
 use std::fmt;
 
@@ -14,7 +17,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use gwead::serde_json::{Value, json};
 
-/// One item of a user turn, in the position the user gave it.
+/// One item of a user turn or of a tool's result, in the position it was
+/// given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UserContent {
@@ -49,6 +53,28 @@ impl UserContent {
                     "reference": image.reference,
                 },
             }),
+        }
+    }
+}
+
+/// What a tool's result carries, as the model gets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolContent {
+    /// Text alone: the contract's string form.
+    Text(String),
+    /// Text, images and image references, in order: the contract's list
+    /// form.
+    Blocks(Vec<UserContent>),
+}
+
+impl ToolContent {
+    /// The `content` of a `tool_result` block: the string, or the list of
+    /// each item's block.
+    pub(crate) fn value(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Blocks(items) => Value::Array(items.iter().map(UserContent::block).collect()),
         }
     }
 }
@@ -104,6 +130,14 @@ impl ImageFormat {
             Self::Gif => "image/gif",
             Self::Webp => "image/webp",
         }
+    }
+
+    /// The format whose media type is `media_type`, if the contract names one.
+    pub(crate) fn from_media_type(media_type: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.media_type() == media_type)
     }
 
     /// The format a file's first bytes claim, if any.
@@ -168,8 +202,8 @@ impl fmt::Debug for Image {
     }
 }
 
-/// An image the provider resolves from `reference`, a string the embedder
-/// chose (a path, a storage key).
+/// An image the provider resolves from `reference`, a string (a path,
+/// a storage key).
 ///
 /// The loop stores the reference and never interprets it. The format is the
 /// caller's declaration, not checked against anything.
@@ -312,6 +346,27 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_content_is_the_contract_value() {
+        assert_eq!(ToolContent::Text("a".into()).value(), json!("a"));
+        let png = Image::new(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let blocks = ToolContent::Blocks(vec![
+            UserContent::Text("a".into()),
+            UserContent::Image(png),
+            UserContent::ImageReference(ImageReference::new(ImageFormat::Jpeg, "k").unwrap()),
+        ]);
+        assert_eq!(
+            blocks.value(),
+            json!([
+                {"type": "text", "text": "a"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                {"type": "image", "source": {
+                    "type": "reference", "media_type": "image/jpeg", "reference": "k"}},
+            ])
+        );
+    }
+
+    #[test]
     fn debug_output_never_carries_image_bytes() {
         let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         bytes.resize(1 << 20, 0x41);
@@ -322,7 +377,21 @@ mod tests {
             shown.contains("Png") && shown.contains("1048576"),
             "{shown}"
         );
-        let shown = format!("{:?}", UserContent::Image(image));
+        let shown = format!("{:?}", UserContent::Image(image.clone()));
+        assert!(shown.len() < 200, "{shown}");
+        assert!(shown.contains("Png"), "{shown}");
+        let shown = format!(
+            "{:?}",
+            crate::events::Event::ToolResult {
+                call: crate::events::ToolCall {
+                    id: Some("c1".into()),
+                    name: "img".into(),
+                    arguments: "{}".into(),
+                },
+                content: ToolContent::Blocks(vec![UserContent::Image(image)]),
+                is_error: false,
+            }
+        );
         assert!(shown.len() < 200, "{shown}");
         assert!(shown.contains("Png"), "{shown}");
         let shown = format!(

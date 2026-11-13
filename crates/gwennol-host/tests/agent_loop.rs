@@ -30,7 +30,7 @@ use gwead::serde_json::{Value, json};
 use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::{
     Event, EventSink, Image, ImageFormat, ImageReference, Session, SessionConfig, SessionError,
-    StopReason, ToolCall, TurnError, TurnOutcome, spi,
+    StopReason, ToolCall, ToolContent, TurnError, TurnOutcome, spi,
 };
 use gwennol_host::steps::http::DEFAULT_IDLE_TIMEOUT_MS;
 use gwennol_host::{Access, ApprovalRequest, Decision, Operator, OperatorEvents, Turn};
@@ -410,6 +410,16 @@ fn fixture_plugins() -> Vec<Value> {
             ret(json!({"content": "abc", "is_error": false, "truncated": true})),
         ),
         tool_plugin("fixture_broken", "broken", &[], ret(json!({"nope": 1}))),
+        tool_plugin(
+            "fixture_image",
+            "image",
+            &[],
+            ret(json!({"content": [
+                {"type": "text", "text": "a screenshot"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]})),
+        ),
         // Throws the host's cancellation code without any cancellation:
         // throw_error is an intrinsic every plugin may use.
         tool_plugin(
@@ -792,13 +802,13 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
             Event::ToolCall(hi.clone()),
             Event::ToolResult {
                 call: hi,
-                content: "echo: hi".into(),
+                content: ToolContent::Text("echo: hi".into()),
                 is_error: false
             },
             Event::ToolCall(again.clone()),
             Event::ToolResult {
                 call: again,
-                content: "echo: again".into(),
+                content: ToolContent::Text("echo: again".into()),
                 is_error: false
             },
             Event::Text("result: echo: hi (error: false)".into()),
@@ -850,6 +860,7 @@ async fn a_multi_turn_conversation_with_tool_calls_runs_end_to_end() {
             "fail",
             "forger",
             "gated",
+            "image",
             "read_file",
             "slow"
         ],
@@ -895,7 +906,7 @@ async fn the_buffered_form_runs_the_same_loop() {
             Event::ToolCall(c1.clone()),
             Event::ToolResult {
                 call: c1,
-                content: "echo: buffered".into(),
+                content: ToolContent::Text("echo: buffered".into()),
                 is_error: false
             },
             Event::Text("done".into()),
@@ -938,6 +949,30 @@ async fn what_a_turn_with_an_image_stores_conforms_to_the_contract() {
     assert_eq!(
         s.transcript()[0]["content"][2]["source"]["type"],
         "reference"
+    );
+    assert_conforms(contracts().chat_input, &s.chat_input());
+}
+
+/// What a tool's image result stores is the contract's user message: the
+/// list is held to the schema, not to the loop's own idea of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_tool_result_image_stores_conforms_to_the_contract() {
+    let mut s = canned(vec![
+        json!({
+            "message": {"role": "assistant", "content": [call("c1", "image", json!({}))]},
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+        json!({
+            "message": {"role": "assistant", "content": [text("seen")]},
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    ]);
+    turn(&mut s, "look").await.unwrap();
+    assert_eq!(
+        s.transcript()[2]["content"][0]["content"][1]["type"],
+        "image"
     );
     assert_conforms(contracts().chat_input, &s.chat_input());
 }
@@ -1059,7 +1094,7 @@ async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     let c1 = tool_call("c1", "fail", json!({}));
     assert!(events.contains(&Event::ToolResult {
         call: c1,
-        content: "boom".into(),
+        content: ToolContent::Text("boom".into()),
         is_error: true
     }));
     assert_eq!(
@@ -1074,7 +1109,7 @@ async fn a_failing_tool_and_a_cut_result_are_reported_to_the_model() {
     let rendered = format!("abc\n{}", spi::tool::TRUNCATED_MARKER);
     assert!(events.contains(&Event::ToolResult {
         call: tool_call("c1", "cut", json!({})),
-        content: rendered.clone(),
+        content: ToolContent::Text(rendered.clone()),
         is_error: false
     }));
     assert_eq!(s.transcript()[2]["content"][0]["content"], rendered);

@@ -125,7 +125,7 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
 
-    use gwennol_core::ToolCall;
+    use gwennol_core::{ToolCall, ToolContent};
 
     use super::*;
 
@@ -171,7 +171,7 @@ mod tests {
         );
         verbose.emit(Event::ToolResult {
             call: call(),
-            content: content.clone(),
+            content: ToolContent::Text(content.clone()),
             is_error: false,
         });
         let whole = last_text(&shared);
@@ -199,7 +199,7 @@ mod tests {
         );
         quiet.emit(Event::ToolResult {
             call: call(),
-            content,
+            content: ToolContent::Text(content),
             is_error: false,
         });
         let preview = last_text(&shared0);

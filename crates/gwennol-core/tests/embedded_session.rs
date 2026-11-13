@@ -22,8 +22,8 @@ use gwead::tokio_util::sync::CancellationToken;
 use gwennol_core::spi::HarvestError;
 use gwennol_core::{
     AcceptsError, ContentError, Event, EventSink, Image, ImageFormat, ImageReference, ImageSource,
-    RetryPolicy, Session, SessionConfig, SessionError, StopReason, Support, ToolCall, TurnError,
-    UserContent, provider_accepts, spi,
+    RetryPolicy, Session, SessionConfig, SessionError, StopReason, Support, ToolCall, ToolContent,
+    TurnError, UserContent, provider_accepts, spi,
 };
 
 const PROVIDER: &str = "embed_llm";
@@ -71,6 +71,39 @@ fn tool(plugin: &str, name: &str) -> Value {
                 "content": "ok", "is_error": false}}}]
         }}
     })
+}
+
+/// `tool("tool_img", "img")` whose result is `$config.result`, so a test
+/// sets what the tool returns through `plugin_configs["tool_img"]`.
+fn image_tool() -> Value {
+    let mut plugin = tool("tool_img", "img");
+    plugin["actions"]["call"]["steps"] = json!([
+        {"id": "out", "type": "return", "params": {"value": "{{$config.result}}"}}
+    ]);
+    plugin
+}
+
+/// `config("img")` with the tool's result set to `result`.
+fn config_returning(result: Value) -> SessionConfig {
+    let mut config = config("img");
+    config
+        .plugin_configs
+        .insert("tool_img".into(), json!({"result": result}));
+    config
+}
+
+fn text_block(text: &str) -> Value {
+    json!({"type": "text", "text": text})
+}
+
+fn inline_block(data: &str) -> Value {
+    json!({"type": "image", "source": {
+        "type": "base64", "media_type": "image/png", "data": data}})
+}
+
+fn reference_block(media_type: &str, reference: &str) -> Value {
+    json!({"type": "image", "source": {
+        "type": "reference", "media_type": media_type, "reference": reference}})
 }
 
 /// A `tool` block on a `call` action of a plugin that never claimed the
@@ -248,7 +281,7 @@ async fn a_sink_session_receives_its_events_in_order() {
             Event::ToolCall(call.clone()),
             Event::ToolResult {
                 call,
-                content: "ok".into(),
+                content: ToolContent::Text("ok".into()),
                 is_error: false
             },
             Event::Text("done".into()),
@@ -565,7 +598,7 @@ async fn a_tool_runs_the_action_that_declared_it() {
             Event::ToolCall(call.clone()),
             Event::ToolResult {
                 call,
-                content: "from second".into(),
+                content: ToolContent::Text("from second".into()),
                 is_error: false
             },
             Event::Text("done".into()),
@@ -588,7 +621,7 @@ async fn a_tool_plugin_needs_no_call_action() {
     assert!(
         sink.0.lock().unwrap().iter().any(|e| matches!(
             e,
-            Event::ToolResult { content, is_error: false, .. } if content == "found"
+            Event::ToolResult { content, is_error: false, .. } if *content == ToolContent::Text("found".into())
         )),
         "{:?}",
         sink.0.lock().unwrap()
@@ -1274,4 +1307,187 @@ async fn a_failed_or_cancelled_accepts_is_an_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, AcceptsError::Cancelled), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_tool_returns_text_and_images_in_order() {
+    let blocks = json!([
+        text_block("shot"),
+        inline_block("iVBORw0KGgo="),
+        reference_block("image/jpeg", "store/42")
+    ]);
+    let items = vec![
+        UserContent::Text("shot".into()),
+        UserContent::Image(png(8)),
+        UserContent::ImageReference(ImageReference::new(ImageFormat::Jpeg, "store/42").unwrap()),
+    ];
+    let expected = ToolContent::Blocks(items.clone());
+    let (kernel, _) = kernel(vec![image_tool()]);
+    let sink = Arc::new(Recorder::default());
+    let mut s = Session::new(
+        kernel.clone(),
+        config_returning(json!({"content": blocks})),
+        sink.clone(),
+    )
+    .unwrap();
+    s.turn("go", &CancellationToken::new()).await.unwrap();
+    let events = sink.0.lock().unwrap().clone();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::ToolResult { content, is_error: false, .. }
+            if *content == expected)
+        ),
+        "{events:?}"
+    );
+    assert_eq!(s.transcript()[2]["content"][0]["content"], blocks);
+    assert_eq!(s.transcript()[2]["content"][0]["is_error"], false);
+    s.restore(s.transcript().to_vec()).unwrap();
+
+    let sink = Arc::new(Recorder::default());
+    let mut s = Session::new(
+        kernel,
+        config_returning(json!({"content": blocks, "is_error": true, "truncated": true})),
+        sink.clone(),
+    )
+    .unwrap();
+    s.turn("go", &CancellationToken::new()).await.unwrap();
+    let mut cut = items.clone();
+    cut.push(UserContent::Text(spi::tool::TRUNCATED_MARKER.into()));
+    let events = sink.0.lock().unwrap().clone();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::ToolResult { content, is_error: true, .. }
+            if *content == ToolContent::Blocks(cut.clone()))
+        ),
+        "{events:?}"
+    );
+    let mut stored = blocks.as_array().unwrap().clone();
+    stored.push(text_block(spi::tool::TRUNCATED_MARKER));
+    assert_eq!(s.transcript()[2]["content"][0]["content"], json!(stored));
+    assert_eq!(s.transcript()[2]["content"][0]["is_error"], true);
+}
+
+#[tokio::test]
+async fn a_tools_image_is_held_to_what_the_loop_can_check() {
+    // (name, the tool's result, max_image_bytes, the error the call is answered with)
+    let failed: Vec<(&str, Value, usize, &str)> = vec![
+        (
+            "over the limit",
+            json!({"content": [inline_block("iVBORw0KGgoA")]}),
+            8,
+            "\"img\" returned an image of 9 bytes at block 0; the session's max_image_bytes is 8",
+        ),
+        (
+            "over the limit, behind a text block",
+            json!({"content": [{"type": "text", "text": "a"}, inline_block("iVBORw0KGgoA")]}),
+            8,
+            "\"img\" returned an image of 9 bytes at block 1; the session's max_image_bytes is 8",
+        ),
+        (
+            "over the limit, second of two images, text last",
+            json!({"content": [
+                inline_block("iVBORw0KGgo="),
+                inline_block("iVBORw0KGgoA"),
+                {"type": "text", "text": "a"},
+            ]}),
+            8,
+            "\"img\" returned an image of 9 bytes at block 1; the session's max_image_bytes is 8",
+        ),
+        (
+            "bytes of another format than declared",
+            json!({"content": [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": "iVBORw0KGgo="}}]}),
+            usize::MAX,
+            "\"img\" returned a malformed result: result block 0: image declares image/jpeg but its bytes are image/png",
+        ),
+        (
+            "an empty list",
+            json!({"content": []}),
+            usize::MAX,
+            "\"img\" returned a malformed result: result `content` is an empty list",
+        ),
+    ];
+    for (name, result, max, error) in failed {
+        let (kernel, _) = kernel(vec![image_tool()]);
+        let sink = Arc::new(Recorder::default());
+        let mut config = config_returning(result);
+        config.max_image_bytes = max;
+        let mut s = Session::new(kernel, config, sink.clone()).unwrap();
+        s.turn("go", &CancellationToken::new()).await.unwrap();
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ToolFailed { error: got, .. } if got == error)),
+            "{name}: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ToolResult { .. })),
+            "{name}: {events:?}"
+        );
+        let stored = &s.transcript()[2]["content"][0];
+        assert_eq!(stored["content"], error, "{name}");
+        assert_eq!(stored["is_error"], true, "{name}");
+    }
+
+    let answered: Vec<(&str, Value, usize)> = vec![
+        (
+            "exactly the limit",
+            json!({"content": [inline_block("iVBORw0KGgo=")]}),
+            8,
+        ),
+        (
+            "a reference, measured by nothing",
+            json!({"content": [reference_block("image/png", "k")]}),
+            0,
+        ),
+    ];
+    for (name, result, max) in answered {
+        let (kernel, _) = kernel(vec![image_tool()]);
+        let sink = Arc::new(Recorder::default());
+        let mut config = config_returning(result);
+        config.max_image_bytes = max;
+        let mut s = Session::new(kernel, config, sink.clone()).unwrap();
+        s.turn("go", &CancellationToken::new()).await.unwrap();
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(e, Event::ToolResult { .. })),
+            "{name}: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ToolFailed { .. })),
+            "{name}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tool_result_image_the_provider_refuses_stays_in_the_transcript() {
+    let (kernel, _) = kernel(vec![image_tool()]);
+    let mut config = config_returning(json!({"content": [reference_block("image/png", "k")]}));
+    let answers = config.plugin_configs[PROVIDER]["answers"]
+        .as_array()
+        .unwrap()
+        .clone();
+    config.plugin_configs.insert(
+        PROVIDER.into(),
+        json!({"answers": [
+            answers[0],
+            {"error": {"message": "no images here", "retryable": false}}
+        ]}),
+    );
+    let mut s = Session::new(kernel, config, Arc::new(Recorder::default())).unwrap();
+    let err = s.turn("go", &CancellationToken::new()).await.unwrap_err();
+    assert!(matches!(err, TurnError::Provider(_)), "{err:?}");
+    assert_eq!(s.transcript().len(), 3);
+    assert_eq!(
+        s.transcript()[2]["content"][0]["content"],
+        json!([reference_block("image/png", "k")])
+    );
+    assert_eq!(s.retract_unanswered(), Vec::<Value>::new());
+    assert_eq!(s.transcript().len(), 3);
+
+    let mut edited = s.transcript().to_vec();
+    edited[2]["content"][0]["content"] = json!("an image was here");
+    s.restore(edited).unwrap();
 }

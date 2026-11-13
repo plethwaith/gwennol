@@ -981,6 +981,43 @@ async fn an_image_block_reaches_the_vendor_request_through_the_bundled_provider(
     }
 }
 
+/// An image block inside a tool's result is in the vendor's request body,
+/// unchanged and in place, on both forms.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_result_image_reaches_the_vendor_request_through_the_bundled_provider() {
+    let f = fixture();
+    let data = "QUJD".repeat(256);
+    let messages = json!([
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "img", "input": {}}
+        ]},
+        {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "c1", "is_error": false,
+            "content": [
+                {"type": "text", "text": "a screenshot"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": data}}
+            ]
+        }]}
+    ]);
+    let input = |stream: bool| json!({"messages": messages.clone(), "stream": stream});
+    f.buffered("/result-image-pin", input(false)).await;
+    f.streamed("/result-image-pin-stream", input(true)).await;
+    for route in ["/result-image-pin", "/result-image-pin-stream"] {
+        let sent: Vec<Value> = f
+            .stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| *p == format!("{route}/v1/messages"))
+            .map(|(_, _, body)| body["messages"].clone())
+            .collect();
+        assert_eq!(sent, vec![messages.clone()], "{route}");
+    }
+}
+
 /// The bundled provider resolves no reference: it declines one as the
 /// contract's Failure on either form, before anything reaches the vendor,
 /// and a loop session reads that as a provider refusal that stays until
@@ -1089,7 +1126,8 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
 }
 
 /// What the bundled provider declares it takes agrees with what `chat`
-/// does, for each source type and each media type the contract names.
+/// does, for each source type and each media type the contract names. Each
+/// source type is tried in both inputs, `at_top` and `in_result`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundled_declaration_agrees_with_what_chat_sends() {
     let f = fixture();
@@ -1121,25 +1159,39 @@ async fn the_bundled_declaration_agrees_with_what_chat_sends() {
             }
             other => panic!("no input builder for source type {other:?}"),
         };
-        let input = json!({"messages": [{"role": "user", "content": [
+        let image = json!({"type": "image", "source": source});
+        // The image at the top of a user message, and inside a tool's result.
+        let at_top = json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "what is this?"},
-            {"type": "image", "source": source}
+            image.clone()
         ]}]});
-        let route = format!("/agree-{t}");
-        let out = f.raw(&route, input, false).await;
-        let sent = f
-            .requested()
-            .iter()
-            .any(|path| *path == format!("{route}/v1/messages"));
-        if declared.as_array().unwrap().contains(&json!(t)) {
-            assert!(out.get("message").is_some(), "{t}: {out}");
-            assert!(sent, "{t}: declared, but nothing reached the vendor");
-        } else {
-            assert_eq!(
-                out["error"]["kind"], "unsupported_image_source",
-                "{t}: {out}"
-            );
-            assert!(!sent, "{t}: not declared, but the vendor was called");
+        let in_result = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "img", "input": {}}
+            ]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "c1",
+                "content": [{"type": "text", "text": "shot"}, image]
+            }]}
+        ]});
+        for (place, input) in [("", at_top), ("result-", in_result)] {
+            let route = format!("/agree-{place}{t}");
+            let out = f.raw(&route, input, false).await;
+            let sent = f
+                .requested()
+                .iter()
+                .any(|path| *path == format!("{route}/v1/messages"));
+            if declared.as_array().unwrap().contains(&json!(t)) {
+                assert!(out.get("message").is_some(), "{place}{t}: {out}");
+                assert!(sent, "{place}{t}: declared, but nothing reached the vendor");
+            } else {
+                assert_eq!(
+                    out["error"]["kind"], "unsupported_image_source",
+                    "{place}{t}: {out}"
+                );
+                assert!(!sent, "{place}{t}: not declared, but the vendor was called");
+            }
         }
     }
 

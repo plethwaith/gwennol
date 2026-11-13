@@ -30,6 +30,8 @@ pub mod llm_chat {
 
 /// The `TOOL` role: a plugin offering tools the model can call.
 pub mod tool {
+    use crate::content::{ToolContent, UserContent};
+
     /// The role name, as used in `roles` and `invoke:role:` permissions.
     pub const ROLE: &str = "TOOL";
     /// The one action the contract names, and it is optional: model-supplied
@@ -43,17 +45,18 @@ pub mod tool {
     /// `plugins/spi/tool.json`; see [`super::llm_chat::DEFINITION`].
     pub const DEFINITION: &str = include_str!("../resources/spi/tool.json");
 
-    /// The one line appended to a truncated result's `content` before
+    /// The marker added to a truncated result's `content` before
     /// the model sees it — the shared truncation convention of
     /// `docs/SPI.md`. Tools report `truncated: true` as data and never
-    /// compose this themselves; [`render_content`] is where it lands.
+    /// compose this themselves; [`render_content`] is where it lands on a
+    /// text result, and on a list it is a text block of its own, last.
     pub const TRUNCATED_MARKER: &str = "[output truncated]";
 
-    /// A tool result's `content` as the model should see it: verbatim,
+    /// A text tool result's `content` as the model should see it: verbatim,
     /// plus [`TRUNCATED_MARKER`] on its own final line when the tool
-    /// reported a cut. The one implementation of the convention — the
-    /// agent loop renders through here, and so do the tests that
-    /// pin the bundled tools to it.
+    /// reported a cut. The one implementation of the convention for text:
+    /// the agent loop renders a text result through here (by `render`),
+    /// and so do the tests that pin the bundled tools to it.
     pub fn render_content(content: &str, truncated: bool) -> String {
         if !truncated {
             return content.to_string();
@@ -65,6 +68,21 @@ pub mod tool {
         }
         rendered.push_str(TRUNCATED_MARKER);
         rendered
+    }
+
+    /// A tool result's content as the model should see it:
+    /// [`render_content`] for text, and for a list the marker as a text
+    /// block of its own after the last block, when the tool reported a cut.
+    pub(crate) fn render(content: ToolContent, truncated: bool) -> ToolContent {
+        match content {
+            ToolContent::Text(text) => ToolContent::Text(render_content(&text, truncated)),
+            ToolContent::Blocks(mut items) => {
+                if truncated {
+                    items.push(UserContent::Text(TRUNCATED_MARKER.to_string()));
+                }
+                ToolContent::Blocks(items)
+            }
+        }
     }
 }
 
@@ -196,7 +214,7 @@ mod tests {
     fn the_result_shape_is_one_definition_and_call_is_optional() {
         let contract: serde_json::Value = serde_json::from_str(tool::DEFINITION).unwrap();
         let actions = contract["actions"].as_object().unwrap();
-        assert_eq!(contract["version"], "0.3.0");
+        assert_eq!(contract["version"], "0.4.0");
         assert_eq!(actions.keys().collect::<Vec<_>>(), ["call"]);
         assert_eq!(contract["actions"]["call"]["optional"], true);
         assert_eq!(
@@ -217,7 +235,7 @@ mod tests {
         use crate::content::ImageFormat;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.6.0");
+        assert_eq!(contract["version"], "0.7.0");
         let defs = &contract["$defs"];
         assert_eq!(
             defs["UserMessage"]["properties"]["content"]["items"]["oneOf"],
@@ -267,7 +285,7 @@ mod tests {
         use crate::accepts::ImageSource;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.6.0");
+        assert_eq!(contract["version"], "0.7.0");
         let accepts = &contract["actions"][llm_chat::ACCEPTS];
         assert_eq!(accepts["optional"], true);
         assert_eq!(
@@ -322,6 +340,85 @@ mod tests {
         assert_eq!(
             HarvestError::NoSuchToolPlugin("x".into()).to_string(),
             "no TOOL plugin named \"x\" offers a tool"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_may_carry_text_and_image_blocks() {
+        use serde_json::{Value, json};
+        let tool: Value = serde_json::from_str(tool::DEFINITION).unwrap();
+        let chat: Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
+        assert_eq!(tool["version"], "0.4.0");
+        assert_eq!(chat["version"], "0.7.0");
+
+        fn without_descriptions(value: &Value) -> Value {
+            match value {
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .filter(|(key, _)| key.as_str() != "description")
+                        .map(|(key, value)| (key.clone(), without_descriptions(value)))
+                        .collect(),
+                ),
+                Value::Array(items) => {
+                    Value::Array(items.iter().map(without_descriptions).collect())
+                }
+                other => other.clone(),
+            }
+        }
+        let one_of = json!({"oneOf": [
+            {"type": "string"},
+            {"type": "array", "minItems": 1, "items": {"oneOf": [
+                {"$ref": "#/$defs/TextBlock"},
+                {"$ref": "#/$defs/ImageBlock"}
+            ]}}
+        ]});
+        assert_eq!(
+            without_descriptions(&tool["$defs"]["Result"]["properties"]["content"]),
+            one_of
+        );
+        assert_eq!(
+            without_descriptions(&chat["$defs"]["ToolResultBlock"]["properties"]["content"]),
+            one_of
+        );
+        for name in [
+            "TextBlock",
+            "ImageBlock",
+            "Base64ImageSource",
+            "ReferenceImageSource",
+            "ImageMediaType",
+        ] {
+            assert!(!tool["$defs"][name].is_null(), "{name} is in TOOL");
+            assert_eq!(
+                without_descriptions(&tool["$defs"][name]),
+                without_descriptions(&chat["$defs"][name]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_result_of_blocks_ends_in_the_marker() {
+        use crate::content::{Image, ToolContent, UserContent};
+        use tool::{TRUNCATED_MARKER, render, render_content};
+        let png = Image::new(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let blocks = || {
+            ToolContent::Blocks(vec![
+                UserContent::Text("a".into()),
+                UserContent::Image(png.clone()),
+            ])
+        };
+        assert_eq!(
+            render(blocks(), true),
+            ToolContent::Blocks(vec![
+                UserContent::Text("a".into()),
+                UserContent::Image(png.clone()),
+                UserContent::Text(TRUNCATED_MARKER.into()),
+            ])
+        );
+        assert_eq!(render(blocks(), false), blocks());
+        assert_eq!(
+            render(ToolContent::Text("cut".into()), true),
+            ToolContent::Text(render_content("cut", true))
         );
     }
 

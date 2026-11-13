@@ -17,7 +17,8 @@ use crate::content::ImageFormat;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Accepts {
-    /// Whether a user message may carry image blocks, and which.
+    /// Whether a message may carry image blocks, in a user message or in a
+    /// tool result, and which.
     pub images: Support<ImageInput>,
 }
 

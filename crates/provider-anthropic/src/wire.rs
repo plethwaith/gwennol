@@ -12,8 +12,10 @@
 //!   confined to `opaque` blocks: this provider's are unwrapped back
 //!   into the vendor blocks they carry, another provider's are dropped
 //!   with a note. A user message's blocks pass through verbatim and in
-//!   place, an `image` block with a `base64` source among them. `chat`
-//!   declines a turn holding an image with any other source before a
+//!   place, an `image` block with a `base64` source among them; so does a
+//!   `tool_result` whose `content` is a list of text and image blocks. `chat`
+//!   declines a turn holding an image with any other source, at the top of a
+//!   message or in a `tool_result`, before a
 //!   request is built ([`unsupported_image_source`]). What else needs
 //!   code is the defaults and the knobs
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
@@ -335,7 +337,8 @@ impl Failure {
 ///
 /// Fail-closed: every source type but `base64` is declined, not sent to
 /// the vendor, so a source this provider cannot send never reaches it.
-/// Nothing is dispatched before this runs.
+/// Nothing is dispatched before this runs. An image in a `tool_result`'s
+/// `content` list is scanned in its place.
 pub fn unsupported_image_source(input: &Value) -> Option<Failure> {
     let messages = input.get("messages")?.as_array()?;
     for (i, message) in messages.iter().enumerate() {
@@ -343,22 +346,28 @@ pub fn unsupported_image_source(input: &Value) -> Option<Failure> {
             continue;
         };
         for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("image") {
-                continue;
-            }
-            let kind = block
-                .get("source")
-                .and_then(|source| source.get("type"))
-                .and_then(Value::as_str);
-            if kind != Some("base64") {
-                let shown = kind.map_or_else(|| "missing".to_string(), |t| format!("{t:?}"));
-                return Some(Failure::new(
-                    format!(
-                        "message {i}: an image block's source type is {shown}; this provider sends only inline (base64) image bytes"
-                    ),
-                    Some(false),
-                    "unsupported_image_source",
-                ));
+            let nested = match block.get("type").and_then(Value::as_str) {
+                Some("tool_result") => block.get("content").and_then(Value::as_array),
+                _ => None,
+            };
+            for image in std::iter::once(block).chain(nested.into_iter().flatten()) {
+                if image.get("type").and_then(Value::as_str) != Some("image") {
+                    continue;
+                }
+                let kind = image
+                    .get("source")
+                    .and_then(|source| source.get("type"))
+                    .and_then(Value::as_str);
+                if kind != Some("base64") {
+                    let shown = kind.map_or_else(|| "missing".to_string(), |t| format!("{t:?}"));
+                    return Some(Failure::new(
+                        format!(
+                            "message {i}: an image block's source type is {shown}; this provider sends only inline (base64) image bytes"
+                        ),
+                        Some(false),
+                        "unsupported_image_source",
+                    ));
+                }
             }
         }
     }
@@ -1203,6 +1212,27 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_of_blocks_reaches_the_request_verbatim() {
+        let input = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "img", "input": {}}
+            ]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "c1", "is_error": false,
+                "content": [
+                    {"type": "text", "text": "shot"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+                ]
+            }]}
+        ]});
+        let r = build_request(&input, &json!({})).unwrap();
+        assert_eq!(r.body["messages"], input["messages"]);
+        assert!(r.dropped.is_empty(), "{:?}", r.dropped);
+    }
+
+    #[test]
     fn only_inline_image_sources_are_sent() {
         let inline = json!({"type": "image", "source": {
             "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
@@ -1265,6 +1295,51 @@ mod tests {
                 .message
                 .starts_with("message 0: an image block's source type is \"url\"; ")
         );
+
+        let result = |content: Value| {
+            user(vec![
+                json!({"type": "tool_result", "tool_use_id": "c1", "content": content}),
+            ])
+        };
+        let nested = json!({"messages": [
+            user(vec![text.clone()]),
+            {"role": "assistant", "content": [text.clone()]},
+            result(json!([text.clone(), reference.clone()])),
+        ]});
+        assert_eq!(
+            unsupported_image_source(&nested),
+            Some(Failure {
+                message: "message 2: an image block's source type is \"reference\"; this provider sends only inline (base64) image bytes".into(),
+                retryable: Some(false),
+                kind: Some("unsupported_image_source".into()),
+            })
+        );
+        let nested_older = json!({"messages": [
+            result(json!([text.clone(), reference.clone()])),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![text.clone()]),
+        ]});
+        assert!(
+            unsupported_image_source(&nested_older)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"reference\"; ")
+        );
+        let nested_then_top = json!({"messages": [
+            result(json!([text.clone(), reference.clone()])),
+            {"role": "assistant", "content": [text.clone()]},
+            user(vec![source(json!({"type": "url"}))]),
+        ]});
+        assert!(
+            unsupported_image_source(&nested_then_top)
+                .unwrap()
+                .message
+                .starts_with("message 0: an image block's source type is \"reference\"; ")
+        );
+        let plain = json!({"messages": [result(json!("text only"))]});
+        assert_eq!(unsupported_image_source(&plain), None);
+        let inline_result = json!({"messages": [result(json!([text.clone(), inline.clone()]))]});
+        assert_eq!(unsupported_image_source(&inline_result), None);
     }
 
     #[test]
