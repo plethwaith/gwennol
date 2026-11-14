@@ -104,8 +104,8 @@ tool descriptor on the wire: `input_schema` is the implementing action's
 
 `temperature` is a number of at least 0, in the provider's own scale, since
 vendors differ on the range. Absent means the provider's default. A
-provider that knows the field and cannot honour the value answers the
-failed form (below); it never drops the value.
+provider that knows the field and cannot honour the value answers
+with a `Failure`; it never drops the value.
 
 `response_schema` is a JSON Schema. When the answer's `stop_reason` is
 `end_turn`, the text of its text blocks, joined in order, is one JSON
@@ -114,8 +114,8 @@ streamed, the document arrives as `text` events, and `opaque` and
 `tool_use` blocks are as without a schema. A `max_tokens` or `refusal`
 stop carries no such guarantee. A provider that takes response schemas at
 all takes every schema within the floor below, and may refuse anything
-beyond it, or a schema beside a non-empty `tools`, with the failed form. A
-provider that takes none refuses every schema with the failed form. Neither
+beyond it, or a schema beside a non-empty `tools`, with a `Failure`. A
+provider that takes none refuses every schema with a `Failure`. Neither
 answers unconstrained text in its place. Nothing checks the document
 against the schema: the provider's guarantee is generation, and Gwead
 validates no payloads.

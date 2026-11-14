@@ -650,7 +650,8 @@ impl Session {
     /// Start a session on a booted kernel — the `Arc` from
     /// [`Kernel::into_arc`], with the SPI contracts, the provider and
     /// the tools registered — that sends its events to `events`.
-    /// Resolves the provider, harvests the tools and compiles their
+    /// Checks [`SessionConfig::context`] and [`SessionConfig::temperature`],
+    /// resolves the provider, harvests the tools and compiles their
     /// schemas; each can refuse, see [`SessionError`].
     ///
     /// The session reads no process-global state. Several sessions can

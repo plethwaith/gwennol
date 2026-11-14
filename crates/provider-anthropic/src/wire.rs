@@ -21,7 +21,8 @@
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
 //!   exclusions"). The input's `temperature` and `response_schema` travel
 //!   as the vendor's `temperature` and `output_config.format`, and the
-//!   vendor judges them: nothing here declines either.
+//!   vendor judges them, except that `build_request` refuses a
+//!   `response_schema` beside `extra.stop_sequences`.
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
 //!   `Failure` the contract's buffered failed form (since `LLM_CHAT` 0.2.0)
@@ -191,7 +192,8 @@ pub fn messages_url(config: &Value) -> Result<String, String> {
 /// sampling knobs and vendor features the contract does not carry. A
 /// `chat` input's `temperature` beats `extra.temperature`, and its
 /// `response_schema` travels as `output_config.format`, merged into
-/// `extra.output_config`.
+/// `extra.output_config`; a schema beside `extra.stop_sequences` is an
+/// error, because `map_stop_reason` reports a stop sequence as `end_turn`.
 pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     let (messages, dropped) = match input.get("messages") {
         Some(Value::Array(m)) if !m.is_empty() => replay_messages(m),
@@ -280,6 +282,19 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     match input.get("response_schema") {
         None | Some(Value::Null) => {}
         Some(schema @ Value::Object(_)) => {
+            // A stop sequence ends generation wherever it appears, and
+            // `map_stop_reason` reports that stop as `end_turn`, which under
+            // a schema means one conforming document. Refuse the pair.
+            if config
+                .get("extra")
+                .and_then(|e| e.get("stop_sequences"))
+                .is_some()
+            {
+                return Err(
+                    "config.extra.stop_sequences cannot be set beside a chat input `response_schema`"
+                        .into(),
+                );
+            }
             let mut output_config = match config.get("extra").and_then(|e| e.get("output_config")) {
                 None => Map::new(),
                 Some(Value::Object(o)) => o.clone(),
@@ -1048,12 +1063,23 @@ mod tests {
             build_request(&with("response_schema", floor_schema()), &low).unwrap_err(),
             "config.extra.output_config must be an object, got \"low\""
         );
-        for k in ["temperature", "response_schema"] {
+        for (k, sent) in [
+            ("temperature", "temperature"),
+            ("response_schema", "output_config"),
+        ] {
             let r = build_request(&with(k, Value::Null), &none).unwrap();
-            assert!(r.body.get(k).is_none(), "{k}: null sends nothing");
+            assert!(r.body.get(sent).is_none(), "{k}: null sends no `{sent}`");
         }
         let r = build_request(&input(false), &low).unwrap();
         assert_eq!(r.body["output_config"], "low");
+
+        let stops = json!({"extra": {"stop_sequences": ["END"]}});
+        assert_eq!(
+            build_request(&with("response_schema", floor_schema()), &stops).unwrap_err(),
+            "config.extra.stop_sequences cannot be set beside a chat input `response_schema`"
+        );
+        let r = build_request(&input(false), &stops).unwrap();
+        assert_eq!(r.body["stop_sequences"], json!(["END"]));
     }
 
     #[test]

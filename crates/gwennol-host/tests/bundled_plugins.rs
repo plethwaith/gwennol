@@ -1195,6 +1195,18 @@ async fn the_bundled_schema_declaration_agrees_with_what_chat_sends() {
     if declared {
         assert!(out.get("message").is_some(), "{out}");
         assert!(sent, "declared, but nothing reached the vendor");
+        let bodies: Vec<Value> = f
+            .stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path == "/schema-agree/v1/messages")
+            .map(|(_, _, body)| body.clone())
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["output_config"]["format"]["type"], "json_schema");
+        assert!(!bodies[0]["tools"].as_array().unwrap().is_empty());
     } else {
         assert!(out.get("error").is_some(), "{out}");
         assert!(!sent, "not declared, but the vendor was called");

@@ -35,11 +35,11 @@
           "temperature": {
             "type": "number",
             "minimum": 0,
-            "description": "Sampling temperature, in the provider's own scale: vendors differ on the range. Optional; absent means the provider's default. A provider that cannot honour the value answers with the failed form and never drops it. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
+            "description": "Sampling temperature, in the provider's own scale: vendors differ on the range. Optional; absent means the provider's default. A provider that cannot honour the value answers with a `Failure` and never drops it. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
           },
           "response_schema": {
             "type": "object",
-            "description": "A JSON Schema the answer is generated to. When `stop_reason` is `end_turn`, the text of the answer's text blocks, joined in order, is one JSON document conforming to it; other blocks are as without it, and a `max_tokens` or `refusal` stop carries no such guarantee. The output shapes do not change: streamed, the document arrives as `text` events. A provider that takes response schemas at all takes every schema within the floor docs/SPI.md names, and may refuse anything beyond it, or this field beside a non-empty `tools`, with the failed form; one that takes none refuses every schema with the failed form. Neither answers unconstrained text in its place. Nothing checks the document against the schema. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
+            "description": "A JSON Schema the answer is generated to. When `stop_reason` is `end_turn`, the text of the answer's text blocks, joined in order, is one JSON document conforming to it; other blocks are as without it, and a `max_tokens` or `refusal` stop carries no such guarantee. The output shapes do not change: streamed, the document arrives as `text` events. A provider that takes response schemas at all takes every schema within the floor docs/SPI.md names, and may refuse anything beyond it, or this field beside a non-empty `tools`, with a `Failure`; one that takes none refuses every schema with a `Failure`. Neither answers unconstrained text in its place. Nothing checks the document against the schema. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
           },
           "stream": {
             "type": "boolean",

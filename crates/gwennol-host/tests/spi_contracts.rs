@@ -345,7 +345,7 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
-    // The sampling fields of a chat input.
+    // The `temperature` and `response_schema` fields of a chat input.
     let with = |key: &str, value: Value| {
         let mut input = json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "go"}
@@ -482,8 +482,7 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
-    // The `accepts` input is closed and empty; its output is open. Each
-    // fault below but the first changes one field of the valid `images`.
+    // The `accepts` input is closed and empty; its output is open.
     assert_conforms(c.accepts_input, &json!({}));
     assert!(
         c.schemas
@@ -521,6 +520,7 @@ fn the_conformance_harness_rejects_violating_payloads() {
             "accepts output admitted {fault}: {bad}"
         );
     }
+    // Each fault below but the first changes one field of the valid `images`.
     let mut no_sources = valid_images.clone();
     no_sources.as_object_mut().unwrap().remove("sources");
     let mut empty_types = valid_images.clone();

@@ -1080,6 +1080,7 @@ async fn a_sessions_temperature_reaches_every_round() {
     )
     .unwrap();
     assert_eq!(turn(&mut with, "go").await.unwrap().rounds, 2);
+    assert_eq!(with.chat_input()["temperature"], 0.25);
     let sent = f.stub.requests_for("/temperature");
     assert_eq!(sent.len(), 2);
     for (round, input) in sent.iter().enumerate() {
@@ -1088,6 +1089,7 @@ async fn a_sessions_temperature_reaches_every_round() {
 
     let mut without = session("/temperature-none");
     assert_eq!(turn(&mut without, "go").await.unwrap().rounds, 2);
+    assert!(without.chat_input().get("temperature").is_none());
     let sent = f.stub.requests_for("/temperature-none");
     assert_eq!(sent.len(), 2);
     for input in &sent {
