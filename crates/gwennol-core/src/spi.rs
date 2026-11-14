@@ -21,6 +21,12 @@ pub mod llm_chat {
     /// The optional action: what the provider takes under its `$config`.
     /// A provider may omit it.
     pub const ACCEPTS: &str = "accepts";
+    /// An optional `chat` input field: the sampling temperature, in the
+    /// provider's own scale.
+    pub const TEMPERATURE: &str = "temperature";
+    /// An optional `chat` input field: a JSON Schema the answer is
+    /// generated to.
+    pub const RESPONSE_SCHEMA: &str = "response_schema";
     /// The contract document, as shipped. The canonical file is
     /// `plugins/spi/llm_chat.json`; this embeds the crate's byte-identical
     /// copy (`cargo package` cannot reach outside the crate), pinned equal
@@ -235,7 +241,7 @@ mod tests {
         use crate::content::ImageFormat;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.7.0");
+        assert_eq!(contract["version"], "0.8.0");
         let defs = &contract["$defs"];
         assert_eq!(
             defs["UserMessage"]["properties"]["content"]["items"]["oneOf"],
@@ -285,7 +291,7 @@ mod tests {
         use crate::accepts::ImageSource;
         use serde_json::json;
         let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
-        assert_eq!(contract["version"], "0.7.0");
+        assert_eq!(contract["version"], "0.8.0");
         let accepts = &contract["actions"][llm_chat::ACCEPTS];
         assert_eq!(accepts["optional"], true);
         assert_eq!(
@@ -332,6 +338,52 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_may_ask_for_a_temperature_and_a_response_schema() {
+        use serde_json::json;
+        let contract: serde_json::Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
+        assert_eq!(contract["version"], "0.8.0");
+        let input = &contract["actions"][llm_chat::CHAT]["input"];
+        assert_eq!(input["additionalProperties"], false);
+        let temperature = &input["properties"][llm_chat::TEMPERATURE];
+        assert_eq!(temperature["type"], "number");
+        assert_eq!(temperature["minimum"], 0);
+        assert_eq!(
+            input["properties"][llm_chat::RESPONSE_SCHEMA]["type"],
+            "object"
+        );
+        assert!(
+            !input["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == llm_chat::TEMPERATURE || r == llm_chat::RESPONSE_SCHEMA),
+            "both fields are optional"
+        );
+
+        let accepts = &contract["actions"][llm_chat::ACCEPTS]["output"]["properties"];
+        assert_eq!(
+            accepts[llm_chat::TEMPERATURE]["oneOf"],
+            json!([{"const": false}, {"$ref": "#/$defs/TemperatureInput"}])
+        );
+        assert_eq!(
+            accepts[llm_chat::RESPONSE_SCHEMA]["oneOf"],
+            json!([{"const": false}, {"$ref": "#/$defs/ResponseSchemaInput"}])
+        );
+        let defs = &contract["$defs"];
+        let temperature = &defs["TemperatureInput"];
+        assert_eq!(temperature["additionalProperties"], true);
+        assert!(temperature.get("required").is_none());
+        let schema = &defs["ResponseSchemaInput"];
+        assert_eq!(schema["additionalProperties"], true);
+        assert_eq!(schema["required"], json!(["with_tools", "keywords"]));
+        assert_eq!(schema["properties"]["with_tools"]["type"], "boolean");
+        let keywords = &schema["properties"]["keywords"];
+        assert_eq!(keywords["type"], "array");
+        assert_eq!(keywords["uniqueItems"], true);
+        assert_eq!(keywords["items"], json!({"type": "string", "minLength": 1}));
+    }
+
+    #[test]
     fn harvest_refusals_read_as_written() {
         assert_eq!(
             HarvestError::DuplicateToolName("x".into()).to_string(),
@@ -349,7 +401,7 @@ mod tests {
         let tool: Value = serde_json::from_str(tool::DEFINITION).unwrap();
         let chat: Value = serde_json::from_str(llm_chat::DEFINITION).unwrap();
         assert_eq!(tool["version"], "0.4.0");
-        assert_eq!(chat["version"], "0.7.0");
+        assert_eq!(chat["version"], "0.8.0");
 
         fn without_descriptions(value: &Value) -> Value {
             match value {

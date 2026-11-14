@@ -1151,6 +1151,35 @@ fn accepting(accepts: Value) -> SessionConfig {
     config
 }
 
+#[test]
+fn a_temperature_that_is_not_a_finite_non_negative_number_refuses_the_session() {
+    let (kernel, _seen) = kernel(vec![]);
+    let session = |t: f64| {
+        let config = SessionConfig {
+            temperature: Some(t),
+            ..done()
+        };
+        Session::new(kernel.clone(), config, Arc::new(Recorder::default()))
+    };
+    for t in [f64::NAN, f64::INFINITY, -0.5] {
+        let Err(err) = session(t) else {
+            panic!("{t} was accepted")
+        };
+        assert!(
+            matches!(err, SessionError::InvalidTemperature(_)),
+            "{t}: {err:?}"
+        );
+    }
+    let Err(err) = session(-0.5) else {
+        panic!("-0.5 was accepted")
+    };
+    assert_eq!(
+        err.to_string(),
+        "SessionConfig::temperature must be a finite number of at least 0, got -0.5"
+    );
+    assert!(session(0.0).is_ok());
+}
+
 #[tokio::test]
 async fn a_provider_declares_what_it_accepts_under_the_sessions_config() {
     let (kernel, seen) = kernel(vec![]);
@@ -1159,6 +1188,7 @@ async fn a_provider_declares_what_it_accepts_under_the_sessions_config() {
     let mut a = accepting(png_only);
     a.context = context(json!({"embedder": "settings"}));
     a.tool_plugins = Some(names(&["nope"]));
+    a.temperature = Some(f64::NAN);
     let answer = provider_accepts(&kernel, &a, &token).await.unwrap();
     let Support::Yes(images) = answer.images else {
         panic!("{:?}", answer.images)
@@ -1166,6 +1196,7 @@ async fn a_provider_declares_what_it_accepts_under_the_sessions_config() {
     assert_eq!(images.formats, [ImageFormat::Png]);
     assert_eq!(images.sources, [ImageSource::Base64]);
     assert_eq!(one(&seen, PROVIDER), json!({"embedder": "settings"}));
+    a.temperature = None;
 
     let b = accepting(json!({"images": false}));
     assert_eq!(
@@ -1200,6 +1231,8 @@ async fn a_provider_without_accepts_is_unknown() {
         .await
         .unwrap();
     assert_eq!(answer.images, Support::Unknown);
+    assert_eq!(answer.temperature, Support::Unknown);
+    assert_eq!(answer.response_schema, Support::Unknown);
 }
 
 #[tokio::test]

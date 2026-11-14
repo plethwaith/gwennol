@@ -360,6 +360,9 @@ pub enum SessionError {
         /// The rule it breaks.
         error: String,
     },
+    /// [`SessionConfig::temperature`] is not finite or is below 0.
+    #[error("SessionConfig::temperature must be a finite number of at least 0, got {0}")]
+    InvalidTemperature(f64),
     /// A tool's declared argument schema does not compile.
     #[error("tool {tool:?} declares a schema that does not compile: {error}")]
     ToolSchema {
@@ -403,6 +406,14 @@ pub struct SessionConfig {
     pub system: Option<String>,
     /// The generation cap passed to the provider, if any.
     pub max_tokens: Option<u64>,
+    /// The temperature passed to the provider on every round, in the
+    /// provider's own scale; `None` leaves the provider's default. A value
+    /// that is not finite or is below 0 refuses the session
+    /// ([`SessionError::InvalidTemperature`]). The loop does not ask
+    /// whether the provider honours it, and a provider that predates the
+    /// field may drop it, so an embedder that relies on it asks
+    /// [`provider_accepts`] first.
+    pub temperature: Option<f64>,
     /// Ask for the streamed form (the default) or the buffered one.
     pub stream: bool,
     /// The `$config` each plugin runs under, by plugin name — a
@@ -465,6 +476,7 @@ impl Default for SessionConfig {
             provider: None,
             system: None,
             max_tokens: None,
+            temperature: None,
             stream: true,
             plugin_configs: BTreeMap::new(),
             max_rounds: 64,
@@ -551,6 +563,8 @@ pub async fn provider_accepts(
     {
         return Ok(Accepts {
             images: Support::Unknown,
+            temperature: Support::Unknown,
+            response_schema: Support::Unknown,
         });
     }
     let plugin_config = config.plugin_config_for(&provider);
@@ -636,7 +650,8 @@ impl Session {
     /// Start a session on a booted kernel — the `Arc` from
     /// [`Kernel::into_arc`], with the SPI contracts, the provider and
     /// the tools registered — that sends its events to `events`.
-    /// Resolves the provider, harvests the tools and compiles their
+    /// Checks [`SessionConfig::context`] and [`SessionConfig::temperature`],
+    /// resolves the provider, harvests the tools and compiles their
     /// schemas; each can refuse, see [`SessionError`].
     ///
     /// The session reads no process-global state. Several sessions can
@@ -649,6 +664,11 @@ impl Session {
     ) -> Result<Self, SessionError> {
         if config.context.contains_key(CONTEXT_KEY) {
             return Err(SessionError::ReservedContextKey);
+        }
+        if let Some(t) = config.temperature
+            && !(t.is_finite() && t >= 0.0)
+        {
+            return Err(SessionError::InvalidTemperature(t));
         }
         let provider = resolve_provider(&kernel, config.provider.as_deref())?;
         let tools = ToolTable::harvest(&kernel, config.tool_plugins.as_ref())?;
@@ -888,6 +908,9 @@ impl Session {
         }
         if let Some(max_tokens) = self.config.max_tokens {
             input.insert("max_tokens".into(), Value::from(max_tokens));
+        }
+        if let Some(temperature) = self.config.temperature {
+            input.insert(spi::llm_chat::TEMPERATURE.into(), Value::from(temperature));
         }
         if self.config.stream {
             input.insert("stream".into(), Value::Bool(true));

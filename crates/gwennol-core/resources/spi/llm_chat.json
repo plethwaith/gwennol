@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "name": "LLM_CHAT",
   "displayName": "Chat-model provider",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A chat-completion model provider. One required action, `chat`: messages in, an assistant message (or a stream handle) out — or, when the turn failed in a way the provider can name (the vendor said no, or the provider declined the request), a `Failure` the caller can classify without reading error text. One optional action, `accepts`: what the provider takes under its `$config`, for a caller to ask before a turn. The wire shapes here are the harness's own, not any vendor's; a provider plugin translates them to its API. Prose contract in docs/SPI.md. Schemas are documentation and tooling input: Gwead validates no payloads at dispatch.",
   "actions": {
     "chat": {
@@ -31,6 +31,15 @@
             "type": "integer",
             "minimum": 1,
             "description": "Cap on generated tokens. Optional; the provider applies its own default and ceiling."
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Sampling temperature, in the provider's own scale: vendors differ on the range. Optional; absent means the provider's default. A provider that cannot honour the value answers with a `Failure` and never drops it. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
+          },
+          "response_schema": {
+            "type": "object",
+            "description": "A JSON Schema the answer is generated to. When `stop_reason` is `end_turn`, the text of the answer's text blocks, joined in order, is one JSON document conforming to it; other blocks are as without it, and a `max_tokens` or `refusal` stop carries no such guarantee. The output shapes do not change: streamed, the document arrives as `text` events. A provider that takes response schemas at all takes every schema within the floor docs/SPI.md names, and may refuse anything beyond it, or this field beside a non-empty `tools`, with a `Failure`; one that takes none refuses every schema with a `Failure`. Neither answers unconstrained text in its place. Nothing checks the document against the schema. A provider that predates this field (before 0.8.0) may drop it without a word, so a caller that relies on it asks `accepts` first."
           },
           "stream": {
             "type": "boolean",
@@ -69,7 +78,7 @@
             "type": "object",
             "required": ["error"],
             "additionalProperties": false,
-            "description": "The failed form: the provider can say why the turn failed, as data. Either the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
+            "description": "The failed form: the provider can say why the turn failed, as data. For instance, the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve, a `temperature` or `response_schema` it cannot honour). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
             "properties": {
               "error": { "$ref": "#/$defs/Failure" }
             }
@@ -89,6 +98,14 @@
           "images": {
             "oneOf": [ { "const": false }, { "$ref": "#/$defs/ImageInput" } ],
             "description": "Whether a message may carry `image` blocks, in a user message or in a `tool_result`'s content: `false` for none, or which ones."
+          },
+          "temperature": {
+            "oneOf": [ { "const": false }, { "$ref": "#/$defs/TemperatureInput" } ],
+            "description": "Whether the provider honours `chat`'s `temperature`: `false` for no, or an object for yes."
+          },
+          "response_schema": {
+            "oneOf": [ { "const": false }, { "$ref": "#/$defs/ResponseSchemaInput" } ],
+            "description": "Whether the provider honours `chat`'s `response_schema`: `false` for no, or how."
           }
         }
       }
@@ -263,6 +280,22 @@
       "properties": {
         "media_types": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/ImageMediaType" }, "description": "The formats it takes." },
         "sources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["base64", "reference"] }, "description": "The source types it takes: `base64`, the bytes inline, and `reference`, a reference it resolves." }
+      }
+    },
+    "TemperatureInput": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {},
+      "description": "The provider honours a temperature. No fields at this version; open like the answer it sits in, so a later version may add one (a maximum, say)."
+    },
+    "ResponseSchemaInput": {
+      "type": "object",
+      "required": ["with_tools", "keywords"],
+      "additionalProperties": true,
+      "description": "How the provider honours a response schema. Open like the answer it sits in.",
+      "properties": {
+        "with_tools": { "type": "boolean", "description": "Whether it honours one beside a non-empty `tools`." },
+        "keywords": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "JSON Schema keywords it honours beyond the floor docs/SPI.md names, by name (`anyOf`, `$ref`); empty for the floor alone." }
       }
     },
     "ToolUseBlock": {
