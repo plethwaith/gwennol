@@ -150,11 +150,13 @@ fn relay_sse(args: Args) -> Result<Value, String> {
     }
 
     let mut parser = SseParser::new();
-    let mut translator = StreamTranslator::constrained(
-        args.field("constrained")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    );
+    // The stop-reason rule is fail-closed, so a missing flag is a failed
+    // step, not "unconstrained".
+    let constrained = args
+        .field("constrained")
+        .and_then(Value::as_bool)
+        .ok_or("the stream_turn input carried no boolean `constrained`")?;
+    let mut translator = StreamTranslator::constrained(constrained);
     let mut buf = [0u8; 4096];
     loop {
         if cancelled() {

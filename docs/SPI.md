@@ -180,10 +180,13 @@ ignore them.
 Settled with the first real provider to inform it ("4. Provider and
 tools" in the roadmap). The buffered form has a third shape,
 `{"error": {"message", "retryable"?, "kind"?}}` — the same three
-fields the stream's `error` event carries — for a turn the vendor
-answered and refused (a non-2xx status, or an error
-document in place of a message), or one the provider declined (below),
-which answers a streamed request, too. The provider fills `retryable` from
+fields the stream's `error` event carries — for a turn that failed in a
+way the provider can name. For instance, the vendor answered and refused
+(a non-2xx status, or an error document in place of a message); the
+provider declined the request (below), which answers a streamed request,
+too; or the vendor answered with a 2xx whose stop the provider cannot report
+truthfully (a paused turn, or a stop at a stop sequence under a
+`response_schema`). The provider fills `retryable` from
 what it knows of its own API (rate limits, overload and transient
 server errors are worth repeating unchanged; authentication,
 malformed-request and not-found answers will fail again) and `kind`

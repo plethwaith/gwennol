@@ -283,12 +283,17 @@ impl Fixture {
     /// One provider turn, as the raw output of `chat`, for a request whose
     /// answer the test expects to be neither a message nor a stream.
     async fn raw(&self, route: &str, input: Value, streams: bool) -> Value {
+        self.raw_with_config(&self.config(route), input, streams)
+            .await
+    }
+
+    /// [`Fixture::raw`] under a config of the caller's making.
+    async fn raw_with_config(&self, config: &Value, input: Value, streams: bool) -> Value {
         assert_conforms(contracts().chat_input, &input);
-        let config = self.config(route);
         let mut execution = self
             .kernel
             .execute(PROVIDER, spi::llm_chat::CHAT, input)
-            .with_config(&config);
+            .with_config(config);
         if streams {
             execution = execution.with_streams(Arc::new(Mutex::new(StreamRegistry::new())));
         }
@@ -1215,6 +1220,49 @@ async fn a_stop_sequence_under_a_response_schema_is_a_failure_on_both_paths() {
         .raw("/stop-sequence", opening_input(f.tools(), false), false)
         .await;
     assert_eq!(out["stop_reason"], "end_turn", "{out}");
+}
+
+/// A `format` that config supplies in `extra.output_config` does not make
+/// a turn constrained: a stop at a stop sequence is still `end_turn` when
+/// the chat input carries no `response_schema`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_supplied_format_does_not_constrain_the_turn() {
+    let f = fixture();
+    let mut config = f.config("/stop-sequence");
+    config["extra"] = json!({
+        "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "additionalProperties": false}}}
+    });
+    let out = f
+        .raw_with_config(&config, opening_input(f.tools(), false), false)
+        .await;
+    assert_eq!(out["stop_reason"], "end_turn", "{out}");
+}
+
+/// `stream_turn`'s relay fails the step when its input carries no
+/// `constrained` flag, rather than reading the turn as unconstrained.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_relay_without_a_constrained_flag_is_a_failed_step() {
+    use gwead::futures::StreamExt as _;
+    let f = fixture();
+    let input = json!({
+        "url": format!("http://{}/stop-sequence/v1/messages", f.stub.addr),
+        "request": {"model": "claude-fixture", "stream": true, "messages": []}
+    });
+    let mut handle = f
+        .kernel
+        .execute(PROVIDER, STREAM_ACTION, input)
+        .with_config(&f.config("/stop-sequence"))
+        .into_dataflow_streaming_handle()
+        .expect("the dataflow action streams");
+    while let Some(chunk) = handle.output.next().await {
+        let _ = chunk;
+    }
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle.result)
+        .await
+        .expect("the relay finishes within 10s")
+        .expect("the pipeline reports");
+    let error = outcome.expect_err("a missing flag is a failed step");
+    assert!(error.to_string().contains("`constrained`"), "{error}");
 }
 
 /// The declared `response_schema.with_tools` agrees with what `chat` does

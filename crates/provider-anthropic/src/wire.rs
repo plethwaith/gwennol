@@ -1552,12 +1552,14 @@ mod tests {
         assert!(out.get("message").is_none(), "{out}");
         let plain = buffered_output(200, body, false, false).output;
         assert_eq!(plain["stop_reason"], "end_turn");
-        // Another stop under a schema keeps its mapping.
-        let end = body.replace("stop_sequence\"", "end_turn\"");
-        assert_eq!(
-            buffered_output(200, &end, false, true).output["stop_reason"],
-            "end_turn"
-        );
+        // Every other stop that maps keeps its mapping under a schema.
+        for stop in ["end_turn", "tool_use", "max_tokens"] {
+            let other = body.replace("stop_sequence\"", &format!("{stop}\""));
+            assert_eq!(
+                buffered_output(200, &other, false, true).output["stop_reason"],
+                stop
+            );
+        }
     }
 
     #[test]
@@ -1905,6 +1907,18 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(event["type"], "end");
+        // Every other stop that maps keeps its mapping under a schema.
+        for stop in ["end_turn", "tool_use", "max_tokens"] {
+            let mut events = events.clone();
+            events[1].1["delta"]["stop_reason"] = json!(stop);
+            let mut t = StreamTranslator::constrained(true);
+            let out = feed(&mut t, &events);
+            let Some(Emitted::Terminal(event)) = out.last() else {
+                panic!("{out:?}")
+            };
+            assert_eq!(event["type"], "end", "{stop}");
+            assert_eq!(event["stop_reason"], stop);
+        }
     }
 
     #[test]

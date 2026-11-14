@@ -130,8 +130,9 @@ use stream::{EventReader, ReadError};
 use tools::{ToolTable, parse_output};
 use transcript::{MessageBuilder, ToolUse, Transcript, check_assistant_message, check_block};
 
-/// Why a turn failed, as the provider reports it: the vendor said no, or
-/// the provider declined the request (the `LLM_CHAT` `Failure`).
+/// Why a turn failed, as the provider reports it: for instance, the vendor
+/// said no, or the provider declined the request (the `LLM_CHAT`
+/// `Failure`).
 ///
 /// Consumers branch on `retryable` and nothing else; `kind` and
 /// `message` are for people.
@@ -283,8 +284,9 @@ pub enum TurnError {
         /// hid one; `None` for a plain cancellation.
         detail: Option<String>,
     },
-    /// The vendor refused, or the provider declined the request, and the
-    /// failure is not one to repeat — or was, and the retries ran out.
+    /// The provider reported a `Failure` (for instance, the vendor refused,
+    /// or the provider declined the request), and it is not one to repeat —
+    /// or was, and the retries ran out.
     #[error("provider refused the turn: {0}")]
     Provider(Failure),
     /// The provider's `chat` action failed as a step: the transport,
