@@ -19,7 +19,9 @@
 //!   request is built ([`unsupported_image_source`]). What else needs
 //!   code is the defaults and the knobs
 //!   the contract deliberately leaves to config (`docs/SPI.md`, "Known
-//!   exclusions").
+//!   exclusions"). The input's `temperature` and `response_schema` travel
+//!   as the vendor's `temperature` and `output_config.format`, and the
+//!   vendor judges them: nothing here declines either.
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
 //!   `Failure` the contract's buffered failed form (since `LLM_CHAT` 0.2.0)
@@ -185,9 +187,11 @@ pub fn messages_url(config: &Value) -> Result<String, String> {
 /// object, sent verbatim; absent means the field is not sent and the
 /// model's own default applies — see the module docs for what that
 /// costs the contract), and `extra` — an object shallow-merged into the
-/// request for any key the provider did not itself set, the contract's
-/// sanctioned place for sampling knobs and vendor features it
-/// deliberately does not carry.
+/// request for any key the provider did not itself set, the place for the
+/// sampling knobs and vendor features the contract does not carry. A
+/// `chat` input's `temperature` beats `extra.temperature`, and its
+/// `response_schema` travels as `output_config.format`, merged into
+/// `extra.output_config`.
 pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
     let (messages, dropped) = match input.get("messages") {
         Some(Value::Array(m)) if !m.is_empty() => replay_messages(m),
@@ -260,6 +264,41 @@ pub fn build_request(input: &Value, config: &Value) -> Result<Request, String> {
             }
             Value::Array(_) | Value::Null => {}
             other => return Err(format!("chat input `tools` must be an array, got {other}")),
+        }
+    }
+    match input.get("temperature") {
+        None | Some(Value::Null) => {}
+        Some(v) if v.is_number() && v.as_f64().is_some_and(|t| t >= 0.0) => {
+            body.insert("temperature".into(), v.clone());
+        }
+        Some(other) => {
+            return Err(format!(
+                "chat input `temperature` must be a non-negative number, got {other}"
+            ));
+        }
+    }
+    match input.get("response_schema") {
+        None | Some(Value::Null) => {}
+        Some(schema @ Value::Object(_)) => {
+            let mut output_config = match config.get("extra").and_then(|e| e.get("output_config")) {
+                None => Map::new(),
+                Some(Value::Object(o)) => o.clone(),
+                Some(other) => {
+                    return Err(format!(
+                        "config.extra.output_config must be an object, got {other}"
+                    ));
+                }
+            };
+            output_config.insert(
+                "format".into(),
+                json!({"type": "json_schema", "schema": schema}),
+            );
+            body.insert("output_config".into(), Value::Object(output_config));
+        }
+        Some(other) => {
+            return Err(format!(
+                "chat input `response_schema` must be an object, got {other}"
+            ));
         }
     }
     match config.get("extra") {
@@ -928,6 +967,93 @@ mod tests {
         let r = build_request(&input(false), &json!({})).unwrap();
         assert!(!r.stream);
         assert_eq!(r.body["max_tokens"], DEFAULT_MAX_TOKENS_BUFFERED);
+    }
+
+    fn floor_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn the_temperature_and_response_schema_reach_the_request() {
+        let schema = floor_schema();
+        let config = json!({"extra": {
+            "temperature": 0.9,
+            "output_config": {"effort": "low", "format": "stale"}
+        }});
+        let want = json!({
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": schema}
+        });
+        for stream in [false, true] {
+            let mut i = input(stream);
+            i["temperature"] = json!(0.25);
+            i["response_schema"] = schema.clone();
+            let r = build_request(&i, &config).unwrap();
+            assert_eq!(r.body["temperature"], 0.25, "stream {stream}");
+            assert_eq!(r.body["output_config"], want, "stream {stream}");
+        }
+
+        let mut zero = input(false);
+        zero["temperature"] = json!(0);
+        let r = build_request(&zero, &json!({})).unwrap();
+        assert_eq!(r.body["temperature"], json!(0));
+        assert!(r.body["temperature"].is_u64(), "an integer stays one");
+
+        let r = build_request(&input(false), &json!({})).unwrap();
+        assert!(r.body.get("temperature").is_none());
+        assert!(r.body.get("output_config").is_none());
+        let r = build_request(&input(false), &config).unwrap();
+        assert_eq!(r.body["temperature"], 0.9);
+        assert_eq!(
+            r.body["output_config"],
+            json!({"effort": "low", "format": "stale"})
+        );
+    }
+
+    #[test]
+    fn malformed_temperature_and_response_schema_are_readable_errors() {
+        let with = |k: &str, v: Value| {
+            let mut i = input(false);
+            i[k] = v;
+            i
+        };
+        let none = json!({});
+        for (v, shown) in [
+            (json!("hot"), "\"hot\""),
+            (json!(-1), "-1"),
+            (json!(true), "true"),
+        ] {
+            assert_eq!(
+                build_request(&with("temperature", v), &none).unwrap_err(),
+                format!("chat input `temperature` must be a non-negative number, got {shown}")
+            );
+        }
+        for (v, shown) in [
+            (json!([]), "[]"),
+            (json!("x"), "\"x\""),
+            (json!(true), "true"),
+        ] {
+            assert_eq!(
+                build_request(&with("response_schema", v), &none).unwrap_err(),
+                format!("chat input `response_schema` must be an object, got {shown}")
+            );
+        }
+        let low = json!({"extra": {"output_config": "low"}});
+        assert_eq!(
+            build_request(&with("response_schema", floor_schema()), &low).unwrap_err(),
+            "config.extra.output_config must be an object, got \"low\""
+        );
+        for k in ["temperature", "response_schema"] {
+            let r = build_request(&with(k, Value::Null), &none).unwrap();
+            assert!(r.body.get(k).is_none(), "{k}: null sends nothing");
+        }
+        let r = build_request(&input(false), &low).unwrap();
+        assert_eq!(r.body["output_config"], "low");
     }
 
     #[test]

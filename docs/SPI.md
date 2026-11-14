@@ -44,6 +44,8 @@ what the provider takes (below).
   "messages": [ … ],
   "tools": [ {"name": "…", "description": "…", "input_schema": { … }} ],
   "max_tokens": 4096,
+  "temperature": 0.2,
+  "response_schema": { … },
   "stream": false
 }
 ```
@@ -97,6 +99,37 @@ message. A `tool_result`'s `content` is a string, or a non-empty list of
 `tools` is what the model may call this turn, and each entry is a Gwead
 tool descriptor on the wire: `input_schema` is the implementing action's
 `tool.parameters`, verbatim (see `TOOL` below).
+
+### Temperature and response schema
+
+`temperature` is a number of at least 0, in the provider's own scale, since
+vendors differ on the range. Absent means the provider's default. A
+provider that knows the field and cannot honour the value answers the
+failed form (below); it never drops the value.
+
+`response_schema` is a JSON Schema. When the answer's `stop_reason` is
+`end_turn`, the text of its text blocks, joined in order, is one JSON
+document conforming to the schema. The output shapes do not change:
+streamed, the document arrives as `text` events, and `opaque` and
+`tool_use` blocks are as without a schema. A `max_tokens` or `refusal`
+stop carries no such guarantee. A provider that takes response schemas at
+all takes every schema within the floor below, and may refuse anything
+beyond it, or a schema beside a non-empty `tools`, with the failed form. A
+provider that takes none refuses every schema with the failed form. Neither
+answers unconstrained text in its place. Nothing checks the document
+against the schema: the provider's guarantee is generation, and Gwead
+validates no payloads.
+
+The floor: `type` (`object`, `array`, `string`, `number`, `integer`,
+`boolean`, `null`), `properties`, `required`, `items` (one schema), `enum`
+of strings, numbers, booleans or null, and `description`; every object
+schema declares `additionalProperties: false`.
+
+A provider written before 0.8.0 does not know either field and may drop it
+without a word, so a caller that relies on one asks `accepts` (below)
+first and sends it only where the answer says yes.
+`SessionConfig::temperature` sends its value on every round; the loop never
+sends `response_schema`.
 
 ### The tool-call protocol
 
@@ -166,7 +199,8 @@ is the same line the `TOOL` contract draws below: an outcome the caller
 should react to arrives as data, or it is an error nobody should parse.
 
 A provider that declines the request before calling a vendor (an image
-source it cannot resolve) answers the same failed form, on either path;
+source it cannot resolve, a `temperature` or `response_schema` it cannot
+honour) answers the same failed form, on either path;
 on a streamed request it comes back in place of `{"stream": …}`, since no
 stream was started. It is not retryable.
 
@@ -236,8 +270,12 @@ pattern.
 answer can follow the model a config names. A key left out means the
 provider does not know, an answer distinct from `false` (a provider that
 can only ask its server, and cannot, leaves it out). This version defines
-one key, `images`: `false`, or the media types and source types it takes,
-for an image block in a user message or in a tool result.
+three keys. `images`: `false`, or the media types and source types it
+takes, for an image block in a user message or in a tool result.
+`temperature`: `false`, or an object (no fields yet), for `chat`'s
+`temperature`. `response_schema`: `false`, or whether it takes a schema
+beside tools (`with_tools`) and which JSON Schema keywords it honours
+beyond the floor (`keywords`), for `chat`'s `response_schema`.
 The answer is open: a later version adds a key, a caller ignores one it
 does not know, and a known key with a value the schema does not admit is a
 contract violation.
@@ -249,7 +287,10 @@ resolves to, under the `$config` that config gives the provider, and its
 context, for an embedder to call when the config changes. The answer binds
 nothing: a turn the provider cannot serve still answers with the failed
 form. The bundled provider declares inline images in every format the
-contract names, from its manifest, without reading the configured model.
+contract names, and a response schema within the floor, beside tools or
+not, from its manifest, without reading the configured model. It leaves
+`temperature` out, since whether its vendor takes one depends on the
+model.
 
 ## `TOOL`
 
@@ -437,9 +478,10 @@ rather than oversights. Each would be a contract change; none blocks
   equivalent; a provider may cache however its API allows, and the open
   `usage` object lets it report the effect, but the contract offers no
   lever to place cache breakpoints.
-- **Sampling and generation knobs.** No `temperature`, `stop_sequences`,
-  or per-turn model selection; the provider's `$config` carries such
-  choices for the MVP. Per-turn model switching (a cheap summarizer
+- **Sampling and generation knobs.** No `top_p`, `top_k`, seed,
+  `stop_sequences`, or per-turn model selection; `temperature` is the one
+  sampling knob on the wire (above). The provider's `$config` carries the
+  other choices for the MVP. Per-turn model switching (a cheap summarizer
   beside the main model) is the first thing likely to reopen this.
 - **Vendor pause states.** A provider whose API can pause a turn
   (server-side tool use, long-turn pauses) resolves the pause inside its

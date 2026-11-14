@@ -345,6 +345,35 @@ fn the_conformance_harness_rejects_violating_payloads() {
         );
     }
 
+    // The sampling fields of a chat input.
+    let with = |key: &str, value: Value| {
+        let mut input = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "go"}
+        ]}]});
+        input[key] = value;
+        input
+    };
+    for admitted in [
+        with("temperature", json!(0)),
+        with("temperature", json!(0.25)),
+        with("response_schema", json!({})),
+    ] {
+        assert_conforms(c.chat_input, &admitted);
+    }
+    for (fault, bad) in [
+        ("a negative temperature", with("temperature", json!(-0.1))),
+        ("a string temperature", with("temperature", json!("0.5"))),
+        (
+            "an array response_schema",
+            with("response_schema", json!([])),
+        ),
+    ] {
+        assert!(
+            c.schemas.validate(&bad, c.chat_input).is_err(),
+            "chat input admitted {fault}: {bad}"
+        );
+    }
+
     // An image block in a user message: one valid block conforms, and each
     // fault below is the only difference from it.
     let image_input = |source: Value| {
@@ -467,8 +496,31 @@ fn the_conformance_harness_rejects_violating_payloads() {
     assert_conforms(c.accepts_output, &json!({"images": false}));
     assert_conforms(
         c.accepts_output,
-        &json!({"images": valid_images.clone(), "temperature": true}),
+        &json!({"images": valid_images.clone(), "top_p": true}),
     );
+    for admitted in [
+        json!({"temperature": {}}),
+        json!({"temperature": false}),
+        json!({"response_schema": {"with_tools": true, "keywords": []}}),
+    ] {
+        assert_conforms(c.accepts_output, &admitted);
+    }
+    for (fault, bad) in [
+        ("temperature true", json!({"temperature": true})),
+        (
+            "a response_schema without with_tools",
+            json!({"response_schema": {"keywords": []}}),
+        ),
+        (
+            "a response_schema keyword named twice",
+            json!({"response_schema": {"with_tools": true, "keywords": ["a", "a"]}}),
+        ),
+    ] {
+        assert!(
+            c.schemas.validate(&bad, c.accepts_output).is_err(),
+            "accepts output admitted {fault}: {bad}"
+        );
+    }
     let mut no_sources = valid_images.clone();
     no_sources.as_object_mut().unwrap().remove("sources");
     let mut empty_types = valid_images.clone();

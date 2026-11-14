@@ -362,12 +362,14 @@ fn fixture_plugins() -> Vec<Value> {
                     // whole template namespace. Every session in this
                     // suite sets system and max_tokens, and the tool
                     // inventory is never empty, so nothing renders as
-                    // a missing value here.
+                    // a missing value here, except `temperature`, which
+                    // most sessions leave unset (the stub drops it).
                     "body": {
                         "system": "{{$input.system}}",
                         "messages": "{{$input.messages}}",
                         "tools": "{{$input.tools}}",
                         "max_tokens": "{{$input.max_tokens}}",
+                        "temperature": "{{$input.temperature}}",
                         "stream": true
                     },
                     "stream": true}},
@@ -586,6 +588,10 @@ fn script(route: &str, body: &Value, asked: usize) -> Vec<Value> {
             end("tool_use"),
         ],
         "/opaque" => vec![text("ok"), end("end_turn")],
+        "/temperature" | "/temperature-none" if round == 0 => {
+            vec![call("c1", "echo", json!({"message": "x"})), end("tool_use")]
+        }
+        "/temperature" | "/temperature-none" => vec![text("ok"), end("end_turn")],
         "/fail-tool" => one_call("fail", json!({})),
         "/unknown-tool" => one_call("nope", json!({})),
         "/bad-args" => one_call("echo", json!({"message": 5})),
@@ -649,8 +655,16 @@ fn stub() -> &'static Stub {
             let Some((path, body)) = common::read_http_request(&mut socket) else {
                 return;
             };
-            let body: Value = gwead::serde_json::from_slice(&body)
+            let mut body: Value = gwead::serde_json::from_slice(&body)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
+            // The fixture provider forwards `temperature` by template, and
+            // gwead renders an absent input field as the empty string:
+            // that is a session that set none, so the key is dropped here.
+            if let Some(fields) = body.as_object_mut()
+                && fields.get("temperature") == Some(&Value::String(String::new()))
+            {
+                fields.remove("temperature");
+            }
             // Every request the provider sends is a conforming chat
             // input, or the loop built it wrong.
             assert_conforms(contracts().chat_input, &body);
@@ -1050,6 +1064,35 @@ async fn the_assistant_message_is_rebuilt_from_the_stream_and_replayed_verbatim(
         sent[1]["messages"][2]["content"][0]["tool_use_id"], "c1",
         "answered in the immediately following message"
     );
+}
+
+/// `SessionConfig::temperature` is sent on every round of a turn, the
+/// tool round included, and a session without one sends no such key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sessions_temperature_reaches_every_round() {
+    let f = fixture();
+    let mut with = new_session(
+        f.kernel.clone(),
+        SessionConfig {
+            temperature: Some(0.25),
+            ..config("/temperature")
+        },
+    )
+    .unwrap();
+    assert_eq!(turn(&mut with, "go").await.unwrap().rounds, 2);
+    let sent = f.stub.requests_for("/temperature");
+    assert_eq!(sent.len(), 2);
+    for (round, input) in sent.iter().enumerate() {
+        assert_eq!(input["temperature"], 0.25, "round {round}");
+    }
+
+    let mut without = session("/temperature-none");
+    assert_eq!(turn(&mut without, "go").await.unwrap().rounds, 2);
+    let sent = f.stub.requests_for("/temperature-none");
+    assert_eq!(sent.len(), 2);
+    for input in &sent {
+        assert!(input.get("temperature").is_none(), "{input}");
+    }
 }
 
 /// `gwennol_host::run` drives turns from the operator until it has none.

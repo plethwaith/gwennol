@@ -1083,9 +1083,10 @@ async fn an_image_reference_is_declined_before_the_vendor_is_called() {
 }
 
 /// The bundled provider declares inline images in every format the
-/// contract names, from its manifest alone: no request reaches the vendor.
+/// contract names and a response schema within the floor, and leaves
+/// temperature out, from its manifest alone: no request reaches the vendor.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor() {
+async fn the_bundled_provider_declares_what_it_takes_without_calling_the_vendor() {
     let f = fixture();
     let config = f.config("/accepts");
     let out = f
@@ -1098,10 +1099,13 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
         .output;
     assert_eq!(
         out,
-        json!({"images": {
-            "media_types": ["image/jpeg", "image/png", "image/gif", "image/webp"],
-            "sources": ["base64"]
-        }})
+        json!({
+            "images": {
+                "media_types": ["image/jpeg", "image/png", "image/gif", "image/webp"],
+                "sources": ["base64"]
+            },
+            "response_schema": {"with_tools": true, "keywords": []}
+        })
     );
     assert_conforms(contracts().accepts_output, &out);
     let requested = f.requested();
@@ -1123,6 +1127,78 @@ async fn the_bundled_provider_declares_inline_images_without_calling_the_vendor(
     };
     assert_eq!(images.formats, ImageFormat::ALL);
     assert_eq!(images.sources, [ImageSource::Base64]);
+    assert_eq!(answer.temperature, Support::Unknown);
+    let Support::Yes(schema) = answer.response_schema else {
+        panic!("{:?}", answer.response_schema)
+    };
+    assert!(schema.with_tools);
+    assert!(schema.keywords.is_empty());
+}
+
+/// The input's `temperature` and `response_schema` reach the vendor's
+/// request, beside a non-empty `tools`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_provider_sends_a_temperature_and_a_response_schema() {
+    let f = fixture();
+    let schema = json!({
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": false
+    });
+    let mut input = opening_input(f.tools(), false);
+    input["temperature"] = json!(0.25);
+    input["response_schema"] = schema.clone();
+    let out = f.raw("/sampled", input, false).await;
+    assert!(out.get("message").is_some(), "{out}");
+    let bodies: Vec<Value> = f
+        .stub
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _, _)| path == "/sampled/v1/messages")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["temperature"], 0.25);
+    assert_eq!(
+        bodies[0]["output_config"]["format"],
+        json!({"type": "json_schema", "schema": schema})
+    );
+    assert!(!bodies[0]["tools"].as_array().unwrap().is_empty());
+}
+
+/// The declared `response_schema.with_tools` agrees with what `chat` does
+/// with a schema beside a non-empty `tools`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_schema_declaration_agrees_with_what_chat_sends() {
+    let f = fixture();
+    let config = f.config("/schema-agree");
+    let declared = f
+        .kernel
+        .execute(PROVIDER, spi::llm_chat::ACCEPTS, json!({}))
+        .with_config(&config)
+        .run()
+        .await
+        .unwrap()
+        .output["response_schema"]["with_tools"]
+        .as_bool()
+        .expect("the bundled provider declares a response schema");
+    let mut input = opening_input(f.tools(), false);
+    input["response_schema"] = json!({"type": "object", "additionalProperties": false});
+    let out = f.raw("/schema-agree", input, false).await;
+    let sent = f
+        .requested()
+        .iter()
+        .any(|path| path == "/schema-agree/v1/messages");
+    if declared {
+        assert!(out.get("message").is_some(), "{out}");
+        assert!(sent, "declared, but nothing reached the vendor");
+    } else {
+        assert!(out.get("error").is_some(), "{out}");
+        assert!(!sent, "not declared, but the vendor was called");
+    }
 }
 
 /// What the bundled provider declares it takes agrees with what `chat`

@@ -38,7 +38,9 @@ pub mod context;
 pub mod events;
 pub mod spi;
 
-pub use accepts::{Accepts, AcceptsError, ImageInput, ImageSource, Support};
+pub use accepts::{
+    Accepts, AcceptsError, ImageInput, ImageSource, ResponseSchemaInput, Support, TemperatureInput,
+};
 pub use agent::{
     Failure, RetryPolicy, Session, SessionConfig, SessionError, StopReason, TurnError, TurnOutcome,
     Usage, provider_accepts, resolve_provider,
