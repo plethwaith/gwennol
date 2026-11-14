@@ -25,7 +25,7 @@
 //! - **buffered answer**: [`buffered_output`] turns an HTTP status and
 //!   body into the contract's buffered output — the message, or the
 //!   `Failure` the contract's buffered failed form (since `LLM_CHAT` 0.2.0)
-//!   carries when the vendor answered and said no.
+//!   carries.
 //! - **stream**: [`StreamTranslator`] is the state machine that folds
 //!   the Messages API's server-sent events into contract events: text
 //!   deltas relayed as they arrive, tool calls buffered and emitted
@@ -735,9 +735,9 @@ impl StreamTranslator {
         StreamTranslator::default()
     }
 
-    /// A translator for a turn whose chat input was `constrained` to a
-    /// schema ([`is_constrained`]): a stop at a stop sequence ends it
-    /// with a `Failure`, not `end_turn`.
+    /// `constrained` is [`is_constrained`] of the chat input; when it is
+    /// true, a stop at a stop sequence ends the stream with an `error`
+    /// event, not `end`.
     pub fn constrained(constrained: bool) -> StreamTranslator {
         StreamTranslator {
             constrained,

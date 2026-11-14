@@ -78,7 +78,7 @@
             "type": "object",
             "required": ["error"],
             "additionalProperties": false,
-            "description": "The failed form: the provider can say why the turn failed, as data. Either the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve, a `temperature` or `response_schema` it cannot honour). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
+            "description": "The failed form: the provider can say why the turn failed, as data. For instance, the vendor answered and said no (a non-2xx status, an error document), or the provider declined the request before calling a vendor (an image source it cannot resolve, a `temperature` or `response_schema` it cannot honour). On a streamed request it comes back in place of the stream handle only when the provider declined the request before starting a stream; once a stream exists, a failure is its `error` event. Failures the provider cannot classify without reading error text (the transport failed, the operator denied the egress, the kernel refused the step) stay step errors, which the caller treats as uniformly fatal to the turn.",
             "properties": {
               "error": { "$ref": "#/$defs/Failure" }
             }
