@@ -77,6 +77,7 @@ fn chat(args: Args) -> Result<Value, String> {
         return Ok(failure.into_buffered_output());
     }
     let request = wire::build_request(args.raw(), args.config())?;
+    let constrained = wire::is_constrained(args.raw());
     // Anything left out of the request is logged, so a vendor refusal
     // of the replayed history has a breadcrumb in the host's tracing.
     for dropped in &request.dropped {
@@ -90,7 +91,7 @@ fn chat(args: Args) -> Result<Value, String> {
         let stream = invoke_streaming(
             Target::Plugin(PLUGIN_NAME),
             STREAM_ACTION,
-            &json!({ "url": url, "request": request.body }),
+            &json!({ "url": url, "request": request.body, "constrained": constrained }),
         )?;
         // The handle was minted in this invocation's stream table, so it
         // is exactly what the contract's streamed output form carries.
@@ -113,7 +114,7 @@ fn chat(args: Args) -> Result<Value, String> {
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let translated = wire::buffered_output(status, body, truncated);
+    let translated = wire::buffered_output(status, body, truncated, constrained);
     for note in &translated.notes {
         log(Level::Warn, note);
     }
@@ -149,7 +150,11 @@ fn relay_sse(args: Args) -> Result<Value, String> {
     }
 
     let mut parser = SseParser::new();
-    let mut translator = StreamTranslator::new();
+    let mut translator = StreamTranslator::constrained(
+        args.field("constrained")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
     let mut buf = [0u8; 4096];
     loop {
         if cancelled() {
