@@ -112,10 +112,11 @@ with a `Failure`; it never drops the value.
 document conforming to the schema. The output shapes do not change:
 streamed, the document arrives as `text` events, and `opaque` and
 `tool_use` blocks are as without a schema. A `max_tokens` or `refusal`
-stop carries no such guarantee. A provider that takes response schemas at
-all takes every schema within the floor below, and may refuse anything
-beyond it, or a schema beside a non-empty `tools`, with a `Failure`. A
-provider that takes none refuses every schema with a `Failure`. Neither
+stop carries no such guarantee. A provider that knows the field and takes
+response schemas at all takes every schema within the floor below, and may
+refuse anything beyond it, or a schema beside a non-empty `tools`, with a
+`Failure`. A provider that knows the field and takes none refuses every
+schema with a `Failure`. Neither
 answers unconstrained text in its place. Nothing checks the document
 against the schema: the provider's guarantee is generation, and Gwead
 validates no payloads.

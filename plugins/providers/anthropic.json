@@ -73,7 +73,7 @@
       ]
     },
     "stream_turn": {
-      "description": "A streamed Messages API request relayed as contract NDJSON. Input: {url, request} as for fetch_turn, and a boolean `constrained`, whether the chat input carried a `response_schema` (a stop at a stop sequence then ends the stream with an error event, not `end`); the relay fails the step without it. The relay's output is the stream handle chat returns.",
+      "description": "A streamed Messages API request relayed as contract NDJSON. Input: {url, request} as for fetch_turn, and a boolean `constrained`, whether the chat input carried a `response_schema` (a stop at a stop sequence then ends the stream with an error event, not `end`). The relay's output is the stream handle chat returns.",
       "dataflow": true,
       "steps": [
         {

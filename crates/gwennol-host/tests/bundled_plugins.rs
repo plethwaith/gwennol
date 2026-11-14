@@ -280,8 +280,7 @@ impl Fixture {
         out
     }
 
-    /// One provider turn, as the raw output of `chat`, for a request whose
-    /// answer the test expects to be neither a message nor a stream.
+    /// One provider turn, as the raw output of `chat`.
     async fn raw(&self, route: &str, input: Value, streams: bool) -> Value {
         self.raw_with_config(&self.config(route), input, streams)
             .await
@@ -1238,8 +1237,8 @@ async fn a_config_supplied_format_does_not_constrain_the_turn() {
     assert_eq!(out["stop_reason"], "end_turn", "{out}");
 }
 
-/// `stream_turn`'s relay fails the step when its input carries no
-/// `constrained` flag, rather than reading the turn as unconstrained.
+/// On a 2xx answer, `stream_turn`'s relay fails the step when its input
+/// carries no `constrained` flag.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_relay_without_a_constrained_flag_is_a_failed_step() {
     use gwead::futures::StreamExt as _;

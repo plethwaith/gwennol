@@ -1552,7 +1552,7 @@ mod tests {
         assert!(out.get("message").is_none(), "{out}");
         let plain = buffered_output(200, body, false, false).output;
         assert_eq!(plain["stop_reason"], "end_turn");
-        // Every other stop that maps keeps its mapping under a schema.
+        // `end_turn`, `tool_use` and `max_tokens` keep their mapping under a schema.
         for stop in ["end_turn", "tool_use", "max_tokens"] {
             let other = body.replace("stop_sequence\"", &format!("{stop}\""));
             assert_eq!(
@@ -1907,7 +1907,7 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(event["type"], "end");
-        // Every other stop that maps keeps its mapping under a schema.
+        // `end_turn`, `tool_use` and `max_tokens` keep their mapping under a schema.
         for stop in ["end_turn", "tool_use", "max_tokens"] {
             let mut events = events.clone();
             events[1].1["delta"]["stop_reason"] = json!(stop);
